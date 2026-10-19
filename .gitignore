@@ -193,3 +193,6 @@ c/mimo_tiny/image.json
 c/mimo_tiny/patches.f32
 c/mimo
 c/mimo.exe
+
+# engine KV cold-tier checkpoints (never commit model state)
+**/.coli_ckpt/

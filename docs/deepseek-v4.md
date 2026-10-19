@@ -297,11 +297,23 @@ computes, falling back to the single bank when VRAM is short.
   reuse fails at the reply boundary. `V4_PREFIX_CKPT_SLOTS` (4) in-memory
   slots, LRU with prompt-end evicted first. Log lines: `v4_ckpt store
   prefix=N` / `prompt_end=N`, `v4_ckpt hit prefix=N`.
-- **Persistence.** Prefix captures are written to `<model>/.coli_ckpt/`
-  (`V4_PREFIX_CKPT_DISK`=1; `2` also persists prompt-end captures, `0` off;
-  ~140 MB for an 8.3k-token prefix, config-fingerprinted, temp+rename) and
-  loaded lazily on the first request after a restart — a fresh serve no
-  longer re-prefills the system prompt.
+- **Persistence — the cold tier (disk is the system of record).** With
+  `V4_PREFIX_CKPT_DISK`=1 (default) captures go to a process-global,
+  content-addressed catalog under `<model>/.coli_ckpt/`:
+  `kv_<fingerprint>_<idhash>.bin`, header `COLIV4C3` with payload length and
+  CRC32C, written layer-by-layer through a per-pid temp name and rename. A RAM
+  catalog holds only ids + metadata (4 B/token), so an idle lineage costs no
+  snapshot RAM; GC bounds prompt-end entries (`V4_PREFIX_CKPT_SLOTS`=32) and
+  payload bytes (`V4_PREFIX_CKPT_DISK_GB`=8), and pinned system prefixes have
+  their own cap. A scan at the first request rebuilds the catalog (POSIX and
+  Windows); a torn or checksum-failed entry is dropped and removed, and a
+  lcp-discovered capture is restored by longest exact prefix. `2` also persists
+  prompt-end captures from a cancelled prefill, `0` keeps the in-memory
+  backend. Legacy `ckpt_*` files are logged and left in place;
+  `V4_PREFIX_CKPT_LEGACY_IMPORT=1` imports them once, byte-for-byte, into the
+  new format. The fingerprint covers the config geometry, `sliding_window` and
+  the shard count/size/mtime, so a re-downloaded checkpoint cannot restore
+  stale KV.
 
 ## Performance (RTX 5080 16 GB, 2× NVMe mirror, 32 GB RAM, i9-class CPU)
 
@@ -444,7 +456,9 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 |---|---|
 | `V4_PREFILL_CHUNK` (128) | chunk width, clamp [1,128] |
 | `V4_PREFILL_SEGMENT` (4096) | atomic segment length (cancel/resume granularity, expert re-sweeps) |
-| `V4_PREFIX_CKPT` (1) / `V4_PREFIX_CKPT_MIN` (512) / `V4_PREFIX_CKPT_SLOTS` (4) / `V4_PREFIX_CKPT_DISK` (1) | prefix checkpoints, see above |
+| `V4_PREFIX_CKPT` (1) / `V4_PREFIX_CKPT_MIN` (512) / `V4_PREFIX_CKPT_SLOTS` (4) / `V4_PREFIX_CKPT_DISK` (1) | prefix checkpoints: `_SLOTS` bounds prompt-end entries in the catalog; `_DISK=1` uses the content-addressed disk catalog, `2` also captures at a cancelled-prefill boundary, `0` keeps the in-memory backend |
+| `V4_PREFIX_CKPT_DISK_GB` (8) | payload byte budget of the cold catalog (`0` = unlimited); GC evicts LRU prompt-end entries first, pinned system prefixes have their own cap |
+| `V4_PREFIX_CKPT_LEGACY_IMPORT` (0) | `1` imports legacy `ckpt_<fp>_<n>.bin` files once into the content-addressed catalog (payload byte-preserved), then removes the legacy file; default leaves them untouched |
 | `V4_PREFIX_LOG` | log hint boundary / reuse decisions |
 | `V4_IDX_BATCH` (1) | batched indexer selection in prefill; `0` = legacy per-token |
 | `V4_IDX_IDENTITY` (0) | `1` = skip indexer scoring when every candidate fits under `index_topk` (index order instead of upstream's score order; ~8 % faster prefill, changes rounding) |
