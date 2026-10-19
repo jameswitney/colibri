@@ -7,6 +7,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The Vulkan tier's host pool can size itself from the engine's RAM plan:
+  `VktConfig` carries `ram_planned`/`ram_budget`/`ram_spare`, and the pool
+  takes at most what that plan leaves unclaimed. DeepSeek V4 passes its
+  resolved budget; without the bound the pool granted 25.75 GiB of system RAM
+  beside a 17.65 GiB plan and the kernel killed the process. Engines without a
+  plan keep the old rule, now also less their cache growth still to come, and
+  `COLI_VK_TIER_HOST_GB` still overrides the plan (with a line when it goes
+  over). `COLI_VK_TIER_HOST`/`_GB` also gain their missing
+  `docs/ENVIRONMENT.md` rows.
+
 - SSSE3 integer-dot tier in `c/idot.h`: `maddubs`/`madd` kernels for
   `dense_act_i8`, `dot_i8i8`, `dot_i4i8`, `dot_i4p_u` and `i4p_gidot_rows`
   give pre-AVX2 x86-64 CPUs (SSSE3, no AVX2/FMA) an accelerated path where

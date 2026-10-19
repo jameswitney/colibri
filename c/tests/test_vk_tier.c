@@ -34,6 +34,11 @@
  *            with a budget of four (experts of one form evicted for the other's, no
  *            upload refused), and streamed through slots that change format between
  *            the layers' steps;
+ *   host     the pool in system RAM the device reads over PCIe, sized from the engine's
+ *            RAM plan (VktConfig.ram_planned/ram_budget/ram_spare): the plan's room
+ *            bounds it (vkt_host_room's arithmetic, no device), a plan that leaves
+ *            nothing turns it off with a line that says so, and COLI_VK_TIER_HOST_GB
+ *            wins over the plan with one warning;
  *   timeout  a batch's wait gives up (COLI_VK_WAIT_FAULT): the tier stops and the experts
  *            that batch names keep their device memory until the device is idle.
  *
@@ -1199,9 +1204,125 @@ static void grouped(void) {
     H = h0;
 }
 
+/* The host pool's room, pure arithmetic (vkt_host_room, no device). */
+static void host_room(void) {
+    const size_t GiB = 1073741824, MiB = 1048576;
+    CHECK(vkt_host_room(30 * GiB, 18 * GiB, 350 * MiB, 1, 0) == 350 * MiB,
+          "host room: a plan that leaves 350 MiB gave %zu", vkt_host_room(30 * GiB, 18 * GiB, 350 * MiB, 1, 0));
+    CHECK(vkt_host_room(30 * GiB, 1 * GiB, 2 * GiB, 1, 0) == 1 * GiB,
+          "host room: a spare above the budget is not budget-bound");
+    CHECK(vkt_host_room(30 * GiB, 18 * GiB, 0, 1, 0) == 0,
+          "host room: a plan that leaves nothing gave no room");
+    CHECK(vkt_host_room(30 * GiB, 50 * GiB, 40 * GiB, 1, 0) == 30 * GiB,
+          "host room: room above what is available is clamped to it");
+    CHECK(vkt_host_room(30 * GiB, 0, 0, 0, 1 * GiB) == 25 * GiB,
+          "host room: without a plan, MemAvailable less the cache growth and 4 GiB");
+    CHECK(vkt_host_room(4 * GiB, 0, 0, 0, 2 * GiB) == 0 && vkt_host_room(4 * GiB, 0, 0, 0, 0) == 0,
+          "host room: the fallback went negative");
+    /* The run the fix is for: an 18 GiB budget the planner had spent to 17.65 GiB,
+     * 15.1 MiB an expert, MemAvailable 29.75 GiB. The old pool took MemAvailable
+     * less 4 GiB = 25.75 GiB beside it and the kernel killed the process; the plan
+     * leaves 0.35 GiB, so the pool holds at most 23 experts and stays inside the
+     * budget. */
+    size_t budget = 18 * GiB, projected = (size_t)(17.65 * (double)GiB), per = (size_t)(15.1 * (double)MiB),
+           avail = (size_t)(29.75 * (double)GiB);
+    size_t spare = budget - projected, room = vkt_host_room(avail, budget, spare, 1, 0);
+    CHECK(projected + room <= budget, "host room: the plan and the pool exceed the budget (%zu + %zu of %zu)",
+          projected, room, budget);
+    CHECK(room / per <= 23, "host room: the pool would hold %zu experts, not 23", room / per);
+    CHECK(vkt_host_room(avail, 0, 0, 0, 0) > 25 * GiB,
+          "host room: without the plan the room is the 25.75 GiB that killed the run");
+    printf("host room: the plan leaves %zu of %zu, %zu experts; without it %.2f GiB\n",
+           room, budget, room / per, (double)vkt_host_room(avail, 0, 0, 0, 0) / GiB);
+}
+
+/* vkt_init with stderr captured, so a test can read the tier's [VK] lines; the capture
+ * lands in host_cap (the boot lines the host pool's cases are about). */
+static char host_cap[16384];
+static int cap_vkt_init(const VktConfig *vc, uint32_t *const *heat) {
+    fflush(stderr);
+    host_cap[0] = 0;
+    int save = dup(2), on;
+    char path[] = "/tmp/coli_vkt_host.XXXXXX";
+    int fd = mkstemp(path);
+    if (save < 0 || fd < 0) { if (fd >= 0) close(fd); if (save >= 0) close(save); unlink(path); return vkt_init(vc, heat); }
+    dup2(fd, 2);
+    on = vkt_init(vc, heat);
+    fflush(stderr);
+    dup2(save, 2); close(save);
+    lseek(fd, 0, SEEK_SET);
+    ssize_t got = read(fd, host_cap, sizeof host_cap - 1);
+    if (got > 0) host_cap[got] = 0;
+    close(fd); unlink(path);
+    return on;
+}
+
+/* The pool's bytes as the boot line states them ("host pool on, N experts in X of
+ * system RAM"; *experts its count), -1 when the line is not there to read. */
+static double cap_pool_bytes(const char *cap, int *experts) {
+    const char *p = strstr(cap, "host pool on, ");
+    int n; double v; char unit[8] = "";
+    if (experts) *experts = -1;
+    if (!p || sscanf(p, "host pool on, %d experts in %lf %3s", &n, &v, unit) != 3) return -1;
+    if (experts) *experts = n;
+    const double GiB = 1073741824.0, MiB = 1048576.0, KiB = 1024.0;
+    return v * (!strcmp(unit, "GiB") ? GiB : !strcmp(unit, "MiB") ? MiB : !strcmp(unit, "KiB") ? KiB : 1.0);
+}
+
+/* The host pool from a RAM plan (COLI_VK_TIER_HOST=1, so also on a device that
+ * shares the host's RAM). The fixture is tiny, so the plan is stated in its scale; the
+ * run that OOMed is host_room's above. */
+static void host_plan(void) {
+    const size_t GiB = 1073741824, MiB = 1048576, KiB = 1024;
+    VktFmt f = {VKT_SRC_F32, 0};
+    size_t exp = vkt_expert_bytes(H, F, f, f);
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    set_budget(4, f, f);   /* the device holds 4 of the 20: the pool has experts to take */
+    setenv("COLI_VK_TIER_HOST", "1", 1);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    vc.ram_planned = 1; vc.ram_budget = GiB; vc.ram_spare = 350 * MiB;
+    int on = cap_vkt_init(&vc, NULL), n = -1;
+    CHECK(on, "host plan: the tier did not start");
+    if (on) {
+        CHECK(vkt_host_pool_on(), "host plan: the pool is off with 350 MiB of plan room");
+        CHECK(strstr(host_cap, "RAM plan"), "host plan: the boot line does not name the plan");
+        double b = cap_pool_bytes(host_cap, &n);
+        CHECK(b >= 0 && b <= 350.0 * MiB, "host plan: the pool takes %.0f, over the plan's room", b);
+        printf("  plan of 350 MiB: pool %d experts, %.1f KiB\n", n, b / KiB);
+        vkt_shutdown();
+    }
+    /* a plan that leaves nothing: the pool is off, the line says why */
+    vc.ram_spare = 0;
+    on = cap_vkt_init(&vc, NULL);
+    CHECK(on, "host plan: the tier did not start (no spare)");
+    if (on) {
+        CHECK(!vkt_host_pool_on(), "host plan: the pool is on with no plan room");
+        CHECK(strstr(host_cap, "host pool off: the RAM plan leaves"),
+              "host plan: no line when the plan leaves nothing");
+        vkt_shutdown();
+    }
+    /* the operator's size wins over the plan, with one warning */
+    setenv("COLI_VK_TIER_HOST_GB", "0.001", 1);   /* ~1 MiB: an expert fits, the plan's room does not */
+    vc.ram_spare = 100 * KiB;
+    on = cap_vkt_init(&vc, NULL);
+    CHECK(on, "host plan: the tier did not start (override)");
+    if (on) {
+        double b = cap_pool_bytes(host_cap, &n);
+        CHECK(vkt_host_pool_on(), "host plan: the explicit size did not override the plan");
+        CHECK(strstr(host_cap, "over the RAM plan"), "host plan: no warning for the size over the plan");
+        CHECK(b >= 0 && b > 100.0 * KiB + (double)exp, "host plan: the override gave %.0f, under the plan's room", b);
+        printf("  override 0.001 GiB over a 100 KiB plan: pool %.1f KiB, one warning\n", b / KiB);
+        vkt_shutdown();
+    }
+    unsetenv("COLI_VK_TIER_HOST_GB");
+    setenv("COLI_VK_TIER_HOST", "0", 1);   /* the rest of the suite's guard again */
+    model_free();
+}
+
 int main(int argc, char **argv) {
     char buf[1024];
     const char *spv = argc > 1 ? argv[1] : coli_vk_shader_path(buf, sizeof buf);
+    printf("host room:\n"); host_room();   /* pure arithmetic: needs no device */
     if (!coli_vk_init(spv)) { printf("FAIL: no Vulkan device (shaders %s)\n", spv); return 1; }
     setenv("COLI_VK_TIER_RESERVE_GB", "0", 1);
     /* the budgets, evictions and promotions below are the device's: the host pool (a
@@ -1220,6 +1341,7 @@ int main(int argc, char **argv) {
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
     printf("layers:\n"); layers();
+    printf("host pool:\n"); host_plan();
     ColiVkPoolStats ps, px; coli_vk_pool_stats(1, &ps); coli_vk_pool_stats(4, &px);
     CHECK(ps.live == 0 && px.live == 0, "%d + %d tier ranges still live after every shutdown", ps.live, px.live);
     coli_vk_shutdown();   /* with staged uploads: where the experts were ("[VK] memory at exit") */

@@ -1652,6 +1652,19 @@ static void d2_init(long long fit0, long long all, int act) {
             di.shares_ram ? "shared RAM" : "device memory");
 }
 
+/* The host pool's room in bytes: with the engine's RAM plan, what that plan
+ * leaves unclaimed, never above the budget it resolved; without one, what is
+ * available less the engine's cache growth (hold = VktConfig.ram_reserve) and 4 GiB
+ * (the engine's own growth, the page cache the loads go through). Pure arithmetic,
+ * for tests; never negative, never above avail. */
+size_t vkt_host_room(size_t avail, size_t budget, size_t spare, int planned, size_t hold) {
+    const size_t GiB = (size_t)1073741824;
+    size_t room = 0;
+    if (planned) room = spare < budget ? spare : budget;
+    else if (avail > hold && avail - hold > 4 * GiB) room = avail - hold - 4 * GiB;
+    return room > avail ? avail : room;
+}
+
 /* The host pool (backend_vulkan.h: coli_vk_tier_host_pool): the main layers' experts that
  * neither device's memory holds, in system RAM the primary device reads by address over
  * PCIe. They count as the primary device's (dev 0): its batch takes them, and the dense
@@ -1660,19 +1673,51 @@ static void d2_init(long long fit0, long long all, int act) {
  * every layer's frame for the host. Only beside the exclusive RAM/VRAM books
  * (COLI_VK_TIER_EXCLUSIVE): the engine's RAM cache gives up the copies of what the
  * device holds, so the pool takes RAM the cache would have, not RAM beside it. Its size:
- * what RAM has free less 4 GiB (the engine's own growth, the page cache the loads go
- * through), at most what the devices leave; COLI_VK_TIER_HOST_GB sets it and
- * COLI_VK_TIER_HOST=0 turns it off. COLI_VK_TIER_HOST=1 turns it on where the device
- * shares the host's RAM too (tests: the same memory, the paths of a card). */
+ * what the engine's RAM plan leaves unclaimed (VktConfig.ram_spare -- beside its expert
+ * cache at capacity, its dense weights in RAM, its head and its KV/workspace reserves;
+ * vkt_host_room), at most what the devices leave; an engine without a plan falls back to
+ * MemAvailable less 4 GiB and its cache growth still to come. COLI_VK_TIER_HOST_GB sets
+ * it and wins over the plan, never over MemAvailable; COLI_VK_TIER_HOST=0 turns it off.
+ * COLI_VK_TIER_HOST=1 turns it on where the device shares the host's RAM too (tests: the
+ * same memory, the paths of a card). */
 static void host_init(long long all) {
     const char *e = getenv("COLI_VK_TIER_HOST"), *g = getenv("COLI_VK_TIER_HOST_GB");
     if ((e && *e == '0') || (T.uma && !(e && !strcmp(e, "1"))) || !T.excl || !T.exp_bytes || !coli_vk_tier_host_pool()) return;
     long long left = all - T.dmax[0] - T.dmax[1];
     if (left <= 0) return;
     const double GiB = 1073741824.0;
-    double want = g && *g ? atof(g) * GiB : (double)mem_available() - 4.0 * GiB;
+    size_t avail = mem_available();
+    double want = (double)vkt_host_room(avail, T.c.ram_budget, T.c.ram_spare, T.c.ram_planned, T.c.ram_reserve);
+    char hs[32], hb[32];
+    if (g && *g) {   /* the operator's explicit size: it wins over the plan, never over the RAM there is */
+        double gb = atof(g) * GiB;
+        if (gb <= 0) {
+            static int junk;
+            if (!junk) { junk = 1; fprintf(stderr, "[VK] tier %s: COLI_VK_TIER_HOST_GB=%s is not a positive size, "
+                            "the pool stays off\n", T.engine, g); }
+            return;
+        }
+        if (T.c.ram_planned && gb > (double)T.c.ram_spare)
+            fprintf(stderr, "[VK] tier %s: COLI_VK_TIER_HOST_GB=%s GiB over the RAM plan (%s left of the %s budget)\n",
+                    T.engine, g, human((double)T.c.ram_spare, hs, sizeof hs), human((double)T.c.ram_budget, hb, sizeof hb));
+        if (gb > (double)avail) gb = (double)avail;
+        if (gb < 0) gb = 0;
+        want = gb;
+    }
     size_t blk = coli_vk_block_bytes((size_t)256 << 20);
-    if (want < (double)T.exp_bytes || blk < T.exp_bytes) return;
+    if (blk < T.exp_bytes) return;
+    if (want < (double)T.exp_bytes) {   /* no room for one expert: say so, unless the operator sized it */
+        if (!(g && *g)) {
+            if (T.c.ram_planned)
+                fprintf(stderr, "[VK] tier %s: host pool off: the RAM plan leaves %s beside the expert cache (budget %s; "
+                                "COLI_VK_TIER_HOST_GB overrides, COLI_VK_TIER_HOST=0 silences)\n",
+                        T.engine, human(want, hs, sizeof hs), human((double)T.c.ram_budget, hb, sizeof hb));
+            else
+                fprintf(stderr, "[VK] tier %s: host pool off: MemAvailable less the engine's cache growth and 4 GiB leaves %s "
+                                "(COLI_VK_TIER_HOST_GB sets it)\n", T.engine, human(want, hs, sizeof hs));
+        }
+        return;
+    }
     size_t full = (size_t)want / blk, rest = (size_t)want - full * blk;
     long long fit = (long long)full * (long long)(blk / T.exp_bytes) + (long long)(rest / T.exp_bytes);
     if (fit > left) fit = left;
@@ -1683,10 +1728,18 @@ static void host_init(long long all) {
     if (fit < per) lim = (size_t)fit * T.exp_bytes + 4096;
     coli_vk_tier_pool_limit_dev(2, lim);
     T.dmax[2] = (int)fit; T.max_resident += (int)fit; T.h_budget = lim;
-    char hb[32];
-    fprintf(stderr, "[VK] tier %s: host pool on, %d experts in %s of system RAM the device reads over PCIe "
-                    "(the %lld its memory leaves%s; COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB sets it)\n",
-            T.engine, T.dmax[2], human((double)lim, hb, sizeof hb), left, fit < left ? ", not all of them" : "");
+    char hl[32];
+    if (T.c.ram_planned)
+        fprintf(stderr, "[VK] tier %s: host pool on, %d experts in %s of system RAM the device reads over PCIe "
+                        "(the RAM plan leaves %s of the %s budget; %lld the devices leave%s; "
+                        "COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB overrides)\n",
+                T.engine, T.dmax[2], human((double)lim, hl, sizeof hl), human((double)T.c.ram_spare, hs, sizeof hs),
+                human((double)T.c.ram_budget, hb, sizeof hb), left, fit < left ? ", not all of them" : "");
+    else
+        fprintf(stderr, "[VK] tier %s: host pool on, %d experts in %s of system RAM the device reads over PCIe "
+                        "(no RAM plan: MemAvailable less 4 GiB and the engine's cache growth; %lld the devices leave%s; "
+                        "COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB sets it)\n",
+                T.engine, T.dmax[2], human((double)lim, hl, sizeof hl), left, fit < left ? ", not all of them" : "");
 }
 
 int vkt_host_pool_on(void) { return T.on && T.dmax[2] > 0; }
@@ -1987,9 +2040,12 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     }
     if (T.dmax[2]) {
         ColiVkPoolStats ph; coli_vk_pool_stats(5, &ph);
-        char hh[32], hb[32];
+        char hh[32], hbd[32];
         fprintf(stderr, " | host pool: resident %d (budget %d, %s of %s)", T.dres[2], T.dmax[2],
-                human((double)ph.used, hh, sizeof hh), human((double)T.h_budget, hb, sizeof hb));
+                human((double)ph.used, hh, sizeof hh), human((double)T.h_budget, hbd, sizeof hbd));
+        if (T.c.ram_planned)   /* the plan figure the pool was sized from */
+            fprintf(stderr, ", the RAM plan leaves %s of the %s budget",
+                    human((double)T.c.ram_spare, hh, sizeof hh), human((double)T.c.ram_budget, hbd, sizeof hbd));
     }
     if (T.d2 || T.d2_lost) {
         ColiVkPoolStats p2; coli_vk_pool_stats(3, &p2);

@@ -187,6 +187,12 @@ typedef struct {
     size_t dense_bytes;            /* dense weights the engine puts on the device after vkt_init */
     size_t chain_bytes;            /* what the dense chain allocates at its first forward, after the
                                       tier has filled the device (its KV mirror, a prompt chunk): left free */
+    /* The engine's RAM plan, when it keeps one (0 = it keeps none, today's behaviour):
+     * ram_budget is what it resolved (--memory-gb / RAM_GB / MemAvailable), ram_spare
+     * what that plan leaves unclaimed -- the most the tier's host pool may take. */
+    int    ram_planned;
+    size_t ram_budget;
+    size_t ram_spare;
     /* Optional: is this expert in the engine's RAM cache right now? With it the tier
      * balances a step: when the device keeps the CPU waiting, resident experts the
      * CPU also holds in RAM go back to the CPU (never ones it would read from disk),
@@ -324,11 +330,18 @@ int  vkt_dev_host(int layer, uint8_t *host);
 /* score[e]: the tier's rank of layer `layer`'s expert e (its heat and recency: the order it
  * keeps experts in, the higher the hotter); returns 0, -1 when off */
 int  vkt_score(int layer, uint64_t *score);
+/* The host pool's room in bytes: with the engine's RAM plan, what it leaves unclaimed
+ * (never above the budget itself); without one, what is available less the engine's
+ * cache growth (hold) and 4 GiB. Pure arithmetic, for tests; never above avail. */
+size_t vkt_host_room(size_t avail, size_t budget, size_t spare, int planned, size_t hold);
 #else
 static inline int vkt_host_pool_on(void){return 0;}
 static inline size_t vkt_stage_room(void){return 0;}
 static inline int vkt_dev_host(int l,uint8_t *h){(void)l;(void)h;return -1;}
 static inline int vkt_score(int l,uint64_t *s){(void)l;(void)s;return -1;}
+static inline size_t vkt_host_room(size_t avail, size_t budget, size_t spare, int planned, size_t hold){
+    (void)avail;(void)budget;(void)spare;(void)planned;(void)hold;return 0;}
+
 typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; } VktHostExpert;   /* rgu, rd: bytes a row */
 static inline int vkt_dev_table_hybrid(int l,uint32_t *e,VktHostExpert *h){(void)l;(void)e;(void)h;return -1;}
 static inline int  vkt_wanted(void){return 0;}
