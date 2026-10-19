@@ -102,3 +102,34 @@ recorded as fix **F13** in the plan.
 - record: decode tok/s, TTFT, prefill tok/s, disk-busy %, GPU %, tier hit rate
 
 The fork's comparison points are in `C-perf-evidence.md` §1.
+
+## Result — 2k chain arm (a0037a3a)
+
+Command (detached, 24 GiB cgroup):
+
+```bash
+COLI_VULKAN=1 COLI_VK_TIER_HOST=0 COLI_V4_PREWARM=0 V4_PREFIX_CKPT=0 KVSAVE=0 \
+OMP_NUM_THREADS=8 ./deepseek_v4 $MODEL --prompt-file prompt_2k.txt \
+  --max-tokens 1 --memory-gb 18
+```
+
+| metric | value |
+|---|---|
+| prompt / generated | 2,515 / 1 tokens |
+| TTFT | **206.383 s** (prefill ≈ 12.2 tok/s) |
+| TUNE decode | 1 token in 206.406 s |
+| expert requests | 15,440 (hits 1,098, misses 14,342, hit rate 7.11 %) |
+| device share | **608,027 / 648,870 = 93.7 %** of routed experts |
+| tier | 259 resident, 4.73/4.76 GiB, 341 uploads (4.0 GiB), 82 evictions |
+| streamed | 86 steps, 7,777 cold experts, **123.82 GiB at 10.02 GB/s**, 584,960 rows in 367 sub-batches |
+| CPU share | 37.96 s; device 5.48 s; **67 % of device time hidden** |
+| chain | 1 forward, 417 frames, 6,358 ops, 1,106 matmuls, **0 tiled GEMM**; 74.5 s waiting for device; 98.9 s routed experts on host |
+| RSS at exit | 6.279 GiB (dense host copies dropped) |
+| cgroup peak | 17.5 GiB of 24 GiB (no OOM) |
+
+Interpretation: the chain path is **expert-streaming and host-MoE bound**, not
+GPU-bound: 98.9 s of the 206 s is routed experts on the host, and the chain's
+prompt matmuls run per-row GEMV (`0 tiled GEMM`). That is exactly the gap the
+fork's mm8 tiled projection GEMM (P3.1) and prefill expert bank (P4.1) target.
+
+Raw log: `/root/bench-worktrees/port-baseline/bench-phase0/a0037-2k-chain-1tok.log`.
