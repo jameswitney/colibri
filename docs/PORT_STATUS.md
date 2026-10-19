@@ -1,40 +1,46 @@
-# colibri-upstream
+# colibri-upstream — port status
 
-A fresh fork of [JustVugg/colibri](https://github.com/JustVugg/colibri)
-(`upstream/dev`, v2.0.0+) intended to receive the measured capabilities of
-[`colibri-ds4-vulkan`](../colibri-ds4-vulkan) — the DeepSeek-V4-Flash Vulkan
-fork — through upstream's own chain/tier architecture.
+**Status:** active · Phase 0 baseline running · 2026-10-19
+**Repo:** http://ai-container.local.lan:3000/pi/colibri-upstream
+**Base:** `upstream/dev` @ `a0037a3a` (v2.0.0 + ~590)
+**Source fork:** `pi/colibri-ds4-vulkan` @ `d11fba5b` (tag `port-source-2026-10-19` pending F1)
 
-**Status:** planning · 2026-10-19. No source tree yet; the repo is cut from
-`upstream/dev` after the owner decisions in the plan.
+## Decisions taken (2026-10-19)
 
-## Read first
+| # | Decision |
+|---|---|
+| D1 | Target `upstream/dev` |
+| D2 | Repo `colibri-upstream` at `/root/Projects/colibri-upstream`, Gitea `pi/colibri-upstream` |
+| D3 | **Option A** — upstream chain/tier survives; port capabilities, not the fork's per-op stack |
+| D4 | **Both** serving models — `--kv-slots` for live concurrency + content-addressed cold KV |
+| D5 | Upstream silent degradation by default; **opt-in strict mode, enabled by our tests/deploy** |
+| D6 | Decode first, then long-context prefill |
+| D7 | DSV4 engine surgery; generic fixes in shared code |
+| D8 | Upstream PRs for generic slices |
+| D9 | Freeze the old fork after tagging `port-source-2026-10-19` |
+| D10 | **GO** — real-checkpoint baseline approved |
+| D11 | **Approved** — 8 h golden re-record budget |
+| D12 | Add `NOTICE`; never commit weights, `.golden`, or stage-oracle bundles |
 
-- [`docs/PORT_PLAN.md`](docs/PORT_PLAN.md) — the port plan, portfolio,
-  phase gates, risk register, and the decisions required.
-- [`docs/research/`](docs/research/) — the four evidence lanes the plan is
-  built on:
-  - `A-upstream-architecture.md` — what upstream/dev's DSV4 Vulkan path is
-  - `B-fork-inventory.md` — every fork capability, classified for porting
-  - `C-perf-evidence.md` — measured effect sizes, top-10, and the skip list
-  - `D-risk-validation.md` — divergence, ABI/numerics risk, validation matrix
+## Phase 0 — where it stands
 
-## The short version
+- Build at `a0037a3a`: clean (6.8 s, `VK=1 ARCH=native`).
+- `vk-tier-check`: **PASS**; DSV4 activation 271/306 bit-identical to CPU, worst row 0.00e+00.
+- `vk-chain-check`: **PASS**; KV split bit-consistent with `COLI_VK_KV_COLD=device`.
+- Tiny oracle: **PASS** (torch/transformers venv installed in the baseline worktree).
+- Real checkpoint: 2k/1-token chain arm running under a 24 GiB cgroup.
 
-Upstream now has its own DSV4 Vulkan stack (dense chain + shared expert tier),
-so the fork's trigger for re-evaluation has fired. The plan keeps upstream's
-architecture and ports the fork's *measured* wins in slices:
+**Finding F13:** upstream's `COLI_VK_TIER_HOST` host pool defaults on and sizes
+itself from `MemAvailable − 4 GiB`, ignoring `--memory-gb`; it allocated
+**25.75 GiB** beside a 15.5 GiB engine cache and OOM-killed the first runs.
+Baseline runs set `COLI_VK_TIER_HOST=0`. The knob is also missing from
+`docs/ENVIRONMENT.md`. Fix design in progress.
 
-1. engine/storage: KV cold tier v2, reactive prefill fit, KV admission
-2. decode I/O: demand lanes, async pilot, tier admission fixes
-3. RDNA2 kernels: mm8, pf4, flash attention, idxscore/idxsel
-4. prefill pipeline: only if the Phase 0 baseline says upstream is behind
+## Next gates
 
-The fork's `backend_vulkan_dsv4.c`, GPU-FOLD hardwiring, neutral cadence folds,
-and 175-knob env surface are explicitly not ported.
+1. Finish the 2k/8k chain and chain-off baselines (`docs/research/E-baseline.md`).
+2. Land F13 (host-pool bound), P1.5 (strict gate), then P1.1 (KV cold v2).
+3. Re-pin and record `.golden` (8 h approved).
 
-## Next gate
-
-Phase 0: build `upstream/dev VK=1`, measure the real DeepSeek-V4-Flash
-checkpoint on this host, and compare with the fork's recorded baseline. The
-result decides whether this is a delta port or a pipeline port.
+The plan and all evidence lanes are under [`docs/PORT_PLAN.md`](PORT_PLAN.md)
+and [`docs/research/`](research/).
