@@ -545,6 +545,12 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 \
 	test_ggml_quants test_gguf_c test_gq_dot
 TEST_EXCLUDE += test_vk_chain test_glm53_vk_f32
+# test_vk_degrade forks per case (unistd/sys/wait) and links the VK objects: it
+# joins `check` only on Linux VK=1 builds (plain `check` builds VK=0); the
+# device end of the gate is tests/vulkan_strict.sh via vk-strict-check.
+ifneq ($(VK)$(LINUX),1linux)
+TEST_EXCLUDE += test_vk_degrade
+endif
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
 TEST_EXCLUDE += test_qwen36_tier_stream_engine
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
@@ -2369,6 +2375,13 @@ tests/test_vq1_g64$(EXE): tests/test_vq1_g64.c
 tests/test_vk_alloc$(EXE): tests/test_vk_alloc.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# The strict capability gate's helper (backend_vulkan.c's coli_vk_degrade): classes,
+# exit 70, the dedup table, the env parse — no device, but it lives in the VK
+# objects, so VK=1 and (outside Linux) out of `check` like test_vk_tier.
+tests/test_vk_degrade$(EXE): tests/test_vk_degrade.c $(VK_OBJ)
+	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_degrade needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
 # The Vulkan routed-expert tier (vk_tier.c) against a CPU reference: every source
 # format, warm start, eviction, partial batches. It needs VK=1 and a Vulkan device
 # (CI: Lavapipe), so it stays out of `check` (TEST_EXCLUDE) and runs from
@@ -2389,6 +2402,19 @@ tests/test_vk_chain$(EXE): tests/test_vk_chain.c $(VK_OBJ) $(VK_SPV)
 .PHONY: vk-chain-check
 vk-chain-check: tests/test_vk_chain$(EXE)
 	./tests/test_vk_chain$(EXE) shaders/qmatmul.spv
+
+# The strict capability gate end to end (tests/vulkan_strict.sh): the helper's unit
+# test needs no device; the device cases skip themselves (exit 0) where there is
+# no Vulkan device. A VK=0 build has no gate at all — also a skip, not a failure.
+.PHONY: vk-strict-check
+ifeq ($(VK),1)
+vk-strict-check:
+	$(MAKE) tests/test_vk_degrade$(EXE) tests/test_vk_tier$(EXE) tests/test_vk_chain$(EXE)
+	bash tests/vulkan_strict.sh
+else
+vk-strict-check:
+	@echo "vk-strict-check: VK=0, no Vulkan backend (skip)"
+endif
 
 # GLM-5.3's resident f32 dispatch and its dense memory reservation (#1863).
 # Run by vulkan_engines.sh shader; requires a real or software Vulkan device.

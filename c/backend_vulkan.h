@@ -493,6 +493,17 @@ int  coli_vk_core(ColiVkCore *out);
 /* A resident tensor's buffers (VkBuffer as void *) and layout; 0 for a COLI_VK_DEV2 one. */
 typedef struct { void *wbuf, *sbuf; int fmt, I, O, rowWords, gs; } ColiVkTensorInfo;
 int  coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *out);
+/* The strict capability gate (COLI_VK_STRICT=1, docs/vulkan.md). Every point that
+ * would silently leave the GPU off — a shader absent from the deployment, a fence
+ * wait that failed, the device lost mid-run — reports through coli_vk_degrade.
+ * COLI_VK_DEGRADE is a capability the run had and silently loses: under strict it
+ * aborts (exit 70) naming the op. COLI_VK_REFUSE (the device never had it: a
+ * format, a tile) and COLI_VK_FALLBACK (budget, policy) never abort. Unset or 0:
+ * counters only, behaviour byte-identical. */
+typedef enum { COLI_VK_REFUSE = 0, COLI_VK_DEGRADE = 1, COLI_VK_FALLBACK = 2 } ColiVkClass;
+void coli_vk_degrade(ColiVkClass cls, const char *op, const char *reason);
+long coli_vk_degrade_events(void);   /* tests: degradation events so far, refusals excluded */
+int  coli_vk_strict(void);           /* COLI_VK_STRICT=1 */
 /* The chain's fence wait failed: the device is lost, the backend stops. */
 void coli_vk_mark_lost(void);
 /* vkQueueSubmit(queue, 1, submit_info, fence) as the backend submits (a VkResult): the

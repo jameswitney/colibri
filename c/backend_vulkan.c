@@ -1015,8 +1015,80 @@ static int coop_slot(int S) {
 static void vk_prof_paths(void);
 static int g_vk_prof;
 
+/* ---- the strict capability gate (COLI_VK_STRICT, backend_vulkan.h) ----------------
+ *
+ * Upstream degrades silently: a shader absent from the deployment, a fence wait that
+ * failed, a device lost mid-run each leave part of the model on the CPU with at most
+ * a passing line, and a failed tier looks like a slow one. COLI_VK_STRICT=1 turns
+ * the silent losses (COLI_VK_DEGRADE) into exit 70 naming the op, so a deployment or
+ * CI run says what it lost instead of quietly running without it. Refusals (the
+ * device never had the capability: a format, a tile — COLI_VK_REFUSE) and fallbacks
+ * (budget or policy — COLI_VK_FALLBACK) never abort; a refusal prints one line per
+ * op under strict. The knob unset or 0 keeps everything exactly as it was: the gate
+ * counts, prints nothing and changes no control flow. */
+static int g_strict = -1, g_strict_abort;
+static pthread_mutex_t g_degrade_mx = PTHREAD_MUTEX_INITIALIZER;
+static struct { const char *op; ColiVkClass cls; long events; } g_degrade[64];
+static int g_degrade_n;
+
+int coli_vk_strict(void) {
+    /* read once, like the file's other lazy knobs (the engine thread calls first) */
+    if (g_strict < 0) { const char *e = getenv("COLI_VK_STRICT"); g_strict = e && *e && !strcmp(e, "1"); }
+    return g_strict;
+}
+
+long coli_vk_degrade_events(void) {
+    long n = 0;
+    pthread_mutex_lock(&g_degrade_mx);
+    for (int k = 0; k < g_degrade_n; k++) if (g_degrade[k].cls != COLI_VK_REFUSE) n += g_degrade[k].events;
+    pthread_mutex_unlock(&g_degrade_mx);
+    return n;
+}
+
+static void vk_degrade_summary(void) {   /* strict only, on the exits that did not abort */
+    if (g_strict_abort) return;
+    long dg = 0, rf = 0;
+    pthread_mutex_lock(&g_degrade_mx);
+    for (int k = 0; k < g_degrade_n; k++)
+        if (g_degrade[k].cls == COLI_VK_REFUSE) rf += g_degrade[k].events;
+        else dg += g_degrade[k].events;
+    pthread_mutex_unlock(&g_degrade_mx);
+    fprintf(stderr, "[VK] strict: %ld degradations, %ld refusals\n", dg, rf);
+}
+
+void coli_vk_degrade(ColiVkClass cls, const char *op, const char *reason) {
+    int fresh = 0;
+    pthread_mutex_lock(&g_degrade_mx);
+    int k;
+    for (k = 0; k < g_degrade_n; k++) if (!strcmp(g_degrade[k].op, op)) break;
+    if (k == g_degrade_n && g_degrade_n < (int)(sizeof g_degrade / sizeof g_degrade[0])) {
+        g_degrade[g_degrade_n].op = op; g_degrade[g_degrade_n].cls = cls; g_degrade[g_degrade_n].events = 0;
+        k = g_degrade_n++;
+    }
+    if (k < g_degrade_n && ++g_degrade[k].events == 1) fresh = 1;
+    if (cls == COLI_VK_DEGRADE && coli_vk_strict()) {
+        fprintf(stderr, "[VK] strict: aborting, op=%s — %s\n", op, reason ? reason : "");
+        g_strict_abort = 1;
+        pthread_mutex_unlock(&g_degrade_mx);
+        exit(70);   /* the degradation already changed what the run computes; stop it there */
+    }
+    if (cls == COLI_VK_REFUSE && fresh && coli_vk_strict())
+        fprintf(stderr, "[VK] refused: %s — %s\n", op, reason ? reason : "");
+    pthread_mutex_unlock(&g_degrade_mx);
+}
+
+static void vk_strict_boot(void) {   /* one line per process, before any early return 0 */
+    static int once;
+    if (once) return;
+    once = 1;
+    if (!coli_vk_strict()) return;   /* unset or 0: not a byte of new output */
+    atexit(vk_degrade_summary);
+    fprintf(stderr, "[VK] strict: on (COLI_VK_STRICT) — a capability degradation aborts\n");
+}
+
 int coli_vk_init(const char *spv_path) {
     if (G.ready) return 1;
+    vk_strict_boot();
     if (!coli_vk_load()) return 0;
     up_fault_init();
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -1401,9 +1473,12 @@ int coli_vk_init(const char *spv_path) {
     }
 
     G.shader = load_spv(G.dev, spv_path);
-    if (!G.shader) return 0;
+    if (!G.shader) { coli_vk_degrade(COLI_VK_DEGRADE, "core shader", "qmatmul.spv absent or invalid"); return 0; }
     snprintf(G.spv_path, sizeof G.spv_path, "%s", spv_path);
-    if (!build_pipeline(G.dev, 4, sizeof(struct PC), G.shader, &G.dsl, &G.plyt, &G.pipe, &G.dpool, &G.dset)) return 0;
+    if (!build_pipeline(G.dev, 4, sizeof(struct PC), G.shader, &G.dsl, &G.plyt, &G.pipe, &G.dpool, &G.dset)) {
+        coli_vk_degrade(COLI_VK_DEGRADE, "core pipeline", "the core matmul pipeline did not build");
+        return 0;
+    }
 
     /* Optional tiled GEMMs: an absent shader or a tile the device cannot hold leaves
      * that slot empty; without the fp32 one every S stays on the GEMV. The cooperative-
@@ -1413,16 +1488,19 @@ int coli_vk_init(const char *spv_path) {
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(G.phys, &pp);
         char gm_path[512]; derive_sibling(spv_path, "_gemm.spv", gm_path, sizeof(gm_path));
         G.shader_gemm = load_spv(G.dev, gm_path);
+        if (!G.shader_gemm) coli_vk_degrade(COLI_VK_DEGRADE, "qmatmul_gemm.spv", "absent: the tiled GEMM stays off");
         const char *e = getenv("COLI_VK_GEMM_TILE");
         VkGemmTile u = {0, 0, 0, 0, 0, 0};
         int one = e && *e && sscanf(e, "%d,%d,%d,%d,%d,%d", &u.bm, &u.bn, &u.bk, &u.tm, &u.tn, &u.pf) >= 5 &&
                   gemm_tile_ok(u, &pp.limits);
-        if (e && *e && !one) fprintf(stderr, "[VK] COLI_VK_GEMM_TILE=%s rejected\n", e);
+        if (e && *e && !one) { fprintf(stderr, "[VK] COLI_VK_GEMM_TILE=%s rejected\n", e);
+                              coli_vk_degrade(COLI_VK_REFUSE, "COLI_VK_GEMM_TILE", e); }
         for (int k = 0; G.shader_gemm && k < (one ? 1 : VK_GEMM_SLOTS); k++) {
             VkGemmTile t = one ? u : gemm_tiles[k];
             if (gemm_tile_ok(t, &pp.limits)) gemm_pipeline(t, k);
         }
         if (G.shader_gemm && !G.pipe_gemm[0]) {
+            coli_vk_degrade(COLI_VK_REFUSE, "qmatmul_gemm.spv", "no built-in tile fits this device's limits: the tiled GEMM stays off");
             vkDestroyShaderModule(G.dev, G.shader_gemm, NULL); G.shader_gemm = VK_NULL_HANDLE;
             for (int k = 1; k < VK_GEMM_SLOTS; k++)
                 if (G.pipe_gemm[k]) { vkDestroyPipeline(G.dev, G.pipe_gemm[k], NULL); G.pipe_gemm[k] = VK_NULL_HANDLE; }
@@ -1430,11 +1508,13 @@ int coli_vk_init(const char *spv_path) {
         if (G.has_coop && G.pipe_gemm[0]) {
             char cm_path[512]; derive_sibling(spv_path, "_coop.spv", cm_path, sizeof(cm_path));
             G.shader_coop = load_spv(G.dev, cm_path);
+            if (!G.shader_coop) coli_vk_degrade(COLI_VK_DEGRADE, "qmatmul_coop.spv", "absent: the cooperative-matrix GEMM stays off");
             e = getenv("COLI_VK_COOP_TILE");
             VkCoopTile c = {0, 0, 0, 0, 0};
             one = e && *e && sscanf(e, "%d,%d,%d,%d,%d", &c.bm, &c.bn, &c.wm, &c.wn, &c.bk) == 5 &&
                   coop_tile_ok(c, &pp.limits);
-            if (e && *e && !one) fprintf(stderr, "[VK] COLI_VK_COOP_TILE=%s rejected\n", e);
+            if (e && *e && !one) { fprintf(stderr, "[VK] COLI_VK_COOP_TILE=%s rejected\n", e);
+                                  coli_vk_degrade(COLI_VK_REFUSE, "COLI_VK_COOP_TILE", e); }
             /* every slot shares BK: coop_fmt checks group sizes against it */
             for (int k = 0; G.shader_coop && k < (one ? 1 : VK_COOP_SLOTS); k++) {
                 VkCoopTile t = one ? c : coop_tiles[k];
@@ -1442,6 +1522,7 @@ int coli_vk_init(const char *spv_path) {
             }
         }
         if (!G.pipe_coop[0]) {
+            if (G.shader_coop) coli_vk_degrade(COLI_VK_REFUSE, "qmatmul_coop.spv", "no built-in tile fits this device's limits: the cooperative-matrix GEMM stays off");
             for (int k = 1; k < VK_COOP_SLOTS; k++)
                 if (G.pipe_coop[k]) { vkDestroyPipeline(G.dev, G.pipe_coop[k], NULL); G.pipe_coop[k] = VK_NULL_HANDLE; }
             if (G.shader_coop) vkDestroyShaderModule(G.dev, G.shader_coop, NULL);
@@ -1464,6 +1545,7 @@ int coli_vk_init(const char *spv_path) {
      * (single-matmul path keeps working). */
     char gu_path[512]; derive_sibling(spv_path, "_gate_up.spv", gu_path, sizeof(gu_path));
     G.shader_gu = load_spv(G.dev, gu_path);
+    if (!G.shader_gu) coli_vk_degrade(COLI_VK_DEGRADE, "qmatmul_gate_up.spv", "absent: fused MLP off");
     if (G.shader_gu && !build_pipeline(G.dev, 6, sizeof(struct PCGU), G.shader_gu, &G.dsl_gu, &G.plyt_gu, &G.pipe_gu, &G.dpool_gu, &G.dset_gu))
         return 0;
 
@@ -1472,6 +1554,7 @@ int coli_vk_init(const char *spv_path) {
      * (coli_vk_attn_qprep); absent -> callers keep the 3-submit path. */
     char nrm_path[512]; derive_dir_file(spv_path, "rmsnorm.spv", nrm_path, sizeof(nrm_path));
     G.shader_nrm = load_spv(G.dev, nrm_path);
+    if (!G.shader_nrm) coli_vk_degrade(COLI_VK_DEGRADE, "rmsnorm.spv", "absent: the 3-submit q-prep path stays");
     if (G.shader_nrm) {
         VkDescriptorPool np; VkDescriptorSet ns;
         if (!build_pipeline(G.dev, 3, sizeof(struct PCN), G.shader_nrm, &G.dsl_nrm, &G.plyt_nrm, &G.pipe_nrm, &np, &ns))
@@ -1488,6 +1571,7 @@ int coli_vk_init(const char *spv_path) {
     }
     char att_path[512]; derive_dir_file(spv_path, "attention_absorb.spv", att_path, sizeof(att_path));
     G.shader_att = load_spv(G.dev, att_path);
+    if (!G.shader_att) coli_vk_degrade(COLI_VK_DEGRADE, "attention_absorb.spv", "absent: absorbed attention stays off");
     if (G.shader_att && !build_pipeline(G.dev, 7, sizeof(struct PCAttn), G.shader_att, &G.dsl_att, &G.plyt_att, &G.pipe_att, &G.dpool_att, &G.dset_att))
         return 0;
 
@@ -2375,6 +2459,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
     VkResult wr = path ? vk_fence_wait_gemm(G.dev, G.fence) : vk_fence_wait(G.dev, G.fence);
     if (wr != VK_SUCCESS) {
         fprintf(stderr, "[VK] fence wait failed: %d — disabling GPU offload, staying on CPU\n", wr);
+        coli_vk_degrade(COLI_VK_DEGRADE, "matmul fence", "the wait failed: GPU offload disabled");
         G.ready = 0;
         return 0;
     }
@@ -2685,7 +2770,10 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        coli_vk_degrade(COLI_VK_DEGRADE, "gate_up fence", "the fused gate+up wait failed: GPU offload disabled");
+        G.ready = 0; return 0;
+    }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(hidden, G.h.ptr, hb);
     G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
@@ -2808,6 +2896,7 @@ int coli_vk_expert_group_take(float *y) {
     G.eg_inflight = 0;
     if (vk_fence_wait(G.dev, G.eg_fence) != VK_SUCCESS) {   /* no async_end: the group may still run */
         fprintf(stderr, "[VK] expert-group fence wait failed — disabling GPU offload\n");
+        coli_vk_degrade(COLI_VK_DEGRADE, "expert group fence", "the wait failed: GPU offload disabled");
         G.ready = 0; return 0;
     }
     async_end(0);
@@ -2890,6 +2979,7 @@ static uint32_t pool_memtype(const VkWPool *P) {
 static void up_lost(int dev) {
     fprintf(stderr, "[VK] %sstaged upload failed (%s: %d): the device is lost, disabling %s\n", dev ? "dev2 " : "",
             g_up[dev].what ? g_up[dev].what : "?", (int)g_up[dev].err, dev ? "dev2 offload" : "GPU offload");
+    coli_vk_degrade(COLI_VK_DEGRADE, dev ? "dev2 lost" : "device lost", "a staged upload's fence failed");
     /* another thread (the tier's uploader) may be the one that finds out */
     if (dev) __atomic_store_n(&G2.ready, 0, __ATOMIC_RELEASE); else __atomic_store_n(&G.ready, 0, __ATOMIC_RELEASE);
 }
@@ -3265,6 +3355,7 @@ int coli_vk_expert_group_take2(float *y) {
     G2.inflight = 0;
     if (vk_fence_wait(G2.dev, G2.fence) != VK_SUCCESS) {   /* no async_end: the group may still run */
         fprintf(stderr, "[VK] dev2 expert-group fence wait failed — disabling dev2 offload\n");
+        coli_vk_degrade(COLI_VK_DEGRADE, "dev2 expert group fence", "the wait failed: dev2 offload disabled");
         G2.ready = 0; return 0;
     }
     async_end(1);
@@ -3323,7 +3414,10 @@ static int pw_flush(void) {   /* send what is pending now, in a command buffer o
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
-    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        coli_vk_degrade(COLI_VK_DEGRADE, "prefetch fence", "the prefetch writeback's wait failed: GPU offload disabled");
+        G.ready = 0; return 0;
+    }
     pw_done();
     return 1;
 }
@@ -3465,7 +3559,10 @@ int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc,
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        coli_vk_degrade(COLI_VK_DEGRADE, "kv mirror fence", "the submit's wait failed: GPU offload disabled");
+        G.ready = 0; return 0;
+    }
     pw_done();
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(ctx, G.y.ptr, cb);
@@ -3525,7 +3622,10 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        coli_vk_degrade(COLI_VK_DEGRADE, "kv mirror fence", "the submit's wait failed: GPU offload disabled");
+        G.ready = 0; return 0;
+    }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(y1, G.y.ptr, yb1);
     memcpy(y2, G.y2.ptr, yb2);
@@ -3633,7 +3733,10 @@ int coli_vk_attn_qprep(int layer,
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        coli_vk_degrade(COLI_VK_DEGRADE, "kv mirror fence", "the submit's wait failed: GPU offload disabled");
+        G.ready = 0; return 0;
+    }
     pw_done();
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(q_out, G.y.ptr, qb_b);
@@ -3708,7 +3811,10 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vk_submit(0, G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        coli_vk_degrade(COLI_VK_DEGRADE, "kv mirror fence", "the submit's wait failed: GPU offload disabled");
+        G.ready = 0; return 0;
+    }
     pw_done();
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(out, G.y.ptr, ob);
@@ -4128,7 +4234,11 @@ static int xb_reserve(XbCtx *X, size_t xr, size_t ir, size_t yr) {
                 (double)(nx + 3 * ni + ny) * 2 / 1048576.0,
                 back ? "this step's experts on the CPU (the batch keeps its scratch)"
                      : X->d ? "the second device stops" : "the tier stops");
-        if (!back) { X->ready = 0; return 0; }
+        if (!back) {
+            coli_vk_degrade(COLI_VK_DEGRADE, X->d ? "dev2 expert batch scratch" : "expert batch scratch",
+                            "the scratch failed: the tier stops");
+            X->ready = 0; return 0;
+        }
         ok = 0;
     }
     for (ColiVkExpert *e = X->live; e; e = e->next) xb_write_sets(e);
@@ -5178,6 +5288,7 @@ recorded:
     if (vk_submit(X->d, X->q, &si, fence) != VK_SUCCESS) {
         fprintf(stderr, "[VK] %sexpert batch: submit failed, %s\n", X->d ? "dev2 " : "",
                 X->d ? "the second device stops" : "the tier stops");
+        coli_vk_degrade(COLI_VK_DEGRADE, "expert batch submit", "the submit failed: the tier stops");
         X->ready = 0; return 0;
     }
     *ngemm_out = ngemm;
@@ -5258,6 +5369,7 @@ static int xb_join(XbCtx *X, const float **yrows, double *device_ms) {
     if (r != VK_SUCCESS) {   /* no async_end: the batch may still run */
         fprintf(stderr, "[VK] %sexpert batch: fence wait failed (%d), %s\n", X->d ? "dev2 " : "", r,
                 X->d ? "the second device stops" : "the tier stops");
+        coli_vk_degrade(COLI_VK_DEGRADE, "expert batch fence", "the batch's wait failed: the tier stops");
         X->ready = 0;
         if (X->d) __atomic_store_n(&G2.ready, 0, __ATOMIC_RELEASE);   /* lost: nothing else runs there */
         return 0;
@@ -5437,6 +5549,7 @@ int coli_vk_xb_sub_join(int h, float *const *yout, double *device_ms) {
     VkResult r = wait_fault() ? VK_TIMEOUT : vk_fence_wait_gemm(X->dev, X->sub[h].fence);
     if (r != VK_SUCCESS) {   /* no async_end: the batch may still run */
         fprintf(stderr, "[VK] expert batch: fence wait failed (%d), the tier stops\n", r);
+        coli_vk_degrade(COLI_VK_DEGRADE, "expert batch fence", "the sub-batch's wait failed: the tier stops");
         X->ready = 0; return 0;
     }
     async_end(X->d);
@@ -5558,7 +5671,9 @@ const float *coli_vk_xb_step_sum(const float *w, const uint8_t *use, double *dev
     async_begin(X->d);
     VkResult r = vk_fence_wait_gemm(X->dev, X->fence);
     if (r != VK_SUCCESS) {   /* no async_end: the sum may still run */
-        fprintf(stderr, "[VK] expert batch: the step's sum failed (%d)\n", r); X->ready = 0; return NULL;
+        fprintf(stderr, "[VK] expert batch: the step's sum failed (%d)\n", r);
+        coli_vk_degrade(COLI_VK_DEGRADE, "expert batch sum", "the step's sum failed: the tier stops");
+        X->ready = 0; return NULL;
     }
     async_end(X->d);
     double ms = 0;
@@ -5664,7 +5779,12 @@ static void xb_shutdown(XbCtx *X) {
  * calls this; the pool's lock is the only shared state it touches. */
 int coli_vk_tier_tensor_pad(int dev, ColiVkTensor **t, int fmt, int I, int O, int gs, size_t pad_w, size_t pad_s,
                             uint8_t **rows, size_t *stride, float **scales) {
-    if ((dev == 1 ? !G2.ready : !G.ready) || !fmt_uploadable(fmt, gs) || (dev == 2 && !coli_vk_tier_host_pool())) return 0;
+    if (dev == 1 ? !G2.ready : !G.ready) return 0;
+    if (!fmt_uploadable(fmt, gs)) {
+        coli_vk_degrade(COLI_VK_REFUSE, "fmt_uploadable", "the format has no device form");
+        return 0;
+    }
+    if (dev == 2 && !coli_vk_tier_host_pool()) return 0;
     void *w, *s;
     ColiVkTensor *n = tensor_alloc_pad(dev == 2 ? &g_hpool : dev == 1 ? &g_tpool2 : &g_tpool, fmt, I, O, gs, pad_w, pad_s, &w, &s);
     if (!n) return 0;
@@ -5686,7 +5806,11 @@ int coli_vk_tier_tensor(ColiVkTensor **t, int fmt, int I, int O, int gs,
 }
 int coli_vk_tier_tensor_extra(ColiVkTensor **t, int fmt, int I, int O, int gs,
                               uint8_t **rows, size_t *stride, float **scales) {
-    if (!G.ready || !fmt_uploadable(fmt, gs)) return 0;
+    if (!G.ready) return 0;
+    if (!fmt_uploadable(fmt, gs)) {
+        coli_vk_degrade(COLI_VK_REFUSE, "fmt_uploadable", "the format has no device form");
+        return 0;
+    }
     void *w, *s;
     ColiVkTensor *n = tensor_alloc(&g_xpool, fmt, I, O, gs, &w, &s);
     if (!n) return 0;
@@ -5958,7 +6082,10 @@ int coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *o) {
     return 1;
 }
 /* A fence the chain waited on failed: the device is gone, everyone falls back. */
-void coli_vk_mark_lost(void) { G.ready = 0; }
+void coli_vk_mark_lost(void) {
+    coli_vk_degrade(COLI_VK_DEGRADE, "device lost", "a fence the chain waited on failed: GPU offload disabled");
+    G.ready = 0;
+}
 
 /* ---- the dense chain on either device (vk_chain.c keeps a context per device) --------
  * d = 0 is the primary device, what the calls without _dev answer; d = 1 is COLI_VK_DEV2's
@@ -5980,7 +6107,15 @@ int coli_vk_core_dev(int d, ColiVkCore *o) {
     return 1;
 }
 int coli_vk_available_dev(int d) { return d == 1 ? G2.ready : G.ready; }
-void coli_vk_mark_lost_dev(int d) { if (d == 1) G2.ready = 0; else G.ready = 0; }
+void coli_vk_mark_lost_dev(int d) {
+    if (d == 1) {
+        coli_vk_degrade(COLI_VK_DEGRADE, "dev2 lost", "a fence the chain waited on failed: dev2's experts go back to the CPU");
+        G2.ready = 0;
+    } else {
+        coli_vk_degrade(COLI_VK_DEGRADE, "device lost", "a fence the chain waited on failed: GPU offload disabled");
+        G.ready = 0;
+    }
+}
 int coli_vk_queue_submit_dev(int d, void *queue, const void *submit_info, void *fence) {
     return (int)vk_submit(d == 1 ? 1 : 0, (VkQueue)queue, (const VkSubmitInfo *)submit_info, (VkFence)fence);
 }

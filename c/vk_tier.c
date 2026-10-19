@@ -1705,6 +1705,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (!form_init(0, T.c.gate_up, T.c.down)) {
         fprintf(stderr, "[VK] tier %s: expert format %d/%d (gs %d/%d) has no device form, the experts stay on the CPU\n",
                 eng, T.c.gate_up.kind, T.c.down.kind, T.c.gate_up.gs, T.c.down.gs);
+        coli_vk_degrade(COLI_VK_REFUSE, "tier expert format", "the expert format has no device form: the experts stay on the CPU");
         return 0;
     }
     int act = T.c.act == VKT_ACT_SITU ? COLI_VK_ACT_SITU
@@ -1717,6 +1718,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (!forms_per_layer()) {
         fprintf(stderr, "[VK] tier %s: the layers' expert formats (more than %d forms, or one with no device form) do not "
                         "all go to the device, the experts stay on the CPU\n", eng, VKT_FORMS - 1);
+        coli_vk_degrade(COLI_VK_REFUSE, "tier forms", "more forms than the tier holds, or one with no device form");
         return 0;
     }
     T.exp_bytes = T.per_layer ? tier_expert_bytes_at(coli_vk_buffer_alignment()) : vkt_expert_bytes(H, F, T.c.gate_up, T.c.down);
@@ -1725,9 +1727,11 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         if (form_init(1, T.c.extra_gate_up, T.c.extra_down) && T.exp_bytes &&
             (T.x_bytes = vkt_expert_bytes(H, F, T.c.extra_gate_up, T.c.extra_down)))
             T.c.layers += T.c.extra_layers;
-        else
+        else {
             fprintf(stderr, "[VK] tier %s: the extra layers' expert format %d/%d (gs %d/%d) has no device form, their experts stay on the CPU\n",
                     eng, T.c.extra_gate_up.kind, T.c.extra_down.kind, T.c.extra_gate_up.gs, T.c.extra_down.gs);
+            coli_vk_degrade(COLI_VK_REFUSE, "tier extra format", "the extra layers' format has no device form: their experts stay on the CPU");
+        }
     }
     if (T.main_layers == T.c.layers) T.c.extra_layers = 0;
 
