@@ -16342,12 +16342,17 @@ static int v4_ckpt_disk_restore(ColiV4Session *session, int prompt_count) {
 
 static int v4_ckpt_restore(ColiV4Session *session, int prompt_count) {
     if (!v4_ckpt_min_tokens()) return 0;
+    /* The slots first: a pin's capture is there whatever its length (upstream's
+     * contract — a pinned prompt is short by nature and never length-gated),
+     * and the cold tier's catalog below keeps its own gates. */
+    int reuse = v4_ckpt_mem_restore(session, prompt_count);
+    if (reuse) return reuse;
     if (v4_ckpt_disk_wanted()) {
         v4_ckpt_disk_init(session);
         v4_ckpt_disk_scan();
         return v4_ckpt_disk_restore(session, prompt_count);
     }
-    return v4_ckpt_mem_restore(session, prompt_count);
+    return 0;
 }
 
 static void v4_ckpt_store(ColiV4Session *session, int len, int kind) {
@@ -16717,8 +16722,10 @@ static int session_generate_impl(ColiV4Session *session,
         } else {
             session->pin_len = 0;        /* an optimisation, never an error */
         }
-        if (v4_ckpt_min_tokens() && !v4_ckpt_have(session->prompt_ids, prompt_count))
-            v4_ckpt_store(session, prompt_count, 1);
+        if (v4_ckpt_min_tokens() && !v4_ckpt_have(session->prompt_ids, prompt_count)) {
+            v4_ckpt_store(session, prompt_count, 1);      /* the cold tier, its own gates */
+            v4_ckpt_mem_store(session, prompt_count, 1);  /* a pin's slot: any length, upstream's contract */
+        }
     }
     /* The prompt is in the attention state from here on; record it before the
      * decode loop so a failure mid-generation still leaves fed describing what
