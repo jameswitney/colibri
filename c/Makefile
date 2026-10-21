@@ -761,6 +761,7 @@ VK_SPV   += shaders/chain_gemv_bd.spv shaders/qmatmul_gemm_bd.spv
 VK_SPV   += shaders/chain_gemv_bd_i8.spv
 # the expert batch's grouped GEMM for a GGUF's experts, down and gate+up (backend_vulkan.c)
 VK_SPV   += shaders/qmatmul_grp_bd.spv shaders/qmatmul_grp_gate_up_bd.spv
+VK_SPV   += shaders/qmatmul_grp_mx.spv shaders/qmatmul_grp_gate_up_mx.spv
 # and both on the matrix units (cooperative matrices at subgroups of 64 or 32)
 VK_SPV   += shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_grp_bdc.spv shaders/qmatmul_grp_gate_up_bdc.spv
 # and for our own formats' experts on the chain's prompt chunks (vk_chain.c: vkc_moe_rows)

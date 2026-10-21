@@ -4077,6 +4077,10 @@ typedef struct XbCtx {
     /* the block formats' grouped GEMM (qmatmul_grp_bd.comp: [0] down, [1] gate+up), a pipeline
      * per ggml type, made on first use; grp_bd: its shaders and the grouped sets are there */
     VkShaderModule sh_grp_bd[2]; VkPipeline p_grp_bd[2][64]; uint8_t grp_bd_tried[2][64]; int grp_bd;
+    /* the native MXFP4's grouped GEMM (qmatmul_grp_mx.comp: [0] down, [1] gate+up, no
+     * per-type variants — the group size rides the expert table); grp_mx: its shaders
+     * and the grouped sets are there */
+    VkShaderModule sh_grp_mx[2]; VkPipeline p_grp_mx[2]; uint8_t grp_mx_tried[2]; int grp_mx;
     VkPipeline p_grp[2]; VkDescriptorPool grp_pool; VkDescriptorSet grp_set[3][2];
     VkShaderModule sh_gv[2]; VkPipeline p_gv[2];   /* qmatmul_grp_gemv.comp: the same batches below grp_rows */
     XbBuf grp_it[3][2], grp_et[3][2], grp_map[3];
@@ -4529,6 +4533,44 @@ static VkPipeline xb_grp_bd_pipe(XbCtx *X, int v, int t) {
     return X->p_grp_bd[v][t];
 }
 
+/* The native MXFP4's grouped GEMM (qmatmul_grp_mx.spv, qmatmul_grp_gate_up_mx.spv): the
+ * tier's fmt 7 experts in one dispatch over the batch — the GGUF blocks' shape (mode 3)
+ * with the GEMV's decode, for the checkpoints whose only group route was the GEMV (mode 2,
+ * a row a time) and the per-expert ops. COLI_VK_XB_GROUPED_MX=0 keeps those routes. */
+static void xb_grp_mx_init(XbCtx *X) {
+    const char *e = getenv("COLI_VK_XB_GROUPED_MX");
+    if (X->d || !G.has_bda || (e && *e == '0')) return;
+    VkPhysicalDeviceProperties lp; vkGetPhysicalDeviceProperties(X->phys, &lp);
+    if (lp.limits.maxComputeSharedMemorySize < 26214) return;   /* wg4/wu4 + xs4, both variants */
+    const char *nm[2] = {"qmatmul_grp_mx.spv", "qmatmul_grp_gate_up_mx.spv"};
+    for (int v = 0; v < 2; v++) {
+        char path[1100];
+        derive_dir_file(X->spv, nm[v], path, sizeof path);
+        if (!(X->sh_grp_mx[v] = load_spv(X->dev, path))) return;
+    }
+    if (!X->pl_grp && !xb_layout(X, 5, 0u, sizeof(struct PCGRP), &X->dsl_grp, &X->pl_grp)) return;
+    if (!X->grp_pool) {
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 30};
+        VkDescriptorPoolCreateInfo dp = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = 6, .poolSizeCount = 1, .pPoolSizes = &ps};
+        if (vkCreateDescriptorPool(X->dev, &dp, NULL, &X->grp_pool) != VK_SUCCESS) { X->grp_pool = VK_NULL_HANDLE; return; }
+        VkDescriptorSetLayout l6[6] = {X->dsl_grp, X->dsl_grp, X->dsl_grp, X->dsl_grp, X->dsl_grp, X->dsl_grp};
+        VkDescriptorSetAllocateInfo da = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = X->grp_pool, .descriptorSetCount = 6, .pSetLayouts = l6};
+        if (vkAllocateDescriptorSets(X->dev, &da, &X->grp_set[0][0]) != VK_SUCCESS) return;
+    }
+    X->grp_mx = 1;
+}
+/* its pipeline for v (0 down, 1 gate+up), made on first use */
+static VkPipeline xb_grp_mx_pipe(XbCtx *X, int v) {
+    if (!X->grp_mx) return VK_NULL_HANDLE;
+    if (!X->grp_mx_tried[v]) {
+        X->grp_mx_tried[v] = 1;
+        if (!xb_pipeline(X, X->sh_grp_mx[v], X->pl_grp, NULL, &X->p_grp_mx[v])) X->p_grp_mx[v] = VK_NULL_HANDLE;
+    }
+    return X->p_grp_mx[v];
+}
+
 /* chain_moe_gv.comp in the expert batch (the shader beside the main one): the dense chain's
  * decode kernel for a batch's small experts, a row a pair (K 1), so a row's bits there are
  * the chain's (a prompt chunk's experts through the tier, its next tokens through the chain,
@@ -4846,6 +4888,7 @@ static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a,
     xb_coop_init(X);
     xb_grp_init(X);
     xb_grp_bd_init(X);
+    xb_grp_mx_init(X);
     xb_cgv_init(X);
     xb_cbd_init(X);
     VkCommandPoolCreateInfo cp = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -5031,6 +5074,21 @@ static int xb_grp_ok(const XbCtx *X, ColiVkExpert *const *ex, const int *rows, i
         }
         if (ok && xb_grp_bd_pipe((XbCtx *)X, 1, tg - 100) && xb_grp_bd_pipe((XbCtx *)X, 0, td - 100)) return 3;
     }
+    /* mode 4: the tier's native MXFP4 experts (fmt 7), one layer's types, a big step
+     * (total >= grp_rows): the GEMV (mode 2) keeps the small ones below the threshold,
+     * the per-expert ops had these. One group a 32-input half: gs % 32 == 0. */
+    if (X->grp_mx && total >= X->grp_rows && X->act == COLI_VK_ACT_SWIGLU && dr % X->align == 0 && ir % X->align == 0 &&
+        D % 64 == 0 && I % 64 == 0 && count > 0 && ex[0]->g->fmt == 7 && ex[0]->d->fmt == 7 &&
+        ex[0]->g->gs >= 32 && ex[0]->g->gs % 32 == 0 && ex[0]->d->gs >= 32 && ex[0]->d->gs % 32 == 0) {
+        int ok = 1;
+        for (int c = 0; c < count && ok; c++) {
+            const ColiVkTensor *t[3] = {ex[c]->g, ex[c]->u, ex[c]->d};
+            for (int k = 0; k < 3; k++)
+                ok = ok && !t[k]->dev && t[k]->pool && t[k]->fmt == 7 && t[k]->rowWords % 4 == 0 &&
+                     t[k]->gs == (k < 2 ? ex[0]->g->gs : ex[0]->d->gs);
+        }
+        if (ok && xb_grp_mx_pipe((XbCtx *)X, 1) && xb_grp_mx_pipe((XbCtx *)X, 0)) return 4;
+    }
     if (!X->grp_rows || dr % X->align || ir % X->align) return 0;
     int mode = total >= X->grp_rows ? 1 : X->p_gv[0] ? 2 : 0;
     /* the grouped GEMV also computes SiTU and MXFP4 (Kimi K3, MiMo, DeepSeek V4.1): on a Radeon
@@ -5067,9 +5125,9 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
      * of one (expert, block) adjacent, so workgroups in flight share weights */
     /* the GEMV's items: (expert, row, XB_GV_RPW outputs) */
     /* mode 3 (the block formats'): 32 rows, 64 outputs of the down and 32 of gate+up */
-    const int tm = mode == 1 ? (X->grp_q ? 32 : 16 * XB_GRP_TT) : mode == 3 ? 32 : 1;
-    const int bov[2] = {mode == 1 ? (X->grp_q ? 64 : 128) : mode == 3 ? 64 : XB_GV_RPW,
-                        mode == 1 ? (X->grp_q ? 32 : 128) : mode == 3 ? 32 : XB_GV_RPW};
+    const int tm = mode == 1 ? (X->grp_q ? 32 : 16 * XB_GRP_TT) : (mode == 3 || mode == 4) ? 32 : 1;
+    const int bov[2] = {mode == 1 ? (X->grp_q ? 64 : 128) : (mode == 3 || mode == 4) ? 64 : XB_GV_RPW,
+                        mode == 1 ? (X->grp_q ? 32 : 128) : (mode == 3 || mode == 4) ? 32 : XB_GV_RPW};
     int nit[2] = {0, 0};
     for (int c = 0; c < count; c++) {
         int nt = (rows[c] + tm - 1) / tm;
@@ -5100,7 +5158,7 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
             for (int ob = 0; ob < (O + bo - 1) / bo; ob++)
                 for (int t0 = 0; t0 < rows[c]; t0 += tm) {
                     /* the GEMM takes a block index, the GEMV its first output */
-                    uint32_t q[4] = {(uint32_t)c, (uint32_t)t0, (uint32_t)(mode == 1 || mode == 3 ? ob : ob * bo), 1};
+                    uint32_t q[4] = {(uint32_t)c, (uint32_t)t0, (uint32_t)(mode == 1 || mode == 3 || mode == 4 ? ob : ob * bo), 1};
                     memcpy(it + (size_t)n * 4, q, sizeof q); n++;
                 }
         }
@@ -5125,7 +5183,8 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
                 .dstBinding = (uint32_t)b, .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[b]};
         vkUpdateDescriptorSets(X->dev, 5, w, 0, NULL);
-        VkPipeline gp = mode == 3 ? xb_grp_bd_pipe(X, v, (v ? ex[0]->g : ex[0]->d)->fmt - 100) : mode == 1 ? X->p_grp[v] : X->p_gv[v];
+        VkPipeline gp = mode == 3 ? xb_grp_bd_pipe(X, v, (v ? ex[0]->g : ex[0]->d)->fmt - 100) :
+                        mode == 4 ? xb_grp_mx_pipe(X, v) : mode == 1 ? X->p_grp[v] : X->p_gv[v];
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gp);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->pl_grp, 0, 1, &X->grp_set[slot][v], 0, NULL);
         for (int i0n = 0; i0n < nit[v]; i0n += 65535) {   /* the grid's x limit every device has */
@@ -5135,7 +5194,7 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
         }
         if (!step) xb_barrier(cmd);
     }
-    if (mode == 1) X->grp_batches++; else X->gv_batches++;
+    if (mode == 1 || mode == 4) X->grp_batches++; else X->gv_batches++;
     return 1;
 }
 /* Record one batch laid out at off[] (its x rows already written) into cmd, with its

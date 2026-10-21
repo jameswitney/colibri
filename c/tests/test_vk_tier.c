@@ -1173,11 +1173,13 @@ static void grouped(void) {
         {{VKT_SRC_I4U_PAIRS_GS, 64}, {VKT_SRC_I4U_PAIRS_GS, 64}, 2.5f, "int4 v+8 gs64, SwiGLU limit"},
         {{VKT_SRC_I4S_PAIRS_GS, 32}, {VKT_SRC_I4S_PAIRS_GS, 32}, 0, "signed int4 pairs gs32"},
         {{VKT_SRC_I4U_PLANAR64, 64}, {VKT_SRC_I4U_PLANAR64, 64}, 0, "planar int4-g64"},
+        {{VKT_SRC_MXFP4_F32, 32}, {VKT_SRC_MXFP4_F32, 32}, 7.0f, "MXFP4 f32 gs32 (the grouped GEMM's, mode 4)"},
     };
     int h0 = H; H = 256;
     int any_grouped = 0, any_summed = 0, any_gemv = 0;
     for (size_t c = 0; c < sizeof cs / sizeof *cs; c++) {
-        for (int mode = 0; mode < 4; mode++) {   /* single, whole, mixed, decode */
+        int mx = cs[c].gu.kind == VKT_SRC_MXFP4_F32;   /* its GEMM needs no streaming cases */
+        for (int mode = 0; mode < (mx ? 1 : 4); mode++) {   /* single, whole, mixed, decode */
             model_make(cs[c].gu, cs[c].dn);
             g_act = VKT_ACT_SWIGLU; g_limit = cs[c].limit;
             set_budget(mode == 2 ? 4 : L * E, cs[c].gu, cs[c].dn);
@@ -1218,7 +1220,7 @@ static void grouped(void) {
             CHECK(bk.dev > 0, "grouped %s %s: nothing ran on the device", cs[c].name, mn[mode]);
             CHECK(worst < (gb ? 1e-2 : 2e-3), "grouped %s %s: off the reference (%.3g)", cs[c].name, mn[mode], worst);
             any_gemv |= gv > 0 || cg > 0;
-            any_grouped |= gb > 0; any_summed |= summed > 0;
+            any_grouped |= gb > 0 && !mx; any_summed |= summed > 0;   /* the MX GEMM carries no sum contract */
             vkt_shutdown(); model_free();
             unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS");
         }
