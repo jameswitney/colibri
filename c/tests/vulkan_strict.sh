@@ -76,7 +76,7 @@ grep -q "op=expert batch fence" "$TMP/err" || fail "case: op=expert batch fence"
 # carry wall-clock timings (ms, GB/s, %) that jitter between ANY two runs — the
 # baseline against itself differs the same way — so those fields are masked for
 # the comparison; everything else must match byte for byte.
-norm() { sed -E 's/[0-9]+(\.[0-9]+)? (ms|GB\/s)/X/g; s/[0-9]+%/X%/g' "$1"; }
+norm() { sed -E 's/[0-9]+(\.[0-9]+)? (ms|us|GB\/s)/X/g; s/[0-9]+%/X%/g' "$1"; }
 rc=$(rc_of env -u COLI_VK_STRICT "$TIER" "$SPV"); mv "$TMP/out" "$TMP/a.out"; mv "$TMP/err" "$TMP/a.err"
 [ "$rc" = 0 ] || fail "case: unset must pass (rc $rc)"
 rc=$(rc_of env COLI_VK_STRICT=0 "$TIER" "$SPV"); mv "$TMP/out" "$TMP/b.out"; mv "$TMP/err" "$TMP/b.err"

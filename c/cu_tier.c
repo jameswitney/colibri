@@ -106,6 +106,7 @@ static const CuTierOps *cut_ops(void) {
 #define vkt_host_pairs cut_host_pairs
 #define vkt_host_pairs_w cut_host_pairs_w
 #define vkt_host_pool_on cut_host_pool_on
+#define vkt_host_room cut_host_room
 #define vkt_init cut_init
 #define vkt_issue cut_issue
 #define vkt_issue_w cut_issue_w
@@ -131,6 +132,9 @@ static const CuTierOps *cut_ops(void) {
 #define vkt_wants cut_wants
 #define vkt_warm_report cut_warm_report
 
+/* the Vulkan strict gate (COLI_VK_STRICT, backend_vulkan.c) has no CUDA side: the
+ * tier's refusal lines above keep their own fprintf, behaviour unchanged */
+#define coli_vk_degrade(cls, op, reason) ((void)0)
 #define VKT_TAG "[CUDA]"
 #ifndef COLI_VULKAN
 #define COLI_VULKAN 1   /* vk_tier.c's body */

@@ -2360,7 +2360,10 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
      * GEMVs are the expert batch's and the chain's (qmatmul_bd.spv, chain_gemv_bd.spv), and
      * qmatmul.spv read its rows as zeros, returning 1. The tensor stays up for those; the
      * caller's CPU path computes this one. */
-    if (bd_fmt(fmt)) return 0;
+    if (bd_fmt(fmt)) {
+        coli_vk_degrade(COLI_VK_REFUSE, "matmul", "a block-format matrix has no per-op shader: the CPU computes it");
+        return 0;
+    }
     ColiVkTensor *t = *tensor;
     /* VK_PROF=1: phase split of the dense per-call cost, printed every 8192 calls —
      * separates our code (memcpy/desc/record) from the driver (submit) and the GPU
@@ -3559,7 +3562,10 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
                         int fmt, const float *x, int S, int I, int grp) {
     if (!G.ready || S < 1) return 0;
     if (!upload_tensor(t1p, w1, s1, fmt, I, O1, grp) || !upload_tensor(t2p, w2, s2, fmt, I, O2, grp)) return 0;
-    if (bd_fmt(fmt)) return 0;   /* no block-format shader here (coli_vk_matmul) */
+    if (bd_fmt(fmt)) {   /* no block-format shader here (coli_vk_matmul) */
+        coli_vk_degrade(COLI_VK_REFUSE, "matmul pair", "a block-format matrix has no per-op shader: the CPU computes it");
+        return 0;
+    }
     ColiVkTensor *t1 = *t1p, *t2 = *t2p;
     size_t xb = (size_t)S * I * 4, yb1 = (size_t)S * O1 * 4, yb2 = (size_t)S * O2 * 4;
     if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.y, yb1, G.memtype_cached) ||

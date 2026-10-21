@@ -1177,6 +1177,12 @@ struct ColiV4Session {
      * from that position instead of re-prefilling it. */
     kv_prefix fed;
     int prefix_reused;   /* reuse length of the request in flight, for stats */
+    /* The previous fresh prompt of THIS session (per-slot under KV_SLOTS):
+     * the checkpoint plan's longest-common-prefix runs against it. Global
+     * state would compare another slot's prompt — wrong lineage, wrong
+     * "already captured" verdict (D4: kv-slots and the cold tier coexist). */
+    int *ckpt_prev_ids;
+    int ckpt_prev_len;
     uint64_t spec_attempts;
     uint64_t spec_drafted;
     uint64_t spec_accepted;

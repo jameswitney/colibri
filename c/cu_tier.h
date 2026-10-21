@@ -48,11 +48,14 @@ int  cut_host_pairs(const VktHostExpert *const *hx, const float *const *xr, int 
 int  cut_host_pairs_w(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
                       float limit, int nt, float *gu, float *hh, float *out, const float *w);
 int  cut_host_pool_on(void);
+size_t cut_host_room(size_t avail, size_t budget, size_t spare, int planned, size_t hold);
 size_t cut_stage_room(void);
 int  cut_dev_host(int layer, uint8_t *host);
 int  cut_score(int layer, uint64_t *score);
 #else
 static inline int cut_host_pool_on(void){return 0;}
+static inline size_t cut_host_room(size_t avail, size_t budget, size_t spare, int planned, size_t hold){
+    (void)avail;(void)budget;(void)spare;(void)planned;(void)hold;return 0;}
 static inline size_t cut_stage_room(void){return 0;}
 static inline int cut_dev_host(int l,uint8_t *h){(void)l;(void)h;return -1;}
 static inline int cut_score(int l,uint64_t *s){(void)l;(void)s;return -1;}
