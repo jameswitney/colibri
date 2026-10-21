@@ -95,6 +95,44 @@ tier warms from the same history a RAM pin would, so the pin's RAM is better
 spent on the adaptive LRU cache. Keep `PIN` set so AUTOPIN does not re-pin from
 history.
 
+### Strict degradation mode (`COLI_VK_STRICT`)
+
+The backend degrades silently by design: any capability it needs and does not
+find — a shader missing from the deployment's `COLI_VK_SHADERS`, a fence wait that
+failed, a device lost mid-run — leaves that piece on the CPU, and a failed tier
+looks exactly like a slow one. `COLI_VK_STRICT=1` (unset or `0` by default, byte-
+identical either way) turns the silent losses into an abort:
+
+```
+[VK] strict: on (COLI_VK_STRICT) — a capability degradation aborts
+[VK] strict: aborting, op=qmatmul_gate_up.spv — absent: fused MLP off
+```
+
+then `exit(70)`, so a deployment or CI run names what it lost instead of quietly
+running without it. Every degradation point funnels through one helper
+(`coli_vk_degrade`) with three classes:
+
+- **degradation** — a capability the run *had* and silently loses: an optional
+  shader absent from the deployment, a fence wait that failed anywhere (the dense
+  matmul, the KV mirror's submits, an expert batch), `coli_vk_mark_lost` — the one
+  funnel every engine's chain uses when its device stops answering. Strict aborts
+  here, one `op=` line, immediately: the degradation has already changed what the
+  run computes.
+- **refusal** — the device never had it: a format with no device form, a
+  `COLI_VK_GEMM_TILE` the device cannot hold. These are legitimate answers, not
+  failures; strict continues, at most one `[VK] refused:` line per op.
+- **fallback** — budget and policy (the tier's memory, staged uploads): counted,
+  never fatal, never a line.
+
+Strict therefore passes on modest hardware: Lavapipe has no cooperative matrices
+and small shared memory, and neither is a degradation — `make vk-strict-check
+VK=1` runs the whole tier and chain suites under strict on it (and skips itself,
+exit 0, where there is no Vulkan device or the build is `VK=0`). What it does
+catch is a deployment that shipped half the shaders, or a driver that started
+losing fences mid-run. `tests/vulkan_strict.sh` is the same cases one by one
+(`bash tests/vulkan_strict.sh`); `tests/test_vk_degrade.c` unit-tests the helper
+itself with no device.
+
 ## The other engines
 
 Every engine links the same backend in a `VK=1` build (`make <engine> VK=1`;

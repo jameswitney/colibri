@@ -7,6 +7,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `COLI_VK_STRICT=1`: an opt-in mode that makes a silently lost Vulkan
+  capability fatal. One helper (`coli_vk_degrade`) now reports every point
+  that would quietly leave the GPU off — a shader absent from the deployment,
+  a fence wait that failed, the device lost mid-run, a staged upload's fence
+  — naming the operation; under strict it aborts with exit 70 so a broken
+  deployment cannot pass unnoticed. Legitimate refusals (a format or tile the
+  device never had) and budget fallbacks behave exactly as before, and unset
+  or `0` is byte-for-byte today's behaviour. `tests/test_vk_degrade.c` runs
+  the class table with no device; `make vk-strict-check` runs the fault knobs
+  against a real one.
 - SSSE3 integer-dot tier in `c/idot.h`: `maddubs`/`madd` kernels for
   `dense_act_i8`, `dot_i8i8`, `dot_i4i8`, `dot_i4p_u` and `i4p_gidot_rows`
   give pre-AVX2 x86-64 CPUs (SSSE3, no AVX2/FMA) an accelerated path where
