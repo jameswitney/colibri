@@ -156,3 +156,34 @@ The threshold sweep's negative result is also recorded (gr16/gr4/gr1:
 regardless of rows) and step serialization cap it — the bank (§3.1) with
 cross-segment retention and overlapped uploads is the remaining prefill
 slice, next session's build.
+
+## 7. Second addendum: the slot-churn finding — the bank, mostly already there
+
+The gr4 mystery is solved, and the fix is a knob, not a build: **slot churn**.
+DeepSeek V4 Flash routes ~220 distinct experts a layer's 768-row segment; the
+64-slot staging default re-streams every expert each sub-batch that wants it.
+Widening the slots IS the fork's bank within upstream's machinery (the slots
+are the per-segment expert window; the prefetcher already overlaps loads):
+
+| config | TTFT | decode | streamed | kept rows (CPU) |
+|---|---:|---:|---|---:|
+| chain GEMM (default slots/threshold) | 232.5–238.8 | 0.598–0.602 | 148 GiB | 90,807 |
+| + `STREAM_SLOTS=192 GEMM_ROWS=4` | 219.4 | 0.538 | 199 GiB | 5,218 |
+| + `STREAM_SLOTS=256 GEMM_ROWS=4` | **194.9** | 0.528 | — | — |
+| + `HOST_GB=8 PROMOTE=32` (28 GiB) | 246.5 | **0.654** | — | — |
+| **all: 24 GiB plan + pool 5 + slots 192 + gr4 + promote + chain GEMM** | **201.3** | **0.583** | — | — |
+
+The host's routed-expert compute fell 146 s → 56 s and the small-expert tail
+91k rows → 5k. The all-in arm needs the budget rebalanced (the slots' host
+staging is ~15 MiB a slot beside the plan: 28+8 GiB OOMs a 34 GiB cgroup;
+24+5 fits) — the plan cap's warning line is doing its job there.
+
+**Campaign totals (upstream default → our best/balanced):** TTFT 266 → 194.9
+(best) / 201.3 (balanced, wall 309.4 from 370); decode 0.603 → 0.654. The fork
+reference stands at 104–107 / 1.09–1.14 — the remaining ~1.9× on both sides
+is the fork's whole-stack device residency (ring + GPU-FOLD) and its mm8
+int8-activation projections; both need their own sessions (the ring is an
+overlap build on the stream path; mm8 is parity-class, F8 language first).
+
+`COLI_VK_TIER_STREAM_SLOTS`'s ENVIRONMENT row carries the finding and the
+measured numbers.
