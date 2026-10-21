@@ -41,6 +41,11 @@
  *            wins over the plan with one warning;
  *   timeout  a batch's wait gives up (COLI_VK_WAIT_FAULT): the tier stops and the experts
  *            that batch names keep their device memory until the device is idle;
+ *   promote2 a host pool SHORT of every expert (COLI_VK_TIER_HOST_GB caps it at half),
+ *            COLI_VK_TIER_PROMOTE on: a routed pooled expert moves up to the device and
+ *            the coldest resident gives way (its device copy freed: no pool copy to take
+ *            back), every row still the reference's and the device count inside its budget;
+ *            by default (PROMOTE unset) a partial pool promotes nothing
  *   promote  a host pool that holds every expert (COLI_VK_TIER_HOST=1), the device four:
  *            the warm start puts every expert in the pool and the history's four on the
  *            device too; a batch step's routed pool experts move up to the device and the
@@ -1261,6 +1266,69 @@ static unsigned dev_mask(int l) {
     for (int e = 0; e < E; e++) if (vkt_resident(l, e) && !host[e]) m |= 1u << e;
     return m;
 }
+/* A pool short of every expert, promotions on (COLI_VK_TIER_PROMOTE): a routed pooled
+ * expert moves up to the device, the coldest resident gives way -- with no pool copy of
+ * its own, its device copy is freed and the slot empties -- and every row stays the
+ * reference's. Unset, a partial pool promotes nothing (the default). */
+static void promote_partial_case(void) {
+    VktFmt f = {VKT_SRC_I8_ROW, 0};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    const double eb = (double)vkt_expert_bytes(H, F, f, f) / 1073741824.0;
+    char gb[64];
+    setenv("COLI_VK_TIER_HOST", "1", 1);
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    setenv("COLI_VK_TIER_RATE", "64", 1);   /* the notes' admission: an earlier case may have left it at 0 */
+    for (int d = 0; d < 2; d++) {   /* d 1: the default, no promotion without the knob */
+        set_budget(4, f, f);
+        snprintf(gb, sizeof gb, "%.12f", L * E / 2.0 * eb);
+        setenv("COLI_VK_TIER_HOST_GB", gb, 1);
+        if (d) unsetenv("COLI_VK_TIER_PROMOTE"); else setenv("COLI_VK_TIER_PROMOTE", "8", 1);
+        VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+        int on = vkt_init(&vc, NULL);
+        CHECK(on, "promote2: the tier did not start");
+        if (!on) break;
+        CHECK(vkt_host_pool_on(), "promote2: the pool is off");
+        int res0 = 0;
+        for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) res0 += vkt_resident(l, e);
+        CHECK(res0 < L * E, "promote2: the pool holds every expert (%d of %d)", res0, L * E);
+        (void)0;
+        /* fill the device with 0..3, then route 4..6: they land in the pool (the device
+         * is full), their heat grows, and the promotion moves them up over the coldest
+         * of 0..3 -- every row still the reference's */
+        Books bk = {0, 0}; double worst = 0;
+        for (int t = 0; t < 16; t++) {
+            int idx[K]; float w[K];
+            int base = t < 6 ? 0 : 4;
+            for (int k = 0; k < K; k++) { idx[k] = base + k % 4; w[k] = 1.f / (k + 1); }
+            vkt_begin_forward();
+            double r = step(0, 1, idx, w, &bk);
+            if (r > worst) worst = r;
+        }
+        vkt_settle();   /* the last promotion's copy lands at a quiescent point */
+        char line[4096]; report_line(line, sizeof line);
+        unsigned long long ups = ~0ull;   /* its count sits before the words */
+        for (char *m = strstr(line, " moved up to the device ("); m && m > line; ) {
+            char *d = m; while (d > line && d[-1] >= '0' && d[-1] <= '9') d--;
+            ups = strtoull(d, NULL, 10);
+            break;
+        }
+        if (!d) {
+            CHECK(ups != ~0ull && ups >= 1, "promote2: %llu experts moved up", ups == ~0ull ? 0ull : ups);
+            CHECK(worst < 2e-3, "promote2: rows off the reference (%.3g)", worst);
+        } else {
+            CHECK(ups == ~0ull, "promote2: the default moved %llu up", ups == ~0ull ? 0ull : ups);
+        }
+        int res1 = 0;
+        for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) res1 += vkt_resident(l, e);
+        printf("  %s: resident %d of %d (device 4 + the pool), ups %llu, worst %.2e\n", d ? "default" : "PROMOTE=8",
+               res1, L * E, ups == ~0ull ? 0 : ups, worst);
+        vkt_shutdown();
+    }
+    unsetenv("COLI_VK_TIER_HOST_GB"); unsetenv("COLI_VK_TIER_SYNC"); unsetenv("COLI_VK_TIER_RATE");
+    setenv("COLI_VK_TIER_HOST", "0", 1);
+    model_free();
+}
+
 static void promote_case(void) {
     VktFmt f = {VKT_SRC_I8_ROW, 0};
     model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
@@ -1754,6 +1822,7 @@ int main(int argc, char **argv) {
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
     printf("layers:\n"); layers();
+    printf("promote2:\n"); promote_partial_case();
     printf("promote:\n"); promote_case();
     printf("hybrid:\n");
     hybrid_case((VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q4_K), 0}, (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q6_K), 0}, "Q4_K/Q6_K");

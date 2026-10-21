@@ -709,7 +709,8 @@ static void refresh_candidates(void) {
     size_t n = (size_t)T.c.layers * T.c.experts;
     for (size_t i = 0; i < n; i++) {
         VSlot *v = &T.s[i];
-        if (v->state != VS_RESIDENT || (T.full && (v->host || !v->hex))) continue;
+        if (v->state != VS_RESIDENT || (T.full && !v->hex) ||
+            (v->host && (T.full || T.dmax[2] > 0))) continue;
         int k = vcls_of((int)(i / (size_t)T.c.experts)), *c = T.cand[k];
         uint64_t sc = score(v), *cs = T.cand_score[k];
         if (T.ncand[k] == VKT_CAND && sc >= cs[VKT_CAND - 1]) continue;
@@ -726,14 +727,15 @@ static void drop_victim(int k) {
     memmove(T.cand[k], T.cand[k] + 1, (size_t)--T.ncand[k] * sizeof(int));
     memmove(T.cand_score[k], T.cand_score[k] + 1, (size_t)T.ncand[k] * sizeof(uint64_t));
 }
-static int peek_victim(int k, uint64_t hs) {
+static int peek_victim(int k, uint64_t hs, int cheap) {
     while (T.ncand[k]) {
         int i = T.cand[k][0];
         VSlot *v = &T.s[i];
-        if (v->state != VS_RESIDENT || (T.full && v->host)) { drop_victim(k); continue; }
+        if (v->state != VS_RESIDENT || (v->host && (T.full || T.dmax[2] > 0))) { drop_victim(k); continue; }
         uint64_t cs = score(v);
-        /* T.full: a swap copies nothing back and no CPU time goes into it, so any hotter one wins */
-        return hs > (T.full ? cs + ((uint64_t)VKT_UP_MARGIN << 8) : cs + (cs >> 2) + (4u << 8)) ? i : -1;
+        /* T.full, a promotion: a swap copies nothing back and no CPU time goes into it,
+         * so any hotter one wins */
+        return hs > (T.full || cheap ? cs + ((uint64_t)VKT_UP_MARGIN << 8) : cs + (cs >> 2) + (4u << 8)) ? i : -1;
     }
     return -1;
 }
@@ -746,15 +748,15 @@ static int rooms_hold(int a, int b) {   /* pad class a's rooms hold pad class b'
     for (int r = 0; r < 2; r++) if (T.pad_w[a][r] < T.pad_w[b][r] || T.pad_s[a][r] < T.pad_s[b][r]) return 0;
     return 1;
 }
-static int pick_victim(int layer, uint64_t hs, int *from) {
+static int pick_victim(int layer, uint64_t hs, int *from, int cheap) {
     const int k = vcls_of(layer);
-    int v = peek_victim(k, hs);
+    int v = peek_victim(k, hs, cheap);
     *from = k;
     if (v >= 0 || k == 1 || !T.per_layer) return v;
     const int o = k == 0 ? 2 : 0;
     if (!rooms_hold(o == 2, k == 2)) return -1;
     *from = o;
-    return peek_victim(o, hs);
+    return peek_victim(o, hs, cheap);
 }
 
 /* A forward starts when the layer index goes back (a layer that issues several
@@ -785,7 +787,7 @@ void vkt_note(int layer, int eid, const VktExpertSrc *src) {
     if (fm->gu_scales && (!src->gs || !src->us || !src->ds)) return;
     int victim = -1, dev = room_dev(layer), vc = vcls_of(layer);
     /* T.full: the device's residents give way to promote's, which keeps their host pool copy */
-    if (dev < 0 && (T.full || !v->heat || (victim = pick_victim(layer, score(v), &vc)) < 0)) return;
+    if (dev < 0 && (T.full || !v->heat || (victim = pick_victim(layer, score(v), &vc, 0)) < 0)) return;
     if (victim >= 0) dev = place_of(&T.s[victim]);   /* the newcomer takes its place, on its device or in the host pool */
     pthread_mutex_lock(&T.mx);
     int qfull = T.qn >= VKT_QCAP;
@@ -826,7 +828,7 @@ int vkt_wants(int layer, int eid) {
     VSlot *v = slot(layer, eid);
     if (v->state != VS_NONE || T.promos[kind_of(layer)] >= T.promo_cap) return 0;
     int from;
-    if (room_dev(layer) < 0 && (T.full || !v->heat || pick_victim(layer, score(v), &from) < 0)) return 0;
+    if (room_dev(layer) < 0 && (T.full || !v->heat || pick_victim(layer, score(v), &from, 0) < 0)) return 0;
     pthread_mutex_lock(&T.mx);
     int qfull = T.qn >= VKT_QCAP;
     pthread_mutex_unlock(&T.mx);
@@ -842,9 +844,13 @@ int vkt_wants(int layer, int eid) {
  * dense chain's books after its frame (vkt_dev_count), or a batch's step after its issue. */
 static void promote(int layer, int e) {
     VSlot *v = slot(layer, e);
-    if (!T.full || v->state != VS_RESIDENT || !v->host || v->up || !v->hex || kind_of(layer) || T.upromos >= T.promote_rate) return;
+    if (!T.promote_rate || v->state != VS_RESIDENT || !v->host || v->up || kind_of(layer) || T.upromos >= T.promote_rate) return;
+    if (!v->hex) {
+        if (!T.dmax[2]) return;   /* no pool behind it: nothing to copy up from */
+        v->hex = v->ex;           /* a partial pool's own copy: the landing keeps it beside the device's */
+    }
     int victim = -1, from = vcls_of(layer);
-    if (T.dres[0] + T.dque[0] >= T.dmax[0] && (victim = pick_victim(layer, score(v), &from)) < 0) return;
+    if (T.dres[0] + T.dque[0] >= T.dmax[0] && (victim = pick_victim(layer, score(v), &from, 1)) < 0) return;
     pthread_mutex_lock(&T.mx);
     int qfull = T.qn >= VKT_QCAP;
     pthread_mutex_unlock(&T.mx);
@@ -858,8 +864,13 @@ static void promote(int layer, int e) {
             T.dfree = n; T.cdfree = nc;
         }
         drop_victim(from);
-        T.dfree[T.ndfree++] = w->ex;
-        w->ex = w->hex; w->host = 1; T.dres[0]--; T.dres[2]++; T.evictions++; T.up_victims++;
+        if (w->hex) {   /* its pool copy takes it back: nothing is copied */
+            T.dfree[T.ndfree++] = w->ex;
+            w->ex = w->hex; w->host = 1; T.dres[0]--; T.dres[2]++; T.evictions++; T.up_victims++;
+        } else {         /* a partial pool: no copy to fall back on — the device's frees, the slot empties */
+            T.dfree[T.ndfree++] = w->ex;
+            w->ex = NULL; w->state = VS_NONE; T.resident--; T.dres[place_of(w)]--; T.evictions++;
+        }
         note_change(victim);   /* published at the next quiescent point: a chain's frame start (vkt_settle) */
         pthread_mutex_lock(&T.mx); T.evict_pending = T.nevict + T.ndfree; pthread_mutex_unlock(&T.mx);
         free_victims();   /* nothing in flight: freed right away; else at the join */
@@ -2180,7 +2191,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
     T.inflight = 1; T.S = S; T.K = K; T.steps++;
     /* T.full: the batch is in flight with the experts it took: a victim's device copy is
      * freed at its join */
-    for (int i = 0; T.full && S <= VKT_UP_ROWS && i < n; i++)
+    for (int i = 0; T.promote_rate && S <= VKT_UP_ROWS && i < n; i++)
         if (idx[i] >= 0 && idx[i] < E && layer < T.main_layers) promote(layer, idx[i]);
     if (layer >= T.main_layers) T.extra_served += (unsigned long long)took;
     if (T.d2_inflight) { T.d2_served += (unsigned long long)(total - rows0); T.d2_steps++; }
@@ -2506,8 +2517,8 @@ static void host_init(long long all) {
      * start's set, and on another topic than the history's it reads most of a token's
      * experts over the bus. COLI_VK_TIER_PROMOTE=0 keeps that set, =n sets the rate. */
     const char *pe = getenv("COLI_VK_TIER_PROMOTE");
-    int rate = pe && *pe ? atoi(pe) : 32;
-    T.full = rate > 0 && !T.d2 && fit >= all;
+    T.full = !T.d2 && fit >= all;   /* its rate default below: a pool short of every expert is opt-in */
+    int rate = pe && *pe ? atoi(pe) : (T.full ? 32 : 0);
     /* Short of every expert the device leaves: the CPU computes the rest from the engine's
      * RAM caches, which were sized from the same free RAM. Their least (ram_floor) comes out of
      * the pool's room and the pool's bytes out of them (ram_given); an engine that cannot lower
@@ -2529,7 +2540,7 @@ static void host_init(long long all) {
     if (held < per) lim = (size_t)held * T.exp_bytes + 4096;
     coli_vk_tier_pool_limit_dev(2, lim);
     T.dmax[2] = (int)fit; T.max_resident += (int)fit; T.h_budget = lim;
-    T.promote_rate = T.full ? rate : 0;
+    T.promote_rate = rate > 0 && (T.full || T.dmax[2] > 0) ? rate : 0;   /* a partial pool: COLI_VK_TIER_PROMOTE turns it on */
     if (given) T.c.ram_given(T.c.ram_ctx, lim);
     char hl[32];
     if (T.full) {
@@ -2548,8 +2559,9 @@ static void host_init(long long all) {
                 human((double)T.c.ram_budget, hb, sizeof hb), left, fit < left ? ", not all of them" : "");
     else
         fprintf(stderr, VKT_TAG " tier %s: host pool on, %d experts in %s of system RAM the device reads over PCIe "
-                        "(the %lld its memory leaves%s; COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB sets it)\n",
-                T.engine, T.dmax[2], human((double)lim, hl, sizeof hl), left, fit < left ? ", not all of them" : "");
+                        "(the %lld its memory leaves%s; COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB sets it%s)\n",
+                T.engine, T.dmax[2], human((double)lim, hl, sizeof hl), left, fit < left ? ", not all of them" : "",
+                T.promote_rate ? "; the routed ones move up from it, up to so many a forward (COLI_VK_TIER_PROMOTE)" : "");
 }
 
 int vkt_host_pool_on(void) { return T.on && T.dmax[2] > 0; }
@@ -2894,6 +2906,8 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
         if (T.c.ram_planned)   /* the plan figure the pool was sized from */
             fprintf(stderr, ", the RAM plan leaves %s of the %s budget",
                     human((double)T.c.ram_spare, hh, sizeof hh), human((double)T.c.ram_budget, hbd, sizeof hbd));
+        if (!T.full && (T.ups || T.up_victims))   /* a partial pool's promotions */
+            fprintf(stderr, "; %llu moved up to the device (%llu residents gave way)", T.ups, T.up_victims);
         if (T.chain_served)
             fprintf(stderr, "; of the chain's routed experts %.1f%% in the device's memory, %.1f%% of a decode step's",
                     100.0 * T.vram_routed / T.chain_served, T.dec_routed ? 100.0 * T.dec_vram / T.dec_routed : 0.0);
@@ -3024,7 +3038,7 @@ void vkt_dev_count(int layer, int S, int K, const int *idx) {
 }
 /* T.full: the promotions that landed into the slot table, at a frame's start (vk_dmoe.h)
  * where nothing reads the experts: the table read next has them. */
-void vkt_settle(void) { if (T.on && T.full) quiesce(); }
+void vkt_settle(void) { if (T.on) quiesce(); }   /* a partial pool's promotions land here too */
 int vkt_layers(void) { return T.on ? T.c.layers : 0; }
 static VSlot *g_old_slots;   /* the slot table of the tier shut down last (vkt_shutdown) */
 static uint32_t *g_old_routed, *g_old_seq;
