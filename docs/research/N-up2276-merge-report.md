@@ -36,9 +36,9 @@ pushed, per instruction).
 | upstream `b90a369e`, defaults | 266.1 / 264.3 | 0.603 / 0.613 | 370.5 / 367.0 |
 | upstream, `COLI_VK_TIER_HOST=0` | 257.4 | 0.584 | 365.4 |
 | **`port/up-2276`, defaults** | **251.9** | 0.603 | **356.4** |
-| `port/up-2276` + `COLI_VK_CHAIN_GEMM_ROWS=-1` | (overnight chain) | | |
-| upstream, `--memory-gb 18` (F13 budget) | (overnight chain) | | |
-| `port/up-2276`, `--memory-gb 18` | (overnight chain) | | |
+| `port/up-2276` + `COLI_VK_CHAIN_GEMM_ROWS=-1` | **238.8** | 0.598 | **344.3** |
+| upstream, `--memory-gb 18` (pool 16.0 GiB granted) | 258.2 | 0.625 | 358.9 |
+| `port/up-2276`, `--memory-gb 18` (pool 512 MiB, plan-capped) | 262.0 | 0.551 | 376.3 |
 | (old fork, same methodology, reference) | 105–107 | 1.16–1.18 | ~160 |
 
 Reading so far:
@@ -51,7 +51,20 @@ Reading so far:
   accounting keeps the pool generous.
 - Our merged tree **keeps upstream's decode and beats both upstream arms on
   TTFT** (251.9 s): the plan-capped pool sizes itself smaller and the
-  streaming decisions improve with it.
+  streaming decisions improve with it. The GEMM knob stacks: 238.8 s,
+  **−10.3 % TTFT vs upstream's default** and −7 % vs upstream's best arm
+  (host-off), decode unchanged.
+- **The 18 GiB pair is the honest F13 story on the new tip.** Upstream's pool
+  grants **16.0 GiB beside the plan's 17.65 GiB projection** — 33.7 GiB of
+  claims under a 24 GiB cgroup — and survived this run only through lazy
+  faulting; the arithmetic still spends RAM the plan already claimed, one
+  big routed prompt away from the kill that motivated F13. Ours grants
+  **512 MiB — exactly the plan's spare**. The trade is real and stated
+  plainly: upstream's overspending pool *bought* decode at this budget
+  (0.625 vs 0.551 tok/s — 1,076 pooled experts vs 23) at TTFT parity. The
+  plan cap is a safety contract, not a universal speedup; an operator who
+  wants the aggressive pool keeps `COLI_VK_TIER_HOST_GB=16` (the override
+  wins over the plan, by design, with one line saying so).
 - The old fork's numbers remain ahead (decode 2×; TTFT 2.4×). What closes
   the rest is not in the four merged slices: it is P3.2 (the pf4/RDNA2
   expert GEMM family — prefill) and the decode road upstream itself is now

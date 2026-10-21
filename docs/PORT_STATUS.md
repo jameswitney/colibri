@@ -42,17 +42,21 @@ deterministic). No change requests yet.
 
 | arm | TTFT s | decode tok/s | wall s |
 |---|---:|---:|---:|
-| upstream tip, defaults | 266.1 | 0.603 | 370.5 |
+| upstream tip, defaults (×2) | 266.1 / 264.3 | 0.603 / 0.613 | 370.5 / 367.0 |
 | upstream tip, `COLI_VK_TIER_HOST=0` | 257.4 | 0.584 | 365.4 |
 | **`port/up-2276`, defaults** | **251.9** | 0.603 | **356.4** |
+| **`port/up-2276` + `COLI_VK_CHAIN_GEMM_ROWS=-1`** | **238.8** | 0.598 | **344.3** |
+| upstream, `--memory-gb 18` (pool 16.0 GiB) | 258.2 | 0.625 | 358.9 |
+| `port/up-2276`, `--memory-gb 18` (pool 512 MiB) | 262.0 | 0.551 | 376.3 |
 | (old fork reference, same methodology) | 105–107 | 1.16–1.18 | ~160 |
 
 Upstream's tip improved decode over the previous base (0.487 → 0.60) via the
 host-pool CPU-compute series; TTFT regressed at this budget with the pool on
-(266 vs 257 host-off). Our merged tree keeps upstream's decode gain and beats
-both upstream arms on TTFT. The 18 GiB arms (the F13 motivating budget) and
-the `GEMM_ROWS=-1` arm are in the overnight chain; numbers in
-`bench/up2276/summary.txt` and the night report.
+(266 vs 257 host-off). Our merged tree keeps upstream's decode gain, beats
+both upstream arms on TTFT (−5 %), and the GEMM knob stacks to −10.3 %. The
+18 GiB pair is the F13 evidence: upstream grants 16 GiB beside a 17.65 GiB
+plan (survives by lazy faulting alone); ours grants the plan's 512 MiB spare
+— the safety contract, with the decode trade stated in the night report.
 
 ## Portfolio re-assessment vs the 177 upstream commits (docs/research/M3-portfolio-vs-2276.md)
 
