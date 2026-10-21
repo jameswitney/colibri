@@ -956,6 +956,10 @@ typedef struct {
     int pin_slots_per_layer;
     uint64_t repin_interval;
     uint64_t dspark_reserve_bytes;
+    /* The store's RAM plan, for the Vulkan tier's host pool (vk_tier.h): the
+     * budget the planner resolved and what it projects to hold at capacity. */
+    uint64_t ram_budget_bytes;
+    uint64_t ram_planned_bytes;
 } ColiDeepSeekV4RuntimeOptions;
 
 enum { COLI_V4_RESIDENT_MAX_LAYERS = 128 };

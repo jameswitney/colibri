@@ -2319,7 +2319,13 @@ the matrix units, for the grouped GEMM); `COLI_VK_BDA=0` still opens it without.
 
 **Hybrid steps: the host pool's experts on the CPU.** The tier's host pool holds the
 experts the card has no room for in system RAM, which the device reads over PCIe: 10 to
-11 GB/s on an RTX PRO 4000 at PCIe 4.0 x8, at any size (`COLI_VK_BENCH_HOST`). With
+11 GB/s on an RTX PRO 4000 at PCIe 4.0 x8, at any size (`COLI_VK_BENCH_HOST`). Its size
+comes from the engine's RAM plan — the room that plan leaves beside its expert cache at
+capacity, its dense weights in RAM, its head and its KV/workspace reserves
+(`COLI_VK_TIER_HOST_GB` overrides it, `COLI_VK_TIER_HOST=0` turns it off); an engine
+without a plan falls back to `MemAvailable` less 4 GiB and its own cache growth — and
+colibri's plan spends its whole budget by construction, so its pool needs
+`COLI_VK_TIER_HOST_GB` to come on at all. With
 Qwen3.8 Next IQ2_XS on that card about 7% of a decode step's pairs and 11% of a 3-row
 verify's come from there, and each layer that has one waits for it: skipping them
 (wrong tokens, the right times) took decode from 38.5 to 50.1 tok/s and an MTP verify's

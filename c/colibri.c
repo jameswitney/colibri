@@ -11324,6 +11324,10 @@ static void vk_tier_start(Model *m){
                   .ram_reserve=(size_t)((double)m->ecap*expert_cache_row_bytes(m,m->ebits)),
                   .ram_floor=(size_t)((double)c->topk*expert_cache_row_bytes(m,m->ebits)), .ram_given=vk_ram_given,
                   .dense_bytes=(size_t)dense,
+                  /* cap_for_ram's plan spends the whole resolved budget on the trunk, the
+                   * KV/workspace reserves and the expert cache at its cap, so it leaves the
+                   * pool nothing by default; the line says so, COLI_VK_TIER_HOST_GB wins */
+                  .ram_planned=g_ram_budget_gb>0, .ram_budget=(size_t)(g_ram_budget_gb*1e9), .ram_spare=0,
                   .in_ram=vk_in_ram, .ram_ctx=m,
                   .max_experts=g_vk_experts>0 ? g_vk_experts : 0,
                   .load=vk_load, .release=vk_unhold, .load_ctx=m, .load_batch=vk_load_batch,

@@ -1778,8 +1778,10 @@ int coli_v4_expert_store_open_planned(
     }
     plan.expert_cache_bytes = (uint64_t)slots * per_slot;
     runtime->target_expert_cache_bytes = plan.expert_cache_bytes;
-    plan.projected_bytes = fixed + dense_bytes +
+    runtime->ram_budget_bytes = plan.planner_available_bytes;   /* the tier's host pool takes */
+    runtime->ram_planned_bytes = fixed + dense_bytes +          /* what this leaves unclaimed */
         plan.expert_cache_bytes + (resident_head ? head_bytes : 0);
+    plan.projected_bytes = runtime->ram_planned_bytes;
     if (resident_head && coli_v4_head_cache_load(
             engine, engine->target_index, error, error_size)) return -1;
     if (device_bytes)
@@ -13869,6 +13871,12 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
                      * (the dense weights on the device only) are in its usage */
                     .dense_bytes = v4_tier_dense() && !v4c_partial() && !v4c_whole()   /* a chain placed all it places */
                         ? (size_t)(engine->dense_resident.total_bytes - engine->dense_resident.dropped_bytes + engine->head_cache.bytes) : 0,
+                    /* the store's RAM plan: the pool takes what it leaves beside the expert
+                     * cache at capacity, the dense weights in RAM and the head */
+                    .ram_planned = engine->runtime.ram_budget_bytes && engine->runtime.ram_planned_bytes,
+                    .ram_budget = (size_t)engine->runtime.ram_budget_bytes,
+                    .ram_spare = engine->runtime.ram_budget_bytes > engine->runtime.ram_planned_bytes
+                        ? (size_t)(engine->runtime.ram_budget_bytes - engine->runtime.ram_planned_bytes) : 0,
                     .in_ram = v4_vkt_in_ram, .ram_ctx = store,
                     .load = v4_vkt_load, .release = v4_vkt_unhold, .load_ctx = store};
     /* The device goes before the drivers unload, after the tier's teardown (atexit runs
