@@ -187,3 +187,12 @@ overlap build on the stream path; mm8 is parity-class, F8 language first).
 
 `COLI_VK_TIER_STREAM_SLOTS`'s ENVIRONMENT row carries the finding and the
 measured numbers.
+
+## 8. Close-out: the sweep has converged
+
+`GEMM_ROWS=2` at 256 slots: 196.0 / 0.547 / 311.1 — inside noise of gr4
+(194.9). The tail is exhausted (1,664 single-row experts remain on the CPU,
+57 s host share, 14.5 s device): the expert side of prefill is done. The
+~195 s TTFT floor is now the rest of prefill — dense chain frames, loads and
+staging on the engine thread, attention/indexer — which is the ring/overlap
+build's territory, not the tier's.
