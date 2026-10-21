@@ -7,6 +7,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `COLI_VK_CHAIN_GEMM_ROWS`: DeepSeek V4's chain prompt rows may take the
+  backend's tiled GEMM instead of the per-row GEMV (`-1` follows the backend's
+  rule, `N` from N rows; a verify's rows and decode keep the GEMV's bits). On
+  an RX 6900 XT a 2,515-token prompt's first token goes from 189.6 s to
+  152.1 s median (prefill 13.3 to 16.5 tok/s; experiment record in
+  `docs/experiments/gemm-rows-2026-10-20/`); the default stays `0`, keeping a
+  row's bits independent of the chunking.
 - The Vulkan tier's host pool can size itself from the engine's RAM plan:
   `VktConfig` carries `ram_planned`/`ram_budget`/`ram_spare`, and the pool
   takes at most what that plan leaves unclaimed. DeepSeek V4 passes its
