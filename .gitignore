@@ -198,3 +198,4 @@ c/mimo.exe
 c/qwen36_tiny_mtp*/
 # engine KV cold-tier checkpoints (never commit model state)
 **/.coli_ckpt/
+c/shaders/*.spv
