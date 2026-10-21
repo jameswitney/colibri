@@ -123,3 +123,36 @@ the test).
 4. The MX GEMM can ride to upstream behind the tier-host-pool PR or standalone
    (self-contained: one shader pair + one mode in the batch; kimi/mimo/v41
    deployments on Intel/RADV benefit immediately).
+
+## 6. Addendum (later that day): the partial-pool promote — landed and measured
+
+The decode residency slice is in: **promotions from a partial host pool**
+(`COLI_VK_TIER_PROMOTE=n`, opt-in where the pool is short of every expert —
+the fork's MFU popularity ladder on upstream's own #2258 machinery: the pool
+holds the heat-ordered next-hot tail, routed pooled experts move up by their
+own pool copy, the coldest resident gives way — freed to the RAM cache when
+it has no pool copy, the promoted expert keeps its pool entry so a later
+eviction swaps back at no copy). `test_vk_tier`'s `promote2` holds it
+(ups 2 at 2.9e-07; the default promotes nothing).
+
+Measured (same rig, real model):
+
+| arm | TTFT | decode |
+|---|---:|---:|
+| merged + chain GEMM | 232.5–238.8 | 0.598–0.602 |
+| merged + chain GEMM + 8 GiB pool | 254.7 | 0.624 |
+| **merged + chain GEMM + 8 GiB pool + PROMOTE=32** | **246.5** | **0.654** |
+| fork | 104–107 | 1.09–1.14 |
+
+Decode +8.5 % over no-pool, +5 % over the pool alone, 22 promotions over the
+run. The gap to the fork's decode remains ~1.7×: the profile says our decode
+spends ~1.6 s/token waiting on the device (760 matmuls/token, f32-GEMV
+class) — the fork's mm8 int8-activation projections (4.73× on that class)
+are the next decode slice, a parity-class change that needs the F8 envelope
+language.
+
+The threshold sweep's negative result is also recorded (gr16/gr4/gr1:
+238/278/313 s TTFT): the stream path's per-expert upload economy (15 MiB
+regardless of rows) and step serialization cap it — the bank (§3.1) with
+cross-segment retention and overlapped uploads is the remaining prefill
+slice, next session's build.
