@@ -2554,9 +2554,10 @@ static void host_init(long long all) {
     } else if (T.c.ram_planned)
         fprintf(stderr, VKT_TAG " tier %s: host pool on, %d experts in %s of system RAM the device reads over PCIe "
                         "(the RAM plan leaves %s of the %s budget; %lld the devices leave%s; "
-                        "COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB overrides)\n",
+                        "COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB overrides%s)\n",
                 T.engine, T.dmax[2], human((double)lim, hl, sizeof hl), human((double)T.c.ram_spare, hs, sizeof hs),
-                human((double)T.c.ram_budget, hb, sizeof hb), left, fit < left ? ", not all of them" : "");
+                human((double)T.c.ram_budget, hb, sizeof hb), left, fit < left ? ", not all of them" : "",
+                T.promote_rate ? "; the routed ones move up from it, up to so many a forward (COLI_VK_TIER_PROMOTE)" : "");
     else
         fprintf(stderr, VKT_TAG " tier %s: host pool on, %d experts in %s of system RAM the device reads over PCIe "
                         "(the %lld its memory leaves%s; COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB sets it%s)\n",
