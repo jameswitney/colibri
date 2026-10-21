@@ -829,7 +829,7 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 		--binary ./kimi_k3$(EXE) \
 		--fixture ./kimi_k3_tiny
 
-.PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
+.PHONY: deepseek-v4 deepseek_v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
 	deepseek-v4-tiny-check deepseek-v4-clean
 ifeq ($(COLI_V4_SUPPORTED),1)
 # Every shader the other engines build (VK_SPV, empty without VK=1): backend_vulkan.c
@@ -840,7 +840,7 @@ ifeq ($(COLI_V4_SUPPORTED),1)
 # CUDA=1 on Linux: the routed-expert tier on the CUDA device too (cu_tier.h), from this
 # Makefile's CUDA objects, which Makefile.deepseek-v4 links (V4_CUT_OBJS).
 V4_CUT_OBJS = $(if $(filter 1,$(CUDA)),$(if $(IS_WIN),,$(CUDA_OBJ)))
-deepseek-v4: $(VK_SPV) $(V4_CUT_OBJS)
+deepseek-v4 deepseek_v4: $(VK_SPV) $(V4_CUT_OBJS)
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) V4_CUT_OBJS="$(V4_CUT_OBJS)" deepseek-v4
 
 deepseek-v4-clean:
