@@ -1,0 +1,125 @@
+# Day-2 report: fork vs merged upstream, the gap analysis, and the MXFP4 grouped GEMM
+
+**Date:** 2026-10-22 · **branch:** `port/up-2276` (tip `b8affcad`+) · nothing pushed.
+
+## 1. The A/B (2,515-token prompt / 64 decode tokens, 28 GiB budget, interleaved)
+
+| arm | TTFT s | decode tok/s | wall s |
+|---|---:|---:|---:|
+| **fork** (`colibri-ds4-vulkan` @ port-source, ×2) | **104.2 / 107.1** | **1.094 / 1.144** | **161.8 / 162.2** |
+| merged tree, defaults | 251.9 / 255.3 | 0.603 / 0.636 | 356.4 / 354.3 |
+| merged + `COLI_VK_CHAIN_GEMM_ROWS=-1` (×3, two days) | 232.5–238.8 | 0.598–0.602 | 337.9–344.3 |
+| merged + chain GEMM + **MXFP4 GEMM** | 238.6 | 0.601 | 343.4 |
+| merged + chain GEMM + 8 GiB host pool | 254.7 | **0.624** | 355.6 |
+| merged + chain GEMM + `TIER_GEMM_ROWS=1` (everything streams) | 313.2 | 0.544 | 429.0 |
+| …same without the MXFP4 GEMM | 327.7 | 0.546 | 443.0 |
+
+Drift between same-config arms is ≤ 6 s TTFT / ≤ 0.04 tok/s.
+
+**The gap:** the fork leads TTFT by 2.2× and decode by 1.8× at this operating point.
+
+## 2. Where the time goes (the engines' own tier/chain reports)
+
+The merged tree's routed-expert accounting for the default arm:
+
+```
+device 6248.7 ms, CPU share 141219.3 ms, waited 2519.3 ms
+stream: 172 steps, 8800 cold experts (147.96 GiB, 8.33 GB/s), 348853 rows streamed,
+        16703 cold experts (90807 rows) KEPT ON THE CPU
+```
+
+- The device computes almost nothing of the routed experts' time budget: **~141 s is
+  host-side expert compute**, and it is almost entirely the **≤16-row long tail** the
+  tier's stream rule keeps on the CPU (an expert's 15 MiB upload amortizes at ~16 rows
+  of CPU compute — `COLI_VK_TIER_GEMM_ROWS=16`).
+- Forcing everything to stream (`GEMM_ROWS=1`) proves both halves: the CPU share
+  collapses to 3 s, but **697 GiB** stream at 8.75 GB/s (~80 s of pure uploads, the
+  64 stream slots churn on 1-row experts) — net 75 s worse.
+- An 8 GiB host pool (544 experts, plan-override) buys decode (+4 %) but does not move
+  the tail: the hybrid computes only ≤2-row pooled pairs in place; the stream rule,
+  not pool residency, decides the tail.
+
+The fork's lines tell what it does instead:
+
+```
+v4_gpu moe-ram=on ring=3.19 GiB qd=16 take=par
+v4_gpu moe-batch=on bank=256-experts
+v4_gpu v5-cache: post-prefill refill target=247 ... installed=247 ... mfu=...
+```
+
+## 3. What is actually missing (the merge list, ranked by measured leverage)
+
+1. **The expert-major bank (P4.1) — the one big prefill piece upstream lacks.** The
+   fork gathers every routed expert's rows across a step, uploads each expert ONCE
+   into a 256-expert per-layer VRAM bank, and computes them weight-stationary. That
+   is exactly the ≤16-row tail's problem: upstream's 64 stream slots churn on small
+   experts, and its pool-copy slots (c55cb4be) hold only a few. Measured headroom:
+   ~90–140 s of the ~230 s TTFT. This is the top candidate for the next port — as an
+   extension of upstream's slot machinery, not the fork's bank stack.
+2. **Popularity-based decode residency (the fork's MFU/v5-cache).** Upstream's
+   promote (#2258) moves pooled experts up only when the pool holds *every* expert —
+   a 167 GB model never qualifies on this host, so decode rides the warm-start LFRU
+   set only. A partial-pool promote (their own mechanism, relaxed) is the
+   upstreamable slice; the fork's decode lead (1.09 vs 0.60) is mostly this plus (3).
+3. **The host-RAM ring + PCIe-activation overlap (P3.5's pass).** The fork overlaps
+   next-layer expert loads with compute (`ring=3.19 GiB, take=par`); upstream's
+   prefetch (`prefetched 8202 (6911 used)`) covers part of it.
+4. **mm8 split/ping-pong projections (P3.1's decode side)** — upstream's tiled GEMM
+   now covers prompt rows (PR #2253); decode keeps the GEMV's bits, and the fork's
+   mm8 decode-side win is still unported.
+
+Superseded by upstream (do not port): P2.2 async PILOT, P3.4 idxsel, P4.2 ring (the
+pool is the host-RAM layer), P4.3 submit merges.
+
+## 4. The MXFP4 grouped GEMM (the pf4-GEMM merge, done)
+
+**What landed:** `qmatmul_grp_mx.comp` (+ GATE_UP variant) — mode 4 in the expert
+batch. One dispatch covers every fmt 7 expert of a big step: the GGUF kernel's
+proven shape (32 rows × 64 outputs a workgroup, weights decoded once into shared
+memory, float arithmetic, **no matrix units, any subgroup size**) with the grouped
+GEMV's MXFP4 decode (e2m1 nibbles, one float scale a 32-input group). It rides all
+of upstream's batch machinery (items, expert table, amap sub-batches, slots);
+`COLI_VK_XB_GROUPED_MX=0` restores the old routes.
+
+**Why this shape and not the fork's pf4 kernels verbatim:** the fork's family is
+built on its own tensor layout (packed UE8M0 scales, PCPf4 push constants, per-
+expert dispatch against the GPU-FOLD stack). Upstream's tier tensors (float scales,
+its expert table) and batch machinery are the seam the port plan fixes
+(§2: capabilities into seams). The fork's *measured capability* — a tiled
+weight-stationary MXFP4 GEMM on RDNA2 — is what this re-expresses.
+
+**Bug found by the new test case, worth remembering:** the recorder's item
+`it.z` encoding differs by mode (block index for the GEMMs, first output for the
+GEMV). Mode 4 initially fell into the GEMV branch, so every output block after the
+first read and wrote past its matrix — the case caught it at 1.4e+00, the fix is
+one host line, and the case now holds at **3.8e-07** worst relative error.
+
+**Measured effect (honest):** at the default stream threshold the big fmt 7 steps
+were served by the tier's per-expert GEMM route, which turns out to be efficient —
+device time at `GEMM_ROWS=1` is 25.12 s with or without the MX kernel. The win at
+that routing is dispatch consolidation (429.0 vs 443.0 s wall, ~3 %). The kernel's
+real value: (a) fmt 7 finally has a grouped route — every native-MXFP4 engine
+(kimi_k3, mimo, deepseek_v4.1, qwen38 GGUF-side) on a non-cooperative-matrix
+device gets it; (b) the dispatch reduction matters more on smaller/contended
+queues; (c) it is the foundation the bank (§3.1) would compute through.
+
+**Gates:** `vk-tier-check` PASS (with the new MXFP4 grouped case),
+`vk-chain-check` PASS, `vk-strict-check` PASS, `cu_tier.c -DCOLI_CUDA
+-fsyntax-only` clean (the tier's second compile). The MX test case runs the single
+mode only — no streaming env — so the tier's pool history stays as the cases
+before it left it (`extra`'s eviction scenario is marginal to it; documented in
+the test).
+
+## 5. Recommended next moves
+
+1. **The bank port** (§3.1) as an extension of the stream-slot machinery — the one
+   slice that can close most of the 2.2× TTFT gap. Design sketch: gather rows per
+   expert at issue, a per-layer VRAM window of N experts with LRU across the
+   conversation (the fork's numbers: −2.2 s @11 rows → −708 s @4093 rows).
+2. **Partial-pool promote** (§3.2) for decode — extend upstream's #2258 mechanism
+   below the `fit >= all` condition, rate-limited as theirs is.
+3. Send the #2253 follow-up (the bare `make deepseek_v4` fix) — the maintainer's
+   one note, root-caused and fixed on this branch.
+4. The MX GEMM can ride to upstream behind the tier-host-pool PR or standalone
+   (self-contained: one shader pair + one mode in the batch; kimi/mimo/v41
+   deployments on Intel/RADV benefit immediately).
