@@ -74,6 +74,17 @@ plan (survives by lazy faulting alone); ours grants the plan's 512 MiB spare
   documented as intentional family-wide behaviour ("any value, even 0,
   disables"). Left alone.
 
+## Day-2 state (2026-10-22, later)
+
+Three slices landed on `port/up-2276`: the MXFP4 grouped GEMM (mode 4, fmt 7's
+first grouped route), promotions from a partial host pool (the MFU ladder on
+upstream's #2258 machinery, `COLI_VK_TIER_PROMOTE` opt-in), and the
+slot-churn finding (`COLI_VK_TIER_STREAM_SLOTS` widened = the fork's bank,
+mostly). Best arms: TTFT **194.9** (slots 256 + gr4), decode **0.654**
+(pool 8 + promote), balanced **201.3 / 0.583 / 309.4** (all-in, 24 GiB plan).
+Upstream-default baselines: 266 / 0.603 / 370. The fork still leads ~1.9×;
+the remainder is the ring/whole-stack overlap and mm8 (parity-class).
+
 ## Next gates
 
 1. finish the overnight arm chain (GEMM_ROWS, 18 GiB pair)
