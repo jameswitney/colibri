@@ -153,7 +153,7 @@ A/B). "Port" means port the *capability*, re-expressed in the seam above.
 
 | # | Capability | Why (measured) | Seam | Size | Notes |
 |---|---|---|---|---|---|
-| **P3.1** | **mm8 tiled weight-stationary projection GEMM** (+ split-K/ping-pong) | projections 87.1 → 18.4 ms/cell (4.73×), ~6.8 % e2e | new `chain_*`/`qmatmul` op used by V4 prefill | M | Upstream `chain_gemm` needs coopmat; this is the RDNA2 answer. |
+| **P3.1** | ✅ **landed** (`cc66bf61`, split-K `04aec2c7`) — **mm8 tiled weight-stationary projection GEMM** (+ split-K/ping-pong) | projections 87.1 → 18.4 ms/cell (4.73×), ~6.8 % e2e — the fork's numbers; ours: RX 6900 XT microbench 2,065–4,131 GMAC/s (best tile, split) against the GEMV's 185–243 at S 128, engine arm pending | `matmul_aligned`'s mm8 arm (`qmatmul_mm8.spv` + `_reduce`), opt-in `COLI_VK_MM8`/`COLI_VK_MM8_SPLITK`, default off | M | Upstream `chain_gemm` needs coopmat; this is the RDNA2 answer. |
 | **P3.2** | **pf4 expert GEMM family + expert-major bank** | routed cell 335 → 114 ms (2.94×); 2.65× session GMAC/s | tier batch compute / shaders | M–L | Upstream has MXFP4 decode but not this kernel family. |
 | **P3.3** | **Flash-attention kernel** | attention 5.0× @2k, 16.7× @8k; 2.1–2.4× decode @3k/8k | `chain_dsv4` attention mode | M | 1 bf16-ulp gate; big long-context win. |
 | **P3.4** | **LDS-tiled idxscore + idxsel v2** | indexer 26.1 → 6.2 ms/cell (4.2×); TTFT −9.4 % @33k | `chain_dsv4` indexer modes | M | The measured long-context slope term. |
