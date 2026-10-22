@@ -3005,7 +3005,9 @@ static void test_mm8_case(int O, int I, int S, int distinct) {
     vkc_begin(); int okg = vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
     memcpy(yg, vkc_ptr(yb), (size_t)S * O * 4);
     vkc_mm8_set(1);   /* the tiled GEMM, twice: run-to-run determinism */
+    VkcStats s0, s1; vkc_stats(&s0);   /* the dispatch must be counted: not the GEMV benchmarked twice */
     vkc_begin(); int okm = vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    vkc_stats(&s1);
     memcpy(ym, vkc_ptr(yb), (size_t)S * O * 4);
     vkc_begin(); int okm2 = vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
     int same = !memcmp(vkc_ptr(yb), ym, (size_t)S * O * 4);
@@ -3013,15 +3015,65 @@ static void test_mm8_case(int O, int I, int S, int distinct) {
     double em = relerr(ym, ref, (size_t)S * O, 1e-3);
     double eg = relerr(yg, ref, (size_t)S * O, 1e-3);
     double ev = relerr(ym, yg, (size_t)S * O, 1e-3);
-    CHECK(okg && okm && okm2 && em < g_mm8_tol && eg < g_mm8_tol && !bad(ym, (size_t)S * O) && same,
-          "mm8 %d x %d S %d%s: ok %d/%d/%d err mm8 %.2e gemv %.2e mm8-vs-gemv %.2e%s",
-          O, I, S, distinct ? " (distinct scales)" : "", okg, okm, okm2, em, eg, ev,
+    CHECK(okg && okm && okm2 && s1.mm8 == s0.mm8 + 1 && em < g_mm8_tol && eg < g_mm8_tol &&
+          !bad(ym, (size_t)S * O) && same,
+          "mm8 %d x %d S %d%s: ok %d/%d/%d dispatches %llu err mm8 %.2e gemv %.2e mm8-vs-gemv %.2e%s",
+          O, I, S, distinct ? " (distinct scales)" : "", okg, okm, okm2, s1.mm8 - s0.mm8, em, eg, ev,
           !memcmp(ym, yg, (size_t)S * O * 4) ? ", bitwise vs the GEMV" : "");
     printf("  mm8 [%5d x %5d] S %3d%s: mm8-vs-ref %.2e, gemv-vs-ref %.2e, mm8-vs-gemv %.2e%s\n",
            O, I, S, distinct ? " distinct-scales" : "", em, eg, ev,
            !memcmp(ym, yg, (size_t)S * O * 4) ? ", bitwise" : "");
     vkc_free(xb); vkc_free(yb); coli_vk_tensor_free(t);
     free(w); free(sc); free(x); free(ref); free(yg); free(ym);
+}
+/* every tile of the table on one shape, byte-compared against the frozen F tile: each
+ * variant keeps ONE fp32 accumulator an output over the full K, k ascending (BK and
+ * NDBUF change the staging, never the FMA order), so the tiles must agree bit for bit
+ * -- qmatmul_mm8.comp's NUMERICS contract, asserted here instead of assumed. The
+ * distinct-scales shape: a wrong scale index lands on a different power-of-two scale,
+ * so no variant can pass by reading another tile's layout. */
+static void test_mm8_tiles(void) {
+    int O = 300, I = 320, S = 130, ng = (I + 127) / 128;
+    uint8_t *w = malloc((size_t)O * I);
+    float *sc = malloc((size_t)O * ng * sizeof(float));
+    for (size_t i = 0; i < (size_t)O * I; i++) w[i] = e4m3_rnd(10);
+    for (int o = 0; o < O; o++) for (int g = 0; g < ng; g++)
+        sc[o * ng + g] = ldexpf(1.f, -8 + (o + 3 * g) % 13);
+    float *x = malloc((size_t)S * I * sizeof(float));
+    for (size_t i = 0; i < (size_t)S * I; i++) x[i] = e4m3_val(e4m3_rnd(8));
+    ColiVkTensor *t = NULL;
+    if (!coli_vk_tensor_ensure(&t, w, sc, 12, I, O, 128)) {
+        CHECK(0, "mm8 tiles %d x %d: the fmt-12 upload", O, I); free(w); free(sc); free(x); return;
+    }
+    VkcBuf *xb = vkc_buf((size_t)S * I * 4, VKC_DEV), *yb = vkc_buf((size_t)S * O * 4, VKC_DOWN);
+    vkc_begin(); vkc_write(xb, 0, x, (size_t)S * I * 4); vkc_submit(1);
+    float *yf = malloc((size_t)S * O * sizeof(float)), *yv = malloc((size_t)S * O * sizeof(float));
+    vkc_gemm_rows(0); vkc_mm8_set(1);
+    VkcStats s0; vkc_stats(&s0);
+    int f = -1;   /* the frozen f tile by name: the bits every variant must return */
+    for (int v = 0; v < vkc_mm8_tile_count(); v++) if (!strcmp(vkc_mm8_tile_name(v), "f")) f = v;
+    vkc_mm8_set_tile(f);
+    vkc_begin(); int okf = f >= 0 && vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    memcpy(yf, vkc_ptr(yb), (size_t)S * O * 4);
+    int diff = 0, okall = okf;
+    for (int v = 0; v < vkc_mm8_tile_count(); v++) {   /* forced one by one, the bench's hook */
+        vkc_mm8_set_tile(v);
+        vkc_begin(); int ok = vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+        memcpy(yv, vkc_ptr(yb), (size_t)S * O * 4);
+        if (ok && !memcmp(yv, yf, (size_t)S * O * 4)) continue;
+        if (ok) diff++; else okall = 0;
+        printf("  mm8 tile %-7s: %s the f tile's bits\n", vkc_mm8_tile_name(v),
+               ok ? "DIFFERS from" : "refused, not");
+    }
+    VkcStats s1; vkc_stats(&s1);
+    vkc_mm8_set(0); vkc_mm8_set_tile(-2); vkc_gemm_rows(-1);
+    CHECK(okall && okf && !diff && s1.mm8 == s0.mm8 + (unsigned long long)(vkc_mm8_tile_count() + 1),
+          "mm8 tiles: f ok %d, %d of %d variants differ, dispatches %llu",
+          okf, diff, vkc_mm8_tile_count(), s1.mm8 - s0.mm8);
+    printf("  mm8 tiles: %d variants, all bitwise the f tile, dispatches %llu\n",
+           vkc_mm8_tile_count(), s1.mm8 - s0.mm8);
+    vkc_free(xb); vkc_free(yb); coli_vk_tensor_free(t);
+    free(w); free(sc); free(x); free(yf); free(yv);
 }
 /* the arm's gates and its default: what refuses (S < 2, I not a multiple of 64), what the
  * rows policy does and does not govern, and the knob off leaving the dispatches alone */
@@ -3064,6 +3116,39 @@ static void test_mm8_refusals(void) {
         vkc_mm8_set(0); vkc_gemm_rows(-1);
         vkc_stats(&s1);
         CHECK(ok && s1.mm8 == s0.mm8 + 1, "mm8: the verify's rows take the tiled GEMM with the knob on");
+    }
+    {   /* COLI_VK_MM8=-1: the fill rule as the rows policy gates it, exactly the f32
+         * GEMM's take on the same shape (observed with the knob off) -- so a verify's
+         * pin (vkc_gemm_rows 0) keeps the rows on the GEMV, as the GEMM's own -1 does.
+         * The shape passes the rule itself: S 2 x O 2048 is the S*O >= 4096 floor */
+        int O3 = 2048;
+        uint8_t *w3 = malloc((size_t)O3 * I); float *sc3 = malloc((size_t)O3 * ng * sizeof(float));
+        for (size_t i = 0; i < (size_t)O3 * I; i++) w3[i] = e4m3_rnd(10);
+        for (int i = 0; i < O3 * ng; i++) sc3[i] = ldexpf(1.f, -(int)(i % 13));
+        ColiVkTensor *t3 = NULL;
+        int upt3 = coli_vk_tensor_ensure(&t3, w3, sc3, 12, I, O3, 128);
+        if (upt3) {
+            VkcBuf *xb3 = up(x, 2 * I), *yb3 = vkc_buf((size_t)2 * O3 * 4, VKC_DOWN);
+            VkcStats sa; vkc_stats(&sa);
+            vkc_gemm_rows(-1); vkc_mm8_set(0);
+            vkc_begin(); int okf = vkc_matmul(t3, xb3, 0, yb3, 0, 2); vkc_submit(1);
+            vkc_stats(&s1);
+            int fires = s1.gemms + s1.tile_gemms > sa.gemms + sa.tile_gemms;   /* the f32 GEMM's take */
+            vkc_mm8_set(-1);
+            vkc_begin(); int ok1 = vkc_matmul(t3, xb3, 0, yb3, 0, 2); vkc_submit(1);   /* the rule's choice */
+            vkc_stats(&s1);
+            CHECK(okf && ok1 && s1.mm8 == sa.mm8 + (fires ? 1 : 0),
+                  "mm8 -1: the fill rule took it where the f32 GEMM's own rule did");
+            vkc_gemm_rows(0);   /* a verify's pin: the GEMV, whatever the rule says */
+            vkc_begin(); int ok2 = vkc_matmul(t3, xb3, 0, yb3, 0, 2); vkc_submit(1);
+            vkc_stats(&s1);
+            CHECK(ok2 && s1.mm8 == sa.mm8 + (fires ? 1 : 0),
+                  "mm8 -1: a verify's rows pin kept the GEMV (dispatches %llu)", s1.mm8 - sa.mm8);
+            vkc_mm8_set(0); vkc_gemm_rows(-1);
+            printf("  mm8 -1: the fill rule %s, the rows pin kept the GEMV\n", fires ? "fires here" : "is off here");
+            vkc_free(xb3); vkc_free(yb3); coli_vk_tensor_free(t3);
+        }
+        free(w3); free(sc3);
     }
     if (upt) coli_vk_tensor_free(t);
     if (upt2) coli_vk_tensor_free(t2);
@@ -3201,6 +3286,7 @@ static void test_mm8(void) {
     for (int k = 0; k < 6; k++) for (int j = 0; j < 4; j++) test_mm8_case(shapes[k][0], shapes[k][1], Ss[j], 0);
     /* rows past a tile's BN (128) and a partial group column tail (I = 320 = 2x128 + 64) */
     test_mm8_case(300, 320, 130, 1);
+    test_mm8_tiles();
     test_mm8_refusals();
     test_mm8_split();
 }

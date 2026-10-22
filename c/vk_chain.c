@@ -1311,10 +1311,11 @@ static int matmul_bd(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcBuf *y
  * rows fall to qmatmul.spv's GEMV, a workgroup a row. mm8 tiles them weight-stationary
  * (the fork's issue #46 kernel; the scale staging reads this tree's per-row per-group
  * layout, qmatmul_mm8.comp's note). Opt-in -- COLI_VK_MM8, default 0, keeps every
- * matmul's bits byte-for-byte -- and independent of vkc_gemm_rows: `1` takes it for
- * every eligible matmul (fmt 12, S >= 2, I a multiple of 64), a speculative verify's
- * rows too, which is the documented reassociation-class break of that policy;
- * `-1` follows the backend's own fill rule (gemm_min_s, as the tiled GEMM's -1 does).
+ * matmul's bits byte-for-byte. `1` takes it for every eligible matmul (fmt 12,
+ * S >= 2, I a multiple of 64), a speculative verify's rows too, the documented
+ * reassociation-class break of the rows policy; `-1` follows the backend's own fill
+ * rule (gemm_min_s) as that policy gates it, exactly the tiled GEMM's `-1`: a
+ * per-call vkc_gemm_rows pin (a verify's 0) keeps the rows on the GEMV.
  * A refusal anywhere (no pipeline, an unaligned I) leaves the matmul on the paths
  * below. */
 typedef struct { int blk, bm, bn, bk, wm, wn, wmiter, tm, tn, tk, warp; const char *name; } VkcMm8Tile;
@@ -1360,9 +1361,10 @@ static VkPipeline mm8_pipe(int v) {
     KC.mm8_tried[v] = 1;
     if (!KC.mod_mm8 && !(KC.mod_mm8 = load_module(KC.core.spv_path, "qmatmul_mm8.spv"))) return VK_NULL_HANDLE;
     const VkcMm8Tile *t = &vkc_mm8_tile[v];
-    /* id 11 = NDBUF (ping-pong staging) when the DOUBLED shared memory fits the
-     * device's limit -- the fork's budget with the constant queried, not assumed */
-    uint32_t lds2 = 2u * (uint32_t)(t->bm + t->bn) * (uint32_t)(t->bk / 2 + 1) * 8u * 2u;
+    /* id 11 = NDBUF (ping-pong staging) when the doubled staging fits the device's
+     * shared-memory limit: NBUF=2 buffers of (bm weights + bn activations) rows,
+     * each (bk/2+1) vec2 -- 2*(bm+bn)*(bk/2+1)*8 bytes, the shader's own arrays */
+    uint32_t lds2 = 2u * (uint32_t)(t->bm + t->bn) * (uint32_t)(t->bk / 2 + 1) * 8u;
     int32_t vals[12] = {t->blk, t->bm, t->bn, t->bk, t->wm, t->wn, t->wmiter, t->tm, t->tn,
                         t->tk, t->warp, lds2 <= kc_shared_limit() ? 1 : 0};
     VkSpecializationMapEntry e[12];
@@ -1458,17 +1460,19 @@ static int mm8_record(const ColiVkTensorInfo *ti, VkcBind *bd, int S) {
     if (!record(p, sbd, 4, &pc, sizeof pc, gx, gy, 1)) return 0;   /* the frame frees pb */
     struct { uint32_t n, split; } rpc = {(uint32_t)out, (uint32_t)k};   /* qmatmul_mm8_reduce.comp */
     VkcBind rbd[2] = {{pb->buf, 0, 0, 0}, bd[3]};
-    if (!record(KC.mm8red, rbd, 2, &rpc, sizeof rpc, (uint32_t)((out + 255) / 256), 1, 1)) return 0;
+    uint32_t rgx, rgy; grid(((uint64_t)out + 255) / 256, &rgx, &rgy);   /* S*O past the x limit spills into y */
+    if (!record(KC.mm8red, rbd, 2, &rpc, sizeof rpc, rgx, rgy, 1)) return 0;
     KC.st.mm8_split += 1;
     return 1;
 }
 static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcBuf *y, size_t yb, int S) {
     if (ti->fmt >= 100) return matmul_bd(ti, x, xb, y, yb, S);
     int path = -1;   /* GEMM slot, -1 the GEMV */
+    int take = 0;   /* the tiled GEMM's fill rule as the rows policy gates it (mm8's -1 shares it) */
     if (KC.ngemm && S >= 2) {
-        int take = KC.gemm_rows < 0 ? (KC.core.gemm_min_s && S >= KC.core.gemm_min_s &&
-                                      (int64_t)S * ti->O >= KC.core.gemm_min_so)
-                                   : (KC.gemm_rows > 0 && S >= KC.gemm_rows);
+        take = KC.gemm_rows < 0 ? (KC.core.gemm_min_s && S >= KC.core.gemm_min_s &&
+                                   (int64_t)S * ti->O >= KC.core.gemm_min_so)
+                                : (KC.gemm_rows > 0 && S >= KC.gemm_rows);
         if (take) { path = 0; while (path + 1 < KC.ngemm && S > KC.gemm_bn[path]) path++; }
     }
     VkcBind bd[4] = {{x->buf, xb, 0, 0}, {(VkBuffer)ti->wbuf, 0, 0, 0}, {(VkBuffer)ti->sbuf, 0, 0, 0},
@@ -1484,16 +1488,15 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
              (ti->fmt != 4 || (ti->gs > 0 && ti->gs % 32 == 0)) && (xg ? KC.gemv4x : KC.gemv4);
     KC.kind = path >= 0 ? PK_GEMM : ti->fmt == 1 ? PK_GEMV8 : PK_GEMV;
     /* mm8: the tiled weight-stationary GEMM for the fp8 matrices from 2 rows, opt-in
-     * (COLI_VK_MM8) and independent of the rows policy above -- a verify's rows take
-     * it too, the documented reassociation-class break; a refusal falls through to
-     * the same paths as with the knob off */
-    if (ti->fmt == 12 && S >= 2 && ti->I % 64 == 0 && mm8_mode() &&
-        (mm8_mode() > 0 || (KC.core.gemm_min_s && S >= KC.core.gemm_min_s &&
-                            (int64_t)S * ti->O >= KC.core.gemm_min_so)) &&
-        (ok = mm8_record(ti, bd, S))) {
-        KC.kind = PK_MM8;
-        KC.st.matmuls += ok; KC.st.mm8 += ok;
-        return ok;
+     * (COLI_VK_MM8): `1` takes every eligible matmul independently of the rows policy
+     * above -- a verify's rows take it too, the documented reassociation-class break;
+     * `-1` shares the tiled GEMM's fill rule as that policy gates it (take), so a
+     * per-call vkc_gemm_rows(0) pin keeps a verify's rows on the GEMV; a refusal
+     * falls through to the same paths as with the knob off */
+    if (ti->fmt == 12 && S >= 2 && ti->I % 64 == 0 && mm8_mode() && (mm8_mode() > 0 || take)) {
+        KC.kind = PK_MM8;   /* before the dispatches: record()'s prof_mark files them under the mm8 bucket */
+        if ((ok = mm8_record(ti, bd, S))) { KC.st.matmuls += ok; KC.st.mm8 += ok; return ok; }
+        KC.kind = path >= 0 ? PK_GEMM : ti->fmt == 1 ? PK_GEMV8 : PK_GEMV;   /* refused: the paths below */
     }
     int xv = ti->I / 4 + ti->I / 32;   /* a row of x staged, with chain_gemv2's padding */
     /* a matrix of few long rows: a row a workgroup with every lane on it (an RTX PRO 4000,
