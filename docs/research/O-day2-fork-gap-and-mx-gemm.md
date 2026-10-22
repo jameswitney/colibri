@@ -196,3 +196,31 @@ measured numbers.
 ~195 s TTFT floor is now the rest of prefill — dense chain frames, loads and
 staging on the engine thread, attention/indexer — which is the ring/overlap
 build's territory, not the tier's.
+
+## 9. Third addendum: the two remaining cheap hypotheses, tested — both negative
+
+**Speculative decoding** (upstream's verify-row sharing made it worth testing):
+- n-gram drafter (`V4_DRAFT=4`): 194.4 / 0.533 — no drafts fired (the bench's
+  continuation has no prompt n-grams; `target_only=1`).
+- the Flash's MTP head (`V4_MTP=1 V4_DRAFT=4`): 201.8 / 0.506 —
+  `attempts=1 drafted=3 accepted=0`, the adaptive drafter shut down.
+- Fairness: the fork's reference arms are also `target_only=1` — the 1.9× gap
+  never included drafting. Spec decode may still pay on long generations or
+  with the DSpark-supplement checkpoint; on this bench it is a wash.
+
+**Bigger prompt chunks** (`COLI_VK_CHAIN_ROWS=1536`): TTFT 927.7 s —
+catastrophic on this 16 GiB card (the chunk's activations and the giant
+stream steps thrash; the CPU row cost measure doubled under load). 768
+stands.
+
+**Where this leaves prefill:** the remaining ~90 s of host-side MoE wall
+(loads on the engine thread, staging, join bubbles) over an irreducible
+~70+ s of NVMe (29.4k expert reads ≈ 435 GiB) is the loader-thread build:
+move `st_fill_group`'s `T.c.load_batch` off the engine thread onto the
+existing uploader with a deeper queue, and let the prefetcher hold a
+two-layer slot window (the fork's ring equivalent). Design constraints:
+the `SS_*` slot states and the two-half sub-batch pipeline are the
+synchronization points; `COLI_VK_TIER_SYNC=1` must keep its
+deterministic-drain contract (the tests rely on it). Expected ceiling:
+TTFT ~195 → ~150 s (NVMe-bound), not the fork's 104 (its GPU-FOLD kept
+the whole MoE device-side, an architecture we chose not to port).
