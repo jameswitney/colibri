@@ -7,6 +7,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `COLI_VK_MM8`/`COLI_VK_MM8_SPLITK`: DeepSeek V4's fp8 dense projections
+  may run on the tiled weight-stationary GEMM `qmatmul_mm8.spv` — the weights
+  staged once a tile, the group scale folded at staging, one fp32 accumulator
+  an output over ascending k, so the same exact terms as the GEMV's sums in
+  another order (a measured envelope, not bit-identical; every tile of the
+  table bitwise the frozen one). Opt-in, the default `0` keeping a row's bits
+  dependent on its inputs only; `-1` follows the backend's fill rule for
+  prompt rows only, exactly `COLI_VK_CHAIN_GEMM_ROWS=-1`, so a verify's rows
+  and every decode step keep the GEMV's bits. The split cuts a starved
+  shape's reduction into k partial planes summed in ascending k
+  (deterministic, never bitwise). On an RX 6900 XT, S 128, the six real
+  projection shapes, best tile: the GEMV's 185–241 GMAC/s to 2,107–4,183,
+  the most starved (wkv) 574 → 2,107 with the split (experiment record in
+  `docs/experiments/mm8-2026-10-22/`).
 - `COLI_VK_CHAIN_GEMM_ROWS`: DeepSeek V4's chain prompt rows may take the
   backend's tiled GEMM instead of the per-row GEMV (`-1` follows the backend's
   rule, `N` from N rows; a verify's rows and decode keep the GEMV's bits). On
