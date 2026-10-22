@@ -17,6 +17,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include "compat.h"   /* setenv/unsetenv, two views of one environment on Windows */
 #ifdef __linux__
 #include <unistd.h>
 #endif
@@ -1081,8 +1082,131 @@ static void vk_strict_boot(void) {   /* one line per process, before any early r
     fprintf(stderr, "[VK] strict: on (COLI_VK_STRICT) — a capability degradation aborts\n");
 }
 
+/* ---- the deployment profile (COLI_VK_PROFILE) ----------------------------------------
+ * The port's measured operating points are three mutually-exclusive knob sets (RX
+ * 6900 XT, 2,515-token prompt / 64 tokens, 28 GiB plan, bench/up2276/, the 2026-10-22
+ * stacking campaign): ttft 187.7 s / 0.533 / 305.9, decode 239.5 / 0.670 / 333.5,
+ * balanced 205.7 / 0.557 / 318.9. RDNA2, the headline value, is the hardware profile
+ * tuned on that card (RDNA2, no cooperative matrices) and applies the stage-aware best
+ * set itself: a queued prompt of a thousand tokens or more takes the ttft preset (the
+ * prompt is the run), a smaller one the decode preset (the answer is the run), and a
+ * length the engine cannot know when the knobs are read (serve, streaming) the balanced
+ * fallback. ttft, decode and balanced force one stage's preset -- the A/B machinery --
+ * and auto is RDNA2's other name. The profile fills the UNSET variables only (an
+ * explicitly set env var always wins), so an operator tunes one knob of a preset by
+ * setting just that knob beside it; unset or `0` fills nothing and prints nothing, the
+ * default byte-for-byte today's behaviour. Resolved at boot (an engine's entry, else
+ * coli_vk_init below), never in a dispatch path; balanced's plan budget is taken by the
+ * engine itself, on the path --memory-gb / RAM_GB already uses. Likely beneficial on
+ * other devices, but benchmarks are needed to confirm. */
+enum { PROF_NONE = 0, PROF_TTFT, PROF_DECODE, PROF_BALANCED, PROF_STAGE };
+static const char *const prof_ttft[] = {
+    "COLI_VK_MM8", "1", "COLI_VK_CHAIN_GEMM_ROWS", "-1",
+    "COLI_VK_TIER_STREAM_SLOTS", "256", "COLI_VK_TIER_GEMM_ROWS", "4", NULL };
+static const char *const prof_decode[] = {
+    "COLI_VK_MM8", "1", "COLI_VK_TIER_HOST_GB", "8", "COLI_VK_TIER_PROMOTE", "32", NULL };
+static const char *const prof_balanced[] = {
+    "COLI_VK_MM8", "1", "COLI_VK_CHAIN_GEMM_ROWS", "-1", "COLI_VK_TIER_GEMM_ROWS", "4",
+    "COLI_VK_TIER_STREAM_SLOTS", "192", "COLI_VK_TIER_HOST_GB", "5", "COLI_VK_TIER_PROMOTE", "32", NULL };
+static long prof_prompt = -1;        /* the queued prompt's tokens, -1: none noted before the fill */
+static int prof_applied = PROF_NONE; /* what the last fill applied (the plan budget's question) */
+static char prof_mine[8][26];        /* the knobs a fill set, unset again by the next */
+static char prof_mine_v[8][8];       /* the value each was given (one the operator has since taken over stays) */
+static int prof_nmine;
+static char prof_line[512];          /* the last boot line: a re-fill says nothing new */
+static char prof_named[8];           /* how the env named the stage rule ("RDNA2" or "auto") */
+
+/* the knob itself, re-read when the env names another value (the tests walk the presets) */
+static int prof_knob(void) {
+    static int k = -2;
+    static char was[24];
+    const char *e = getenv("COLI_VK_PROFILE");
+    if (e && !*e) e = NULL;
+    char now[24];
+    snprintf(now, sizeof now, "%s", e ? e : "");
+    if (k != -2 && !strcmp(now, was)) return k;   /* the same value: the warning said once */
+    snprintf(was, sizeof was, "%s", now);
+    k = !e || !strcmp(e, "0") ? PROF_NONE
+      : !strcmp(e, "ttft") ? PROF_TTFT : !strcmp(e, "decode") ? PROF_DECODE
+      : !strcmp(e, "balanced") ? PROF_BALANCED : PROF_NONE;
+    if (e && (!strcmp(e, "RDNA2") || !strcmp(e, "rdna2") || !strcmp(e, "auto"))) {
+        k = PROF_STAGE;
+        snprintf(prof_named, sizeof prof_named, "%s", !strcmp(e, "auto") ? "auto" : "RDNA2");
+    }
+    if (e && strcmp(e, "0") && k == PROF_NONE)
+        fprintf(stderr, "[VK] profile: COLI_VK_PROFILE=%s is not one of RDNA2, ttft, decode, balanced, auto; nothing set\n", e);
+    return k;
+}
+
+int coli_vk_profile_stage(void) { return prof_knob() == PROF_STAGE; }
+
+/* the stage rule, from the arms that made the presets: the 2,515-token prompt put every
+ * lever on prefill (the ttft set, first token 187.7 s), the 64-token decode run put
+ * them on the host pool (the decode set, 0.670 tok/s); a thousand tokens is where a
+ * prompt stops being a chat turn. */
+int coli_vk_profile_pick(long prompt_tokens) { return prompt_tokens >= COLI_VK_PROFILE_PROMPT_MIN; }
+
+void coli_vk_profile_note_prompt(long tokens) {
+    if (tokens > 0) prof_prompt = tokens;   /* the prompt queued now; read when the fill resolves */
+}
+
+double coli_vk_profile_plan_gb(void) { return prof_applied == PROF_BALANCED ? 24.0 : 0.0; }
+
+void coli_vk_profile_fill(void) {
+    while (prof_nmine) {   /* a re-fill recomputes from the env there is; a knob the operator set since is theirs */
+        int i = --prof_nmine;
+        const char *e = getenv(prof_mine[i]);
+        if (e && !strcmp(e, prof_mine_v[i])) unsetenv(prof_mine[i]);
+    }
+    int k = prof_knob();
+    const char *name = k == PROF_TTFT ? "ttft" : k == PROF_DECODE ? "decode" : k == PROF_BALANCED ? "balanced" : NULL;
+    const char *const *set = k == PROF_TTFT ? prof_ttft : k == PROF_DECODE ? prof_decode : k == PROF_BALANCED ? prof_balanced : NULL;
+    char why[80] = "";
+    if (k == PROF_STAGE) {   /* the queued prompt picks; none queued (serve, streaming) is the balanced fallback */
+        int ttft = prof_prompt >= 0 && coli_vk_profile_pick(prof_prompt);
+        set = prof_prompt >= 0 ? (ttft ? prof_ttft : prof_decode) : prof_balanced;
+        name = prof_prompt >= 0 ? (ttft ? "ttft" : "decode") : "balanced";
+        if (prof_prompt >= 0)
+            snprintf(why, sizeof why, "prompt %ld tokens %s %ld; ", prof_prompt, ttft ? ">=" : "<", COLI_VK_PROFILE_PROMPT_MIN);
+        else
+            snprintf(why, sizeof why, "%s", "no prompt queued before the tier started; ");
+    }
+    prof_applied = set ? (set == prof_balanced ? PROF_BALANCED : set == prof_ttft ? PROF_TTFT : PROF_DECODE) : PROF_NONE;
+    if (!set) { prof_line[0] = 0; return; }   /* unset or `0`: no knob set, no line */
+    char line[sizeof prof_line];
+    int at = k == PROF_STAGE   /* RDNA2/auto carry the pick's evidence; a direct preset names its knobs at once */
+        ? snprintf(line, sizeof line, "[VK] profile: %s -> %s (%s", prof_named, name, why)
+        : snprintf(line, sizeof line, "[VK] profile: %s (%s", name, why);
+    for (int i = 0; set[i]; i += 2) {
+        const char *e = getenv(set[i]);
+        if (e && *e) {   /* the operator's knob: it keeps its authority */
+            at += snprintf(line + at, sizeof line - (size_t)at, "%s%s kept (already set)", i ? "; " : "", set[i]);
+            if (at >= (int)sizeof line) at = (int)sizeof line - 1;   /* snprintf counts unwritten bytes too */
+            continue;
+        }
+        if (prof_nmine < (int)(sizeof prof_mine / sizeof prof_mine[0])) {
+            snprintf(prof_mine[prof_nmine], sizeof prof_mine[0], "%s", set[i]);
+            snprintf(prof_mine_v[prof_nmine], sizeof prof_mine_v[0], "%s", set[i + 1]);
+            prof_nmine++;
+        }
+        setenv(set[i], set[i + 1], 1);
+        at += snprintf(line + at, sizeof line - (size_t)at, "%s%s=%s", i ? " " : "", set[i], set[i + 1]);
+        if (at >= (int)sizeof line) at = (int)sizeof line - 1;
+    }
+    if (at >= (int)sizeof line) at = (int)sizeof line - 1;   /* snprintf counts unwritten bytes too */
+    if (prof_applied == PROF_BALANCED)
+        at += snprintf(line + at, sizeof line - (size_t)at, "; plan budget 24 GiB unless --memory-gb/RAM_GB names one");
+    if (at >= (int)sizeof line) at = (int)sizeof line - 1;
+    snprintf(line + at, sizeof line - (size_t)at, ")");
+    if (strcmp(line, prof_line)) {   /* one line an arm log keeps: main fills, the device's init fills again */
+        fprintf(stderr, "%s\n", line);
+        snprintf(prof_line, sizeof prof_line, "%s", line);
+    }
+}
+
 int coli_vk_init(const char *spv_path) {
     if (G.ready) return 1;
+    coli_vk_profile_fill();   /* before any knob the presets fill is read: the tier's, the chain's */
     vk_strict_boot();
     if (!coli_vk_load()) return 0;
     up_fault_init();
