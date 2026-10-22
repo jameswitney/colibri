@@ -1703,6 +1703,148 @@ static void host_room(void) {
            room, budget, room / per, (double)vkt_host_room(avail, 0, 0, 0, 0) / GiB);
 }
 
+/* ---- the deployment profile (COLI_VK_PROFILE, backend_vulkan.c) -----------------------
+ * The measured presets, RX 6900 XT, bench/up2276/ (the 2026-10-22 stacking campaign):
+ * ttft MM8=1 CHAIN_GEMM_ROWS=-1 TIER_STREAM_SLOTS=256 TIER_GEMM_ROWS=4 (187.7 s first
+ * token), decode MM8=1 TIER_HOST_GB=8 TIER_PROMOTE=32 (0.670 tok/s), balanced the two
+ * composed at TIER_STREAM_SLOTS=192 TIER_HOST_GB=5 with the 24 GiB plan (205.7 / 0.557).
+ * RDNA2 is the headline: the hardware profile tuned on that card, whose stage rule
+ * applies the best set itself. The fill takes unset knobs only (an explicit env var
+ * wins), the unset/`0` default sets nothing and prints nothing (counter-asserted, as
+ * mm8's knob-off arm), the stage rule takes ttft from COLI_VK_PROFILE_PROMPT_MIN queued
+ * tokens and decode below, and a path that queued no prompt (serve) falls back to
+ * balanced. Pure env: no device needed. */
+static const char *const prof_knobs[] = {
+    "COLI_VK_MM8", "COLI_VK_CHAIN_GEMM_ROWS", "COLI_VK_TIER_STREAM_SLOTS",
+    "COLI_VK_TIER_GEMM_ROWS", "COLI_VK_TIER_HOST_GB", "COLI_VK_TIER_PROMOTE", NULL };
+static void prof_unset(void) {   /* nothing a case set outlives it */
+    for (int i = 0; prof_knobs[i]; i++) unsetenv(prof_knobs[i]);
+    unsetenv("COLI_VK_PROFILE");
+}
+static int prof_is(const char *k, const char *v) {   /* k holds exactly v (NULL: unset) */
+    const char *e = getenv(k);
+    return v ? e && !strcmp(e, v) : !e;
+}
+static char prof_cap[4096];
+static void cap_fill(void) {   /* the boot line under capture, as the host cases read vkt_init's */
+    fflush(stderr);
+    prof_cap[0] = 0;
+    int save = dup(2);
+    char path[] = "/tmp/coli_vk_prof.XXXXXX";
+    int fd = mkstemp(path);
+    if (save < 0 || fd < 0) {
+        if (fd >= 0) close(fd);
+        if (save >= 0) close(save);
+        unlink(path);
+        coli_vk_profile_fill();
+        return;
+    }
+    dup2(fd, 2);
+    coli_vk_profile_fill();
+    fflush(stderr);
+    dup2(save, 2); close(save);
+    lseek(fd, 0, SEEK_SET);
+    ssize_t got = read(fd, prof_cap, sizeof prof_cap - 1);
+    if (got > 0) prof_cap[got] = 0;
+    close(fd); unlink(path);
+}
+static int prof_none_set(void) {   /* every knob of every preset still unset */
+    for (int i = 0; prof_knobs[i]; i++)
+        if (!prof_is(prof_knobs[i], NULL)) return 0;
+    return 1;
+}
+static void profile(void) {
+    /* the stage rule on the constant: the arms' own prompts either side of it */
+    CHECK(coli_vk_profile_pick(COLI_VK_PROFILE_PROMPT_MIN) == 1 &&
+          coli_vk_profile_pick(COLI_VK_PROFILE_PROMPT_MIN - 1) == 0,
+          "profile pick: the %ld-token boundary is not the rule", COLI_VK_PROFILE_PROMPT_MIN);
+    CHECK(coli_vk_profile_pick(2515) == 1 && coli_vk_profile_pick(64) == 0,
+          "profile pick: the 2,515-token arm and the 64-token decode disagree");
+    /* the default, unset and `0`: no knob set, no line (the counter-assert) */
+    prof_unset();
+    cap_fill();
+    CHECK(prof_none_set(), "profile unset: a knob set by nothing");
+    CHECK(!strstr(prof_cap, "[VK] profile:"), "profile unset: a boot line anyway");
+    setenv("COLI_VK_PROFILE", "0", 1);
+    cap_fill();
+    CHECK(prof_none_set(), "profile 0: a knob set");
+    CHECK(!strstr(prof_cap, "[VK] profile:"), "profile 0: a boot line anyway");
+    /* each preset applies its set -- and only its set */
+    setenv("COLI_VK_PROFILE", "ttft", 1);
+    cap_fill();
+    CHECK(prof_is("COLI_VK_MM8", "1") && prof_is("COLI_VK_CHAIN_GEMM_ROWS", "-1") &&
+          prof_is("COLI_VK_TIER_STREAM_SLOTS", "256") && prof_is("COLI_VK_TIER_GEMM_ROWS", "4") &&
+          prof_is("COLI_VK_TIER_HOST_GB", NULL) && prof_is("COLI_VK_TIER_PROMOTE", NULL),
+          "profile ttft: not its four knobs");
+    CHECK(coli_vk_profile_plan_gb() == 0.0, "profile ttft: a plan budget from nowhere");
+    CHECK(strstr(prof_cap, "profile: ttft (COLI_VK_MM8=1") != NULL, "profile ttft: no boot line");
+    setenv("COLI_VK_PROFILE", "decode", 1);
+    cap_fill();
+    CHECK(prof_is("COLI_VK_MM8", "1") && prof_is("COLI_VK_TIER_HOST_GB", "8") && prof_is("COLI_VK_TIER_PROMOTE", "32") &&
+          prof_is("COLI_VK_CHAIN_GEMM_ROWS", NULL) && prof_is("COLI_VK_TIER_STREAM_SLOTS", NULL) &&
+          prof_is("COLI_VK_TIER_GEMM_ROWS", NULL),
+          "profile decode: not its three knobs, or a stale ttft knob survived the refill");
+    CHECK(coli_vk_profile_plan_gb() == 0.0, "profile decode: a plan budget from nowhere");
+    setenv("COLI_VK_PROFILE", "balanced", 1);
+    cap_fill();
+    CHECK(prof_is("COLI_VK_MM8", "1") && prof_is("COLI_VK_CHAIN_GEMM_ROWS", "-1") &&
+          prof_is("COLI_VK_TIER_GEMM_ROWS", "4") && prof_is("COLI_VK_TIER_STREAM_SLOTS", "192") &&
+          prof_is("COLI_VK_TIER_HOST_GB", "5") && prof_is("COLI_VK_TIER_PROMOTE", "32"),
+          "profile balanced: not its six knobs");
+    CHECK(coli_vk_profile_plan_gb() == 24.0, "profile balanced: the 24 GiB plan budget is not there");
+    /* an explicit env var beats the profile, and the line says it was kept */
+    setenv("COLI_VK_TIER_STREAM_SLOTS", "64", 1);
+    cap_fill();
+    CHECK(prof_is("COLI_VK_TIER_STREAM_SLOTS", "64"),
+          "profile: the explicit COLI_VK_TIER_STREAM_SLOTS lost to the preset");
+    CHECK(prof_is("COLI_VK_TIER_HOST_GB", "5"), "profile: the kept knob unset the rest");
+    CHECK(strstr(prof_cap, "COLI_VK_TIER_STREAM_SLOTS kept (already set)"),
+          "profile: the kept knob not named in the line");
+    unsetenv("COLI_VK_TIER_STREAM_SLOTS");
+    cap_fill();   /* the override lifted: the preset's value again */
+    CHECK(prof_is("COLI_VK_TIER_STREAM_SLOTS", "192"),
+          "profile: the lifted override left its knob behind");
+    cap_fill();
+    CHECK(!*prof_cap, "profile: the same resolution printed its line twice");
+    /* RDNA2, the headline: the stage rule applies the best set itself -- no prompt queued
+     * (serve, streaming) the balanced fallback, a queued prompt of a thousand tokens or
+     * more the ttft preset, a smaller one decode -- and auto, its other name, the same */
+    setenv("COLI_VK_PROFILE", "RDNA2", 1);
+    cap_fill();
+    CHECK(prof_is("COLI_VK_TIER_STREAM_SLOTS", "192") && prof_is("COLI_VK_TIER_HOST_GB", "5") &&
+          prof_is("COLI_VK_TIER_GEMM_ROWS", "4"),
+          "profile RDNA2: the no-prompt fallback is not balanced");
+    CHECK(coli_vk_profile_plan_gb() == 24.0, "profile RDNA2: the fallback carries no plan budget");
+    CHECK(strstr(prof_cap, "profile: RDNA2 -> balanced") && strstr(prof_cap, "no prompt queued"),
+          "profile RDNA2: the fallback not said");
+    CHECK(coli_vk_profile_stage(), "profile RDNA2: not the stage rule");
+    coli_vk_profile_note_prompt(2515);   /* the ttft arm's prompt */
+    cap_fill();
+    CHECK(prof_is("COLI_VK_TIER_STREAM_SLOTS", "256") && prof_is("COLI_VK_TIER_GEMM_ROWS", "4") &&
+          prof_is("COLI_VK_TIER_HOST_GB", NULL) && prof_is("COLI_VK_TIER_PROMOTE", NULL),
+          "profile RDNA2: the 2,515-token prompt did not take ttft");
+    CHECK(coli_vk_profile_plan_gb() == 0.0, "profile RDNA2 ttft: a plan budget from nowhere");
+    CHECK(strstr(prof_cap, "RDNA2 -> ttft") && strstr(prof_cap, "2515"),
+          "profile RDNA2: the pick's evidence not in the line");
+    coli_vk_profile_note_prompt(64);   /* the last prompt queued before the fill is the run's */
+    cap_fill();
+    CHECK(prof_is("COLI_VK_TIER_HOST_GB", "8") && prof_is("COLI_VK_TIER_PROMOTE", "32") &&
+          prof_is("COLI_VK_TIER_STREAM_SLOTS", NULL) && prof_is("COLI_VK_TIER_GEMM_ROWS", NULL),
+          "profile RDNA2: the 64-token prompt did not take decode");
+    CHECK(strstr(prof_cap, "RDNA2 -> decode"), "profile RDNA2: the decode pick not said");
+    setenv("COLI_VK_PROFILE", "auto", 1);   /* RDNA2's other name: the same rule */
+    cap_fill();
+    CHECK(prof_is("COLI_VK_TIER_HOST_GB", "8") && prof_is("COLI_VK_TIER_PROMOTE", "32"),
+          "profile auto: the alias is not the stage rule");
+    CHECK(strstr(prof_cap, "profile: auto -> decode"), "profile auto: the alias not named in the line");
+    /* a name that is not a preset: nothing set, one line says so */
+    setenv("COLI_VK_PROFILE", "fast", 1);
+    cap_fill();
+    CHECK(prof_none_set(), "profile junk: a knob set");
+    CHECK(strstr(prof_cap, "is not one of"), "profile junk: no line naming it");
+    prof_unset();   /* the suite's guard: nothing the case set outlives it */
+}
+
 /* vkt_init with stderr captured, so a test can read the tier's [VK] lines; the capture
  * lands in host_cap (the boot lines the host pool's cases are about). */
 static char host_cap[16384];
@@ -1804,6 +1946,7 @@ int main(int argc, char **argv) {
      * reads GQ_EXACT once, so before any case (the integer form: the argument host-pairs) */
     setenv("GQ_EXACT", "1", 1);
     printf("host room:\n"); host_room();   /* pure arithmetic: needs no device */
+    printf("profile:\n"); profile();   /* pure env: needs no device, before the device's own fill */
     if (!coli_vk_init(spv)) { printf("FAIL: no Vulkan device (shaders %s)\n", spv); return 1; }
     setenv("COLI_VK_TIER_RESERVE_GB", "0", 1);
     /* the budgets, evictions and promotions below are the device's: the host pool (a

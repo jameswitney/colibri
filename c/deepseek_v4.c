@@ -18124,6 +18124,9 @@ static int v4_serve_main(void) {
         fprintf(stderr, "set SNAP=<DeepSeek V4 model directory>\n");
         return 1;
     }
+#ifdef COLI_VULKAN
+    coli_vk_profile_fill();   /* COLI_VK_PROFILE: resolved before any knob reads it; serve queues no prompt at boot, so the stage rule falls back to balanced */
+#endif
     int context = getenv("CTX") ? atoi(getenv("CTX")) : 4096;
     int max_tokens = getenv("NGEN") ? atoi(getenv("NGEN")) : 1024;
     if (context < 2) context = 4096;
@@ -18152,6 +18155,13 @@ static int v4_serve_main(void) {
     if (ram && atof(ram) > 0.0)
         open_options.memory_limit_bytes =
             (uint64_t)(atof(ram) * 1073741824.0);
+#ifdef COLI_VULKAN
+    else {   /* COLI_VK_PROFILE=balanced's plan budget, on the same path RAM_GB takes here */
+        double pg = coli_vk_profile_plan_gb();
+        if (pg > 0.0)
+            open_options.memory_limit_bytes = (uint64_t)(pg * 1073741824.0);
+    }
+#endif
     v4_vk_hooks();   /* the RAM plan may put the dense layers on the Vulkan device only */
     if (coli_v4_engine_open(&engine, &open_options, error, sizeof(error))) {
         fprintf(stderr, "%s\n", error);
@@ -18382,6 +18392,34 @@ int main(int argc, char **argv) {
         }
         cli.prompt = prompt_storage;
     }
+#ifdef COLI_VULKAN
+    /* COLI_VK_PROFILE=RDNA2 (auto, its other name) picks by the queued prompt's tokens,
+     * so the prompt is built and tokenized here -- before the engine opens and the tier
+     * reads its knobs -- and only when the profile asks: the default path never touches
+     * the tokenizer twice. The oracle path queues its prompt from the fixture; without a
+     * queued prompt the stage rule falls back to balanced, as serve does. */
+    if (cli.prompt && coli_vk_profile_stage()) {
+        char *qp = NULL;
+        size_t ql = 0;
+        if (!coli_v4_prompt_build(&qp, &ql, cli.prompt, cli.system_prompt,
+                                  cli.prompt_mode) && ql < INT_MAX - 16) {
+            Tok qt;
+            char qtp[4096];
+            memset(&qt, 0, sizeof qt);
+            snprintf(qtp, sizeof qtp, "%s/tokenizer.json", cli.model_dir);
+            tok_load(&qt, qtp);
+            int *qi = malloc((ql + 16) * sizeof *qi);
+            if (qi) {
+                int qn = tok_encode(&qt, qp, (int)ql, qi, (int)ql + 16);
+                if (qn > 0) coli_vk_profile_note_prompt(qn);
+                free(qi);
+            }
+            tok_free(&qt);
+        }
+        free(qp);
+    }
+    coli_vk_profile_fill();   /* the presets fill unset knobs only; an explicit env var wins */
+#endif
     {
         ColiV4EngineOpenOptions open_opts = {
             .target_model_dir = cli.model_dir,
@@ -18394,6 +18432,13 @@ int main(int argc, char **argv) {
         if (cli.memory_gib > 0.0)
             open_opts.memory_limit_bytes =
                 (uint64_t)(cli.memory_gib * 1073741824.0);
+#ifdef COLI_VULKAN
+        else {   /* the balanced profile's plan budget on --memory-gb's path, when the operator named none */
+            double pg = coli_vk_profile_plan_gb();
+            if (pg > 0.0)
+                open_opts.memory_limit_bytes = (uint64_t)(pg * 1073741824.0);
+        }
+#endif
         v4_vk_hooks();   /* the RAM plan may put the dense layers on the Vulkan device only */
         if (coli_v4_engine_open(&engine, &open_opts, error, sizeof(error))) {
             fprintf(stderr, "%s\n", error);

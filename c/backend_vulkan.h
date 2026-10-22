@@ -23,6 +23,25 @@ void coli_vk_mem_info(size_t *used_bytes, size_t *tensor_count);
 /* GLM-5.3 SwiGLU clamp for the fused gate_up kernel. 0 disables (GLM-5.2). */
 void coli_vk_set_swiglu_limit(float limit);
 
+/* The deployment profile (COLI_VK_PROFILE): one knob for the measured operating points,
+ * resolved once at boot -- before any knob it fills is read, never in a dispatch path.
+ * RDNA2, the headline value, is the hardware profile tuned on the RX 6900 XT: it applies
+ * the stage-aware best set itself (a queued prompt of COLI_VK_PROFILE_PROMPT_MIN tokens
+ * or more takes the ttft preset, a smaller one the decode preset, a length the engine
+ * cannot know when the knobs are read -- serve, streaming -- the balanced fallback).
+ * ttft, decode and balanced force one stage's preset (the A/B machinery); auto is
+ * RDNA2's other name. The fill lands in the UNSET variables only (an explicitly set
+ * env var always wins; unset or `0` fills nothing, so the default is byte-for-byte
+ * today's behaviour) and prints one `[VK] profile: <name> (...)` boot line. balanced's
+ * plan budget (24 GiB) is not an env fill: the engine takes it on the path --memory-gb
+ * / RAM_GB already uses, only when the operator named no budget. */
+#define COLI_VK_PROFILE_PROMPT_MIN 1000L
+void   coli_vk_profile_fill(void);                /* apply the preset to the unset knobs (idempotent) */
+int    coli_vk_profile_stage(void);               /* the knob names RDNA2/auto (the engine tokenizes its queued prompt) */
+void   coli_vk_profile_note_prompt(long tokens);  /* the queued prompt's tokens, before the fill resolves */
+int    coli_vk_profile_pick(long prompt_tokens);  /* the stage rule: 1 ttft, 0 decode */
+double coli_vk_profile_plan_gb(void);             /* the resolved preset's plan budget in GiB (0: none) */
+
 /* VRAM pressure-proofing (both no-ops when the extension is absent):
  * alloc_priority sets the eviction-priority class of SUBSEQUENT weight uploads
  * (VK_EXT_memory_priority; scratches and the KV mirror pin themselves at 1.0) —
