@@ -1196,6 +1196,8 @@ void coli_vk_profile_fill(void) {
     if (at >= (int)sizeof line) at = (int)sizeof line - 1;   /* snprintf counts unwritten bytes too */
     if (prof_applied == PROF_BALANCED)
         at += snprintf(line + at, sizeof line - (size_t)at, "; plan budget 24 GiB unless --memory-gb/RAM_GB names one");
+    else   /* ttft/decode set none: their arms measured at RAM_GB 28, as the row says */
+        at += snprintf(line + at, sizeof line - (size_t)at, "; no plan budget (the arms ran at --memory-gb/RAM_GB 28)");
     if (at >= (int)sizeof line) at = (int)sizeof line - 1;
     snprintf(line + at, sizeof line - (size_t)at, ")");
     if (strcmp(line, prof_line)) {   /* one line an arm log keeps: main fills, the device's init fills again */

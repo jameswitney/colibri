@@ -18556,10 +18556,19 @@ int main(int argc, char **argv) {
     int target_only = !engine->dspark.enabled || cli.no_dspark;
     if (cli.no_dspark && engine->dspark.enabled)
         fprintf(stderr, "note: speculative drafting disabled by CLI\n");
+    char memory_word[24] = "auto";   /* --memory-gb's "limited", the profile's own word, or "auto" */
+    if (cli.memory_gib > 0.0)
+        snprintf(memory_word, sizeof memory_word, "limited");
+#ifdef COLI_VULKAN
+    else {   /* the balanced profile's plan budget, when the profile set one and --memory-gb named none */
+        double pg = coli_vk_profile_plan_gb();
+        if (pg > 0.0) snprintf(memory_word, sizeof memory_word, "profile(%.0fGiB)", pg);
+    }
+#endif
     fprintf(stderr, "v4_cli mode=%s memory=%s target_only=%d\n",
             cli.prompt_mode == COLI_V4_PROMPT_RAW ? "raw" :
             cli.prompt_mode == COLI_V4_PROMPT_THINKING ? "thinking" : "chat",
-            cli.memory_gib > 0.0 ? "limited" : "auto", target_only);
+            memory_word, target_only);
 
     int session_context = engine->runtime.context_tokens;
     ColiV4SessionCreateOptions session_opts = {

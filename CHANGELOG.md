@@ -72,6 +72,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   fetch, immediate admission into the per-layer LRU, 128-row prompt blocks in
   ascending expert id), so expert-placement policies can be compared on a model
   that runs on a CPU-only machine.
+- `tok_load` hardening: `tokenizer.json` is validated before it is indexed —
+  token ids must be finite integers in range (a negative id indexed below the
+  allocation, a fractional one aliased a different token), the containers
+  must have their shapes, and an `added_tokens` entry must carry `id` and
+  `content` — so a malformed file fails at load with a message instead of an
+  out-of-bounds write or a NULL deref
+  (`c/tests/test_tok_load_validation.py`). The commit rode in on `main`
+  (88c89479) before the port branches split, so no port slice carried it;
+  recorded here for the ledger.
 
 ## [2.0.0] - 2026-10-06
 
