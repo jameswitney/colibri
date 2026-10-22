@@ -7,6 +7,12 @@
  *            equals the reference expert output, and the rank-order sum of a mixed
  *            step (device and CPU rows) equals the all-CPU sum, within 2e-3;
  *   warm     a history fills the budget in heat order (vkt_plan / vkt_put);
+ *   hot set  COLI_VK_TIER_HOT: the history's top share of the residents pinned against
+ *            every victim path -- the pins survive a promotion storm that evicts the rest
+ *            (the same storm evicts them with the knob unset), a fully pinned tier refuses
+ *            promotions and still serves, COLI_VK_TIER_PIN_LAYER's layer pins whole and
+ *            holds, and the ranking is global on the RAW counts (HOT_SCOPE=layer and
+ *            HOT_HASH the variants; the scaled 1..31 heat would make it a per-layer film);
  *   adapt    a budget of a third of the experts and a hot set that moves halfway:
  *            experts are evicted, the new hot set becomes resident and its steps
  *            go to the device;
@@ -1259,6 +1265,165 @@ static unsigned long long after(const char *line, const char *key) {
     const char *p = strstr(line, key);
     return p ? strtoull(p + strlen(key), NULL, 10) : ~0ull;
 }
+/* The hot set overlay (COLI_VK_TIER_HOT): the history's top share of the resident places,
+ * ranked on the RAW counts, marked on the slots and skipped by every victim path. The
+ * history names layer 0 ten times hotter than layer 1, so the global ranking and the
+ * scaled 1..31 heat disagree -- the heat would make every layer's hottest expert equal
+ * and the pin set a per-layer film, the counts keep it layer 0's top. */
+static int hot_res(int layer, int lo, int n) {   /* residents of layer in [lo, lo+n) */
+    int r = 0;
+    for (int e = lo; e < lo + n && e < E; e++) r += vkt_resident(layer, e);
+    return r;
+}
+static void hotset(void) {
+    VktFmt f = {VKT_SRC_I4U_PAIRS_GS, 64};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    setenv("COLI_VK_TIER_SYNC", "1", 1);   /* the evictions below are the point: not the uploader's timing */
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    uint32_t hist[L][E], *rows[L];
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = (uint32_t)(l ? 100 - 9 * e : 1000 - 90 * e); }
+    int idx[4 * K]; float w[4 * K];
+    unsigned long long ev, failed;
+    /* (a) HOT=50 of a budget of 8: four pins, the history's top. A storm of the coldest
+     * experts (layer 1's, none resident) churns the four unpinned places; the pins stay.
+     * With the knob unset the same storm takes the head too: the overlay is what holds it. */
+    for (int arm = 0; arm < 2; arm++) {
+        if (arm) setenv("COLI_VK_TIER_HOT", "50", 1);
+        set_budget(8, f, f);
+        VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+        CHECK(vkt_init(&vc, rows), "hot set: the tier did not start");
+        int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+        CHECK(n == 8, "hot set: planned %d experts for a budget of 8", n);
+        for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+        vkt_put_done();
+        CHECK(hot_res(0, 0, 4) == 4, "hot set: the warm start did not take the history's top");
+        Books bk = {0, 0}; double worst = 0;
+        for (int t = 0; t < 300; t++)
+            for (int l = 0; l < L; l++) { route(4, 4, 6, idx, w); double r = step(l, 4, idx, w, &bk); if (r > worst) worst = r; }
+        report_counts(&ev, &failed);
+        int res = 0; for (int l = 0; l < L; l++) res += hot_res(l, 0, E);
+        printf("  %s: after the storm the history's top holds %d of 4 places, resident %d of 8, "
+               "evictions %llu, failed %llu, worst %.2e\n", arm ? "HOT=50" : "HOT unset",
+               hot_res(0, 0, 4), res, ev, failed, worst);
+        CHECK(worst < 2e-3, "hot set: relative error %.3g", worst);
+        CHECK(failed == 0, "hot set: %llu failed uploads", failed);
+        CHECK(ev > 0, "hot set: the storm evicted nothing (the tail never churned)");
+        CHECK(res <= 8, "hot set: %d resident over a budget of 8", res);
+        if (arm) {
+            CHECK(hot_res(0, 0, 4) == 4, "hot set: a pin gave way to the storm");
+            char line[4096]; report_line(line, sizeof line);
+            CHECK(after(line, "pins ") == 4, "hot set: the report says %llu pins, not 4", after(line, "pins "));
+            CHECK(strstr(line, "decode:"), "hot set: the report's decode share is missing");
+        } else
+            CHECK(hot_res(0, 0, 4) < 4, "hot set: the storm left the whole history top resident with no pins");
+        vkt_shutdown();
+        unsetenv("COLI_VK_TIER_HOT");
+    }
+    /* (a2) HOT_UPDATE=1: the same pins re-ranked every forward, the rows still right */
+    setenv("COLI_VK_TIER_HOT", "50", 1);
+    setenv("COLI_VK_TIER_HOT_UPDATE", "1", 1);
+    set_budget(8, f, f);
+    { VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+      CHECK(vkt_init(&vc, rows), "hot set update: the tier did not start");
+      int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+      for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+      vkt_put_done();
+      CHECK(hot_res(0, 0, 4) == 4, "hot set update: the warm start did not take the history's top");
+      Books bk = {0, 0}; double worst = 0;
+      for (int t = 0; t < 60; t++)
+          for (int l = 0; l < L; l++) { route(4, 4, 6, idx, w); double r = step(l, 4, idx, w, &bk); if (r > worst) worst = r; }
+      CHECK(hot_res(0, 0, 4) == 4 && worst < 2e-3, "hot set update: the re-pinned head did not hold (%d, %.3g)",
+            hot_res(0, 0, 4), worst);
+      vkt_shutdown(); }
+    unsetenv("COLI_VK_TIER_HOT_UPDATE");
+    unsetenv("COLI_VK_TIER_HOT");
+    /* (b) HOT=100 of a budget of 4: every resident pinned, the tier full -- promotions
+     * are refused (no victim), nothing is evicted, the residents still serve beside the
+     * CPU's rows */
+    setenv("COLI_VK_TIER_HOT", "100", 1);
+    set_budget(4, f, f);
+    { VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+      CHECK(vkt_init(&vc, rows), "hot set full: the tier did not start");
+      int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+      for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+      vkt_put_done();
+      Books bk = {0, 0}; double worst = 0;
+      for (int t = 0; t < 100; t++)
+          for (int l = 0; l < L; l++) { route(4, 0, E, idx, w); double r = step(l, 4, idx, w, &bk); if (r > worst) worst = r; }
+      report_counts(&ev, &failed);
+      int res = hot_res(0, 0, 4) + hot_res(0, 4, 6) + hot_res(1, 0, E);
+      printf("  HOT=100 of 4: resident %d (all pinned), evictions %llu, device %llu of %llu, worst %.2e\n",
+             res, ev, bk.dev, bk.routed, worst);
+      CHECK(res == 4 && hot_res(0, 0, 4) == 4, "hot set full: %d resident, the history's top %d", res, hot_res(0, 0, 4));
+      CHECK(ev == 0, "hot set full: an all-pinned tier evicted %llu residents", ev);
+      CHECK(bk.dev > 0 && worst < 2e-3, "hot set full: the residents did not serve (%llu of %llu, %.3g)", bk.dev, bk.routed, worst);
+      vkt_shutdown(); }
+    unsetenv("COLI_VK_TIER_HOT");
+    /* (c) COLI_VK_TIER_PIN_LAYER (the dmoe arm's lever, the explicit pin): layer 1's ten
+     * experts planned first whatever the history says and pinned whole; a storm on layer
+     * 0's coldest takes the two unpinned places, never the layer */
+    setenv("COLI_VK_TIER_PIN_LAYER", "1", 1);
+    set_budget(12, f, f);
+    { VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+      CHECK(vkt_init(&vc, rows), "pin layer: the tier did not start");
+      int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+      int ok = n == 12;
+      for (int i = 0; i < E; i++) ok &= pl[i] == 1;   /* the layer ahead of the history */
+      CHECK(ok, "pin layer: the plan did not take layer 1 whole first");
+      for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+      vkt_put_done();
+      Books bk = {0, 0}; double worst = 0;
+      for (int t = 0; t < 200; t++) { route(4, 7, 3, idx, w); double r = step(0, 4, idx, w, &bk); if (r > worst) worst = r; }
+      report_counts(&ev, &failed);
+      printf("  PIN_LAYER=1: layer 1 holds %d of 10 through the storm, layer 0's hot head %d of 2, "
+             "evictions %llu, worst %.2e\n", hot_res(1, 0, E), hot_res(0, 0, 2), ev, worst);
+      CHECK(hot_res(1, 0, E) == 10, "pin layer: the pinned layer lost %d of its 10 places", 10 - hot_res(1, 0, E));
+      CHECK(hot_res(0, 0, 2) < 2, "pin layer: the unpinned places never moved (%d of 2)", hot_res(0, 0, 2));
+      CHECK(ev > 0 && worst < 2e-3 && failed == 0, "pin layer: evictions %llu, failed %llu, worst %.3g", ev, failed, worst);
+      char line[4096]; report_line(line, sizeof line);
+      CHECK(after(line, "pins ") == E, "pin layer: the report says %llu pins, not %d", after(line, "pins "), E);
+      vkt_shutdown(); }
+    unsetenv("COLI_VK_TIER_PIN_LAYER");
+    /* (d) the ranking's scope: global keeps layer 0's top whatever layer 1's storm does;
+     * per layer (HOT_SCOPE=layer) each layer keeps its own two; HOT_HASH=1 hands the
+     * global set to layer 1, the hash-routed layer 0 left out */
+    static const char *const what[3] = {"global", "HOT_SCOPE=layer", "HOT_HASH=1"};
+    for (int arm = 0; arm < 3; arm++) {
+        if (arm == 1) setenv("COLI_VK_TIER_HOT_SCOPE", "layer", 1);
+        if (arm == 2) setenv("COLI_VK_TIER_HOT_HASH", "1", 1);
+        setenv("COLI_VK_TIER_HOT", "50", 1);
+        set_budget(8, f, f);
+        VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+        CHECK(vkt_init(&vc, rows), "hot set %s: the tier did not start", what[arm]);
+        int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+        for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+        vkt_put_done();
+        Books bk = {0, 0}; double worst = 0;
+        for (int t = 0; t < 300; t++) { route(4, 0, E, idx, w); double r = step(1, 4, idx, w, &bk); if (r > worst) worst = r; }
+        int h0 = hot_res(0, 0, 4), r11 = hot_res(1, 0, 2);
+        printf("  %s: after layer 1's storm layer 0's top holds %d, layer 1's first two %d, worst %.2e\n",
+               what[arm], h0, r11, worst);
+        CHECK(worst < 2e-3, "hot set %s: relative error %.3g", what[arm], worst);
+        if (arm == 0) {
+            CHECK(h0 == 4, "hot set global: the RAW-count pins are not layer 0's top four (%d of 4)", h0);
+            CHECK(!hot_res(0, 4, 4), "hot set global: the unpinned residents of layer 0 held too");
+        } else if (arm == 1)
+            CHECK(hot_res(0, 0, 2) == 2 && !vkt_resident(0, 2) && !vkt_resident(0, 3) && r11 == 2,
+                  "hot set layer: the per-layer pins are not two a layer (layer 0's top %d, layer 1's first two %d)",
+                  hot_res(0, 0, 2), r11);
+        else
+            CHECK(!h0 && hot_res(1, 0, 4) == 4, "hot set hash: the hash layer kept %d resident and layer 1's top held %d of 4", h0,
+                  hot_res(1, 0, 4));
+        vkt_shutdown();
+        unsetenv("COLI_VK_TIER_HOT");
+        unsetenv("COLI_VK_TIER_HOT_SCOPE");
+        unsetenv("COLI_VK_TIER_HOT_HASH");
+    }
+    unsetenv("COLI_VK_TIER_SYNC");
+    unsetenv("COLI_VK_TIER_RATE");
+    model_free();
+}
+
 /* the experts of each layer on the device's memory (not the host pool), as a mask */
 static unsigned dev_mask(int l) {
     uint8_t host[E]; unsigned m = 0;
@@ -1962,6 +2127,7 @@ int main(int argc, char **argv) {
     printf("sync:\n"); sync_evict();
     printf("extra:\n"); extra();
     printf("fill:\n"); fill();   /* after extra: its exact pool capacities assume no tier came before with more experts */
+    printf("hot set:\n"); hotset();
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
     printf("layers:\n"); layers();

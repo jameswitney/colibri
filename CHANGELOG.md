@@ -7,6 +7,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `COLI_VK_TIER_HOT`/`_SCOPE`/`_UPDATE`/`_HOT_HASH`: the routed-expert tier's
+  hot set — the history's top share of the resident places, ranked on the raw
+  `.coli_usage` counts (the same ranking the warm start uses, never the scaled
+  1..31 heat), marked on the slots and skipped by every victim path, so the
+  adaptive tail's promotions cannot churn the warm start's head. Default `0`
+  is byte-identical (the guards are pure skips); `COLI_VK_TIER_PIN_LAYER`, the
+  dmoe arm's lever, is the explicit form (a whole layer pinned and planned
+  first), and streaming's staging slots are clamped so they cannot eat the
+  frozen section. The tier's report line gains the pin count (`pins N (hot P%
+  of K resident places, scope, fixed or re-pinned)`) and a decode-only device
+  share (`decode: N of M routed experts on the device`) — the run-level `device
+  N of M` is dominated by a prompt's rows.
 - `COLI_VK_PROFILE`: one knob for the measured operating points. `RDNA2`, the
   headline value, is the hardware profile tuned on the RX 6900 XT and applies
   the stage-aware best set itself (a queued prompt of 1,000 tokens or more
