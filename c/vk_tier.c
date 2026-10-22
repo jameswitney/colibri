@@ -60,6 +60,7 @@ typedef struct {
     uint8_t host;                      /* dev 0 with its tensors in the host pool (coli_vk_tier_host_pool): the
                                         * primary device reads them over PCIe, in a batch and in the dense chain */
     uint8_t up;                        /* T.full: on its way from the host pool to the device (promote) */
+    uint8_t pin;                       /* the hot set's (hot_pin): no victim path may take this resident */
     ColiVkExpert *hex;                 /* T.full: its copy in the host pool (ex itself while host) */
 } VSlot;
 /* dev: the place (place_of); src: a promotion's host pool copy, copied up instead of buf */
@@ -112,6 +113,9 @@ static struct {
     ColiVkExpert **dfree; int ndfree, cdfree;
     unsigned long long ups, up_victims, vram_routed;
     unsigned long long dec_routed, dec_vram;   /* the same in steps of up to VKT_UP_ROWS rows (decode, a verify) */
+    unsigned long long d_routed, d_served;     /* routed and served of those steps only, issue's and dev_count's books
+                                                * alike: the report's decode-only device share (the run's own line is
+                                                * dominated by a prompt's rows) */
     size_t stage_room;                 /* left out of the budget for a prompt chunk's staging (VktConfig.stage) */
     /* the second device (COLI_VK_DEV2) */
     int d2;                            /* the tier holds experts there */
@@ -185,6 +189,12 @@ static struct {
      * to the device failed, or the batch could not take the uploaded expert's sets */
     unsigned long long f_pool, f_copy, f_sets;
     int plan_hist;                        /* the last plan's experts from the history (vkt_plan) */
+    /* the hot set (COLI_VK_TIER_HOT, hot_pin): hot its share of the resident places in %,
+     * hot_scope 1 the per-layer rule, hot_update a re-pin at every forward, hot_hash the
+     * first main layers a hash router serves (no meaningful heat: never pinned), pin_layer
+     * COLI_VK_TIER_PIN_LAYER's layer, npin the pins standing, hot_order/n_hot_order the
+     * ranking it keeps them in */
+    int hot, hot_scope, hot_update, hot_hash, pin_layer, npin, n_hot_order, *hot_order;
     double dev_ms, cpu_ms, wait_ms;
     unsigned long long rep_routed, rep_served;
     /* streaming (big prefill steps; see "streaming" below) */
@@ -709,7 +719,7 @@ static void refresh_candidates(void) {
     size_t n = (size_t)T.c.layers * T.c.experts;
     for (size_t i = 0; i < n; i++) {
         VSlot *v = &T.s[i];
-        if (v->state != VS_RESIDENT || (T.full && !v->hex) ||
+        if (v->state != VS_RESIDENT || v->pin || (T.full && !v->hex) ||
             (v->host && (T.full || T.dmax[2] > 0))) continue;
         int k = vcls_of((int)(i / (size_t)T.c.experts)), *c = T.cand[k];
         uint64_t sc = score(v), *cs = T.cand_score[k];
@@ -731,7 +741,7 @@ static int peek_victim(int k, uint64_t hs, int cheap) {
     while (T.ncand[k]) {
         int i = T.cand[k][0];
         VSlot *v = &T.s[i];
-        if (v->state != VS_RESIDENT || (v->host && (T.full || T.dmax[2] > 0))) { drop_victim(k); continue; }
+        if (v->state != VS_RESIDENT || v->pin || (v->host && (T.full || T.dmax[2] > 0))) { drop_victim(k); continue; }
         uint64_t cs = score(v);
         /* T.full, a promotion: a swap copies nothing back and no CPU time goes into it,
          * so any hotter one wins */
@@ -762,8 +772,10 @@ static int pick_victim(int layer, uint64_t hs, int *from, int cheap) {
 /* A forward starts when the layer index goes back (a layer that issues several
  * blocks of rows, or rows one by one, is the same forward). The tick counts tokens:
  * the rows of the forward's first layer, every block of them. */
+static void hot_pin(void);
 static void new_forward(void) {
     T.promos[0] = T.promos[1] = 0; T.promo_cap = 0; T.said_fwd = 0; T.upromos = 0;
+    if (T.hot_update) hot_pin();   /* COLI_VK_TIER_HOT_UPDATE=1: the pins move with the live counts, before the candidates are built */
     if (T.tick >= T.decay_at) {
         size_t n = (size_t)T.c.layers * T.c.experts;
         for (size_t i = 0; i < n; i++) T.s[i].heat = tier_decay_value(T.s[i].heat);
@@ -903,6 +915,18 @@ int vkt_plan(int *layers, int *eids, int max) {
     T.plan_hist = 0;
     if (!T.on) return 0;
     int L = T.main_layers, E = T.c.experts, n = 0, k = 0;   /* the main layers' */
+    /* COLI_VK_TIER_PIN_LAYER (the COLI_VK_DMOE arm's scaffolding): layer n's
+     * experts ahead of the history, so the one layer the arm wires is fully resident
+     * from the warm start whatever the heat says -- hot_pin has pinned them too, so no
+     * promotion can take them back. Their E experts (256 of 15.0 MiB for DeepSeek V4)
+     * need a COLI_VK_TIER_GB the operator raises to hold them. */
+    if (T.pin_layer >= 0 && T.pin_layer < L)
+        for (int e = 0; e < E && k < max && room_dev(0) >= 0; e++) {
+            VSlot *v = slot(T.pin_layer, e);
+            if (v->state != VS_NONE) continue;
+            v->state = VS_QUEUED; set_place(v, 0); T.queued++; T.dque[0]++;
+            layers[k] = T.pin_layer; eids[k] = e; k++;
+        }
     /* the extra layers' experts first where they stay whole (extra_whole): their own pool,
      * and no history names them */
     if (T.c.extra_whole && T.xmax >= T.c.extra_layers * E)
@@ -955,6 +979,60 @@ void vkt_warm_report(const char *engine, int n, double seconds) {
             engine, n, seconds, T.plan_hist < n ? T.plan_hist : n, n > T.plan_hist ? n - T.plan_hist : 0,
             all && n >= all ? ": every expert of the model" : "");
 }
+
+/* ---- the hot set (COLI_VK_TIER_HOT) -------------------------------------------- */
+/* The frozen section: the top share of the resident places by the RAW history counts
+ * (g_heat_hist, the same table the warm start ranks by -- never the 1..31 heat the seed
+ * scales each layer to, which would make every layer's hottest expert equal and the set
+ * a per-layer film), marked on the slots and skipped by every victim path, so the
+ * adaptive tail's promotions cannot churn the warm start's head. Pins are derived, never
+ * persisted: the history's counts stay the only authority. COLI_VK_TIER_PIN_LAYER's
+ * layer is the explicit form -- its experts pin whole, ahead of the ranking. */
+static void hot_pin(void) {
+    T.npin = 0;
+    size_t n = (size_t)T.c.layers * T.c.experts;
+    for (size_t i = 0; i < n; i++) T.s[i].pin = 0;
+    const int E = T.c.experts;
+    int pinned = 0;
+    if (T.pin_layer >= 0 && T.pin_layer < T.main_layers) {   /* the explicit pin wins over the ranking */
+        for (int e = 0; e < E; e++) slot(T.pin_layer, e)->pin = 1;
+        pinned = E;
+    }
+    if (!T.hot || !g_heat_hist) { T.npin = pinned; return; }   /* no share, or nothing to rank */
+    long long K = (long long)T.hot * (T.dmax[0] + T.dmax[2]) / 100;   /* the resident places: the device and the host pool */
+    const int L = T.main_layers;
+    if (!T.hot_order) T.hot_order = malloc((size_t)L * E * sizeof(int));
+    if (!T.hot_order) { T.npin = pinned; return; }
+    g_plan_heat = (const uint32_t *const *)g_heat_hist; g_plan_E = E;   /* plan_cmp: raw counts, ties by slot */
+    T.n_hot_order = 0;
+    if (T.hot_scope) {   /* per layer: each layer's own top ceil(K/L), so every layer keeps a frozen share */
+        int nl = 0;
+        for (int l = T.hot_hash; l < L; l++) nl += g_heat_hist[l] != NULL;
+        long long per = nl > 0 ? (K + nl - 1) / nl : 0;
+        for (int l = T.hot_hash; l < L && per > 0; l++) {
+            if (!g_heat_hist[l]) continue;
+            int at = T.n_hot_order;
+            for (int e = 0; e < E; e++) if (g_heat_hist[l][e]) T.hot_order[T.n_hot_order++] = l * E + e;
+            qsort(T.hot_order + at, (size_t)(T.n_hot_order - at), sizeof(int), plan_cmp);
+            if (T.n_hot_order > at + per) T.n_hot_order = at + (int)per;
+        }
+        qsort(T.hot_order, (size_t)T.n_hot_order, sizeof(int), plan_cmp);   /* the merge, hottest first */
+    } else {   /* global: the hottest whatever their layer */
+        for (int l = T.hot_hash; l < L; l++) {
+            if (!g_heat_hist[l]) continue;
+            for (int e = 0; e < E; e++) if (g_heat_hist[l][e]) T.hot_order[T.n_hot_order++] = l * E + e;
+        }
+        qsort(T.hot_order, (size_t)T.n_hot_order, sizeof(int), plan_cmp);
+    }
+    for (int i = 0; i < T.n_hot_order && pinned < K; i++) {
+        VSlot *v = &T.s[T.hot_order[i]];
+        if (v->pin) continue;
+        v->pin = 1;
+        pinned++;
+    }
+    T.npin = pinned;
+}
+
 int vkt_put(int layer, int eid, const VktExpertSrc *src) {
     if (!T.on || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts) return 0;
     ColiVkTensor *t[3] = {NULL, NULL, NULL};
@@ -2074,6 +2152,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
         int e = idx[i];
         if (e < 0 || e >= E) continue;
         T.routed++;
+        if (S <= VKT_UP_ROWS) T.d_routed++;   /* the decode-only share (vkt_report) */
         if (layer >= T.main_layers) T.extra_routed++;
         VSlot *v = slot(layer, e);
         if (v->heat < 0xFFFFFFFFu) v->heat++;
@@ -2182,6 +2261,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
         taken[i] = 1; took++;
     }
     T.served += (unsigned long long)took;
+    if (S <= VKT_UP_ROWS) T.d_served += (unsigned long long)took;   /* the decode-only share (vkt_report) */
     if (T.hy_n) {   /* the join computes them */
         for (int i = 0; i < n; i++) if (T.hy_of[i] >= 0) taken[i] = 1;
         for (int p = 0; p < T.hy_n; p++) T.hy_hx[p] = &T.hy_v[p];
@@ -2719,6 +2799,21 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     /* Streaming (big prefill steps, see "streaming" above): COLI_VK_TIER_STREAM=0 turns
      * it off; it needs the engine's load hook and the GEMM route. Its staging slots come
      * out of the budget: the residents give up what the budget cannot hold beside them. */
+    {   /* the hot set (hot_pin, below): read before the carve, which must leave the pins their places */
+        const char *he = getenv("COLI_VK_TIER_HOT");
+        T.hot = he && *he ? atoi(he) : 0;
+        if (T.hot < 0) T.hot = 0;
+        if (T.hot > 100) T.hot = 100;
+        const char *sc = getenv("COLI_VK_TIER_HOT_SCOPE");
+        T.hot_scope = sc && *sc == 'l';   /* "layer"; anything else, the default, is global */
+        const char *hu = getenv("COLI_VK_TIER_HOT_UPDATE");
+        T.hot_update = hu && *hu && atoi(hu) != 0;
+        const char *hh = getenv("COLI_VK_TIER_HOT_HASH");
+        T.hot_hash = hh && *hh ? atoi(hh) : 0;
+        if (T.hot_hash < 0) T.hot_hash = 0;
+        const char *pl = getenv("COLI_VK_TIER_PIN_LAYER");
+        T.pin_layer = pl && *pl ? atoi(pl) : -1;
+    }
     {
         ColiVkXbStats xs; coli_vk_xb_stats(&xs);
         T.gemm_rows = xs.gemm_rows;
@@ -2727,6 +2822,12 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         int want_st = !(se && *se == '0') && T.c.load && T.c.release && T.gemm_rows > 0;
         int slots = sn && *sn ? atoi(sn) : 64;
         if (slots > fit_raw / 2) slots = (int)(fit_raw / 2);
+        /* the hot set's pins come first: staging cannot shrink the residents below the
+         * frozen section. Its count here is the device's share (the host pool is sized
+         * after this, and staging carves the device's places only) */
+        int hotpins = T.hot > 0 ? (int)((long long)T.hot * fit / 100) : 0;
+        if (T.pin_layer >= 0 && T.pin_layer < T.main_layers) hotpins += T.c.experts;
+        if (hotpins > 0 && slots > (int)(fit_raw - hotpins)) slots = (int)(fit_raw - hotpins);
         if (want_st && slots >= 2) {
             if (fit > fit_raw - slots) fit = fit_raw - slots;
             T.st_ok = fit >= 2;
@@ -2832,6 +2933,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     fprintf(stderr, "\n");
     d2_init(fit, all, act);   /* COLI_VK_DEV2: the experts after these on a second device */
     host_init(all);           /* and the rest in system RAM the device reads */
+    hot_pin();                /* the hot set: the pins, once the resident places are known */
     /* hybrid steps: a decode step's or a verify's host pool experts of block types on the CPU,
      * in place, while the device computes the ones it holds (COLI_VK_HYBRID=0: the device
      * reads them over PCIe). SwiGLU, and DeepSeek V4's expert with the device's roundings
@@ -2866,6 +2968,13 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
             human((double)T.budget, hb, sizeof hb), ps.blocks, ps.frag, T.uploads,
             human((double)T.upload_bytes, hl, sizeof hl), T.warm, T.evictions, T.qfull, T.rated, T.failed,
             T.dev_ms, T.cpu_ms, T.wait_ms, T.dev_ms > 0 ? 100.0 * hidden / T.dev_ms : 0.0);
+    if (T.npin || T.pin_layer >= 0)   /* the hot set (hot_pin): the frozen section's standing */
+        fprintf(stderr, " | pins %d (hot %d%% of %d resident places, %s, %s)", T.npin, T.hot,
+                T.dmax[0] + T.dmax[2], T.hot_scope ? "per layer" : "global",
+                T.hot_update ? "re-pinned every forward" : "fixed");
+    if (T.d_routed)   /* the headline's own share of the decode steps, which a prompt's rows dominate */
+        fprintf(stderr, " | decode: %llu of %llu routed experts on the device (%.1f%%)",
+                T.d_served, T.d_routed, 100.0 * T.d_served / (double)T.d_routed);
     if (T.failed)
         fprintf(stderr, " | failed: %llu refused by the pool, %llu copies to the device, %llu not taken by the batch",
                 T.f_pool, T.f_copy, T.f_sets);
@@ -3024,12 +3133,14 @@ void vkt_dev_count(int layer, int S, int K, const int *idx) {
         int e = idx[i];
         if (e < 0 || e >= T.c.experts) continue;
         T.routed++;
+        if (S <= VKT_UP_ROWS) T.d_routed++;   /* the decode-only share (vkt_report) */
         if (layer >= T.main_layers) T.extra_routed++;
         VSlot *v = slot(layer, e);
         if (v->heat < 0xFFFFFFFFu) v->heat++;
         v->last = T.tick;
         if (v->state != VS_RESIDENT || v->dev != 0) continue;
         T.served++; T.chain_served++;
+        if (S <= VKT_UP_ROWS) T.d_served++;   /* the same share: a chain frame's steps are decode's */
         if (layer >= T.main_layers) T.extra_served++;
         if (!v->host) T.vram_routed++;
         if (S > VKT_UP_ROWS) continue;
@@ -3094,6 +3205,7 @@ void vkt_shutdown(void) {
     free(T.st); free(T.sy); free(T.bcnt); free(T.bofs); free(T.bcls); free(T.blist); free(T.pred); free(T.pred_ok);
     for (int h = 0; h < 2; h++) { free(T.hf[h].slot); free(T.hf[h].yout); }
     free(T.d2_idx); free(T.d2_y); free(T.d2_bex); free(T.d2_brows); free(T.d2_bx); free(T.d2_bw);
+    free(T.hot_order);
     free(T.hy_of); free(T.hy_v); free(T.hy_hx); free(T.hy_x); free(T.hy_gu); free(T.hy_hh); free(T.hy_out); free(T.hy_w); free(T.hy_xb); free(T.hy_src); free(T.bpool);
     memset(&T, 0, sizeof T);
 }
