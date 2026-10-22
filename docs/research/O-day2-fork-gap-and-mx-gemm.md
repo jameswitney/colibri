@@ -224,3 +224,41 @@ synchronization points; `COLI_VK_TIER_SYNC=1` must keep its
 deterministic-drain contract (the tests rely on it). Expected ceiling:
 TTFT ~195 → ~150 s (NVMe-bound), not the fork's 104 (its GPU-FOLD kept
 the whole MoE device-side, an architecture we chose not to port).
+
+## 10. The GPU-FOLD attribution series (2026-10-22, final)
+
+Six interleaved arms, two reps each of the three decisive configs:
+
+| arm | TTFT | decode | wall |
+|---|---:|---:|---:|
+| fork, full GPU-FOLD (dense + experts) | 107.8 / 104.4 | 1.162 / 1.155 | 162.0 / 158.9 |
+| **fork, expert fold OFF** (`DSV4_VK_EXPERTS=0`) | **104.1 / 104.2** | **0.630 / 0.610** | 204.2 / 207.5 |
+| new fork (`s256-gr4`) | 202.0 / 202.4 | 0.515 / 0.520 | 324.3 / 323.7 |
+
+**The answer to "is GPU-FOLD the difference": it is HALF the difference, and
+not the half we assumed.**
+
+1. **The expert fold (the v5-cache/GPU-expert stack) contributes ~nothing to
+   the fork's TTFT** (104 with it, 104 without) and **1.84× to decode**
+   (0.62 → 1.16). The decode work we ported (partial-pool promote + pool)
+   already sits at the fold-free fork's level (0.654 vs 0.61-0.63); the rest
+   of the decode gap is exactly this fold's device-resident hot set.
+2. **The TTFT gap (104 vs 202) is NOT the expert fold.** It decomposes into:
+   - **~60 s of expert BYTE economy**: the fold-free fork reads **68 GiB**
+     from disk for the same prompt (store: 16,254 requests, 68.5% hits,
+     5,113 misses) where the new fork reads **~435 GiB** (29.4k loads, 25%
+     hits). Same 25.7 GiB cache both sides, same autopin history loaded —
+     the fork's ExpertCache/slot-pool retention keeps the working set; our
+     LRU thrashes on the cyclic segment access (13,158-expert working set).
+     This is a retention-policy port, not a bandwidth problem, and it is
+     cheaper than the ring with a bigger ceiling than we thought (~60 s).
+   - **~38 s dense-side**: the fork's dense fold kernels (mm8-class
+     projections, wo_b, activation placement) + MoE orchestration, on top of
+     the loader-thread ring's join bubbles.
+3. Both forks and the new fork ran target-only (no drafting) — every
+   comparison in this campaign is draft-free.
+
+**Revised next-session ranking:** (1) the expert-store retention policy
+(the ~60 s, engine-side, no shaders), (2) the loader-thread ring (~15-25 s,
+threading), (3) mm8 decode projections (the fold's decode half, parity
+language first).
