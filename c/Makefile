@@ -944,6 +944,16 @@ shaders/qmatmul_grp_gate_up.spv: shaders/qmatmul_grp.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@ || { [ -f $@ ] && touch $@ && \
 	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+# the MXFP4 pair from the same source (0e79f870 committed the .spv without it; b8affcad
+# untracked them, which left VK_SPV pointing at a target no rule could build)
+shaders/qmatmul_grp_mx.spv: shaders/qmatmul_grp_mx.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+shaders/qmatmul_grp_gate_up_mx.spv: shaders/qmatmul_grp_mx.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
 shaders/qmatmul_grp_gemv_gate_up.spv: shaders/qmatmul_grp_gemv.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
