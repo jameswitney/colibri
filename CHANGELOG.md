@@ -7,6 +7,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `COLI_VK_PROFILE`: one knob for the measured operating points. `RDNA2`, the
+  headline value, is the hardware profile tuned on the RX 6900 XT and applies
+  the stage-aware best set itself (a queued prompt of 1,000 tokens or more
+  takes the ttft set, a smaller one the decode set, a length the engine cannot
+  know when the knobs are read — serve, streaming — the balanced set);
+  `ttft`/`decode`/`balanced` force one stage's set, `auto` is `RDNA2`'s other
+  name. The fills land in unset variables only (an explicit env var always
+  wins), one `[VK] profile: ...` boot line says what was applied, and unset or
+  `0` is byte-for-byte today's behaviour. The three sets, RX 6900 XT,
+  2,515-token prompt / 64 tokens, 28 GiB plan (`bench/up2276/`): ttft
+  187.7 s / 0.533 / 305.9, decode 239.5 / 0.670 / 333.5, balanced
+  205.7 / 0.557 / 318.9 with the 24 GiB plan budget on the `--memory-gb`/
+  `RAM_GB` path where no budget was named. Likely beneficial on other devices,
+  but benchmarks are needed to confirm.
 - `COLI_VK_MM8`/`COLI_VK_MM8_SPLITK`: DeepSeek V4's fp8 dense projections
   may run on the tiled weight-stationary GEMM `qmatmul_mm8.spv` — the weights
   staged once a tile, the group scale folded at staging, one fp32 accumulator
