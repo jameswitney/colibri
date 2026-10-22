@@ -1599,9 +1599,16 @@ static void v4c_report(void) {
                 v4c_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
                 st.dev_bytes / 1048576.0);
         vkc_kv_report(&ch->ks);
-        if (ch->dm.steps)
-            fprintf(stderr, "[VK] %s chain: %llu layer steps ran their routed experts in the frame (COLI_VK_DMOE=%d)\n",
-                    v4c_name(ch), ch->dm.steps, vkc_dmoe_layer_env());
+        {   /* COLI_VK_DMOE's own line: one line whenever the env named a layer, steps or none --
+             * an armed run whose gate kept the host's step (the tier never held the layer's experts
+             * whole) must still say so at exit, not only in the one-time line at its first forward */
+            int dn = !ch->d ? vkc_dmoe_layer_env() : 0;   /* the arm is the primary device's */
+            if (dn)
+                fprintf(stderr, "[VK] %s chain: COLI_VK_DMOE=%d: layer %d, %llu layer steps through the dmoe path "
+                                "(%llu in-frame, %llu hybrid)%s\n",
+                        v4c_name(ch), dn, dn, ch->dm.steps, ch->dm.steps - ch->dm.hyb_steps, ch->dm.hyb_steps,
+                        ch->dm.steps ? "" : "; none: the host's step kept every one");
+        }
         vkc_dmoe_hyb_report(v4c_name(ch), &ch->dm);
         vkc_prof_print();
         vkc_device(was);
