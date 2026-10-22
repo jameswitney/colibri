@@ -57,10 +57,11 @@ static const char *const pipe_file[P_NPIPE] = {
 /* COLI_VK_CHAIN_PROF=1: device time per kind of op (timestamps after every op; ops
  * that run side by side between two barriers share the time unevenly) */
 enum { PK_GEMV8, PK_GEMV, PK_GEMM, PK_NORM, PK_ROPE, PK_ATTN, PK_DNCONV, PK_DNREC, PK_EW, PK_QSA, PK_PLE, PK_COPY,
-       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_ARES, PK_ROUTE, PK_MOE, PK_N };
+       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_ARES, PK_ROUTE, PK_MOE, PK_MM8, PK_N };
 static const char *const pk_name[PK_N] = {"GEMV int8", "GEMV other", "tiled GEMM", "norm", "rope", "attention",
                                           "dn conv", "dn recurrence", "element-wise", "qsa", "ple", "copy",
-                                          "mla", "mla weights", "dsa", "kda", "mhc", "attnres", "route", "experts"};
+                                          "mla", "mla weights", "dsa", "kda", "mhc", "attnres", "route", "experts",
+                                          "mm8 GEMM"};
 /* the MLA, KDA, mHC and AttnRes pipelines: optional (an engine without such layers
  * needs none of them, and a missing one turns off only its own ops) */
 enum { PM_MLA, PM_HGEMV, PM_DSA, PM_KDA, PM_MHC, PM_ARES, PM_ROUTE, PM_N };
@@ -145,6 +146,10 @@ typedef struct {
     VkShaderModule mod_mdec; VkPipeline mdec; int mdec_tried;   /* chain_mla_dec.comp (the same scratch) */
     /* chain_gemm.comp: int8/int4 prompt GEMMs, x rounded to f16 once (COLI_VK_CHAIN_GEMM) */
     VkShaderModule mod_tg; VkPipeline tg;
+    /* qmatmul_mm8.comp: the tiled weight-stationary GEMM for fmt 12, one pipeline per
+     * tile set, made on first use (vk_chain.c's mm8 arm, COLI_VK_MM8) */
+#define VKC_MM8_VAR 9
+    VkShaderModule mod_mm8; VkPipeline mm8[VKC_MM8_VAR]; uint8_t mm8_tried[VKC_MM8_VAR];
     VkShaderModule mmod[PM_N]; VkPipeline mpipe[PM_N]; int mla_ok;   /* chain_mla, chain_hgemv, chain_dsa */
     /* chain_attn_flash.comp: the attention core on the matrix units for prompt chunks,
      * one pipeline per (head dim, query heads per kv head) */
@@ -1296,6 +1301,88 @@ static int matmul_bd(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcBuf *y
     KC.st.matmuls += ok;
     return ok;
 }
+
+/* ---- mm8: the tiled weight-stationary GEMM for fmt 12 (qmatmul_mm8.comp) -------------
+ * The dense chain's fp8 matrices (e4m3 weights, one f32 scale a row a 128-input group)
+ * have no tiled path on a device without cooperative matrices: every prompt chunk's
+ * rows fall to qmatmul.spv's GEMV, a workgroup a row. mm8 tiles them weight-stationary
+ * (the fork's issue #46 kernel; the scale staging reads this tree's per-row per-group
+ * layout, qmatmul_mm8.comp's note). Opt-in -- COLI_VK_MM8, default 0, keeps every
+ * matmul's bits byte-for-byte -- and independent of vkc_gemm_rows: `1` takes it for
+ * every eligible matmul (fmt 12, S >= 2, I a multiple of 64), a speculative verify's
+ * rows too, which is the documented reassociation-class break of that policy;
+ * `-1` follows the backend's own fill rule (gemm_min_s, as the tiled GEMM's -1 does).
+ * A refusal anywhere (no pipeline, an unaligned I) leaves the matmul on the paths
+ * below. */
+typedef struct { int blk, bm, bn, bk, wm, wn, wmiter, tm, tn, tk, warp; const char *name; } VkcMm8Tile;
+enum { MM8_F, MM8_M, MM8_S, MM8_M16, MM8_F64, MM8_FTM4, MM8_FTN4, MM8_MWM4, MM8_MBN128 };
+/* the fork's sweep set (an RX 6900 XT, GMAC/s at S=128): the frozen F tile won five
+ * of the six real projection shapes; m16 measured ~+18% on the wq_b class (large O,
+ * small K). The small S tile did not help -- the k-split covers small-O starvation */
+static const VkcMm8Tile vkc_mm8_tile[VKC_MM8_VAR] = {
+    /* F   frozen        128t 32x64 BK32 */ {128, 32, 64, 32, 32, 32, 2, 2, 2, 1, 64, "f"},
+    /* M   golden medium 128t 64x64 BK32 */ {128, 64, 64, 32, 64, 32, 2, 4, 2, 1, 64, "m"},
+    /* S   golden small   64t 32x32 BK32 */ { 64, 32, 32, 32, 32, 32, 2, 2, 2, 1, 64, "s"},
+    /* M16 medium BK16 (the wq_b class)   */ {128, 64, 64, 16, 64, 32, 2, 4, 2, 1, 64, "m16"},
+    /* F64 the F tile with BK=64           */ {128, 32, 64, 64, 32, 32, 2, 2, 2, 1, 64, "f64"},
+    /* FTM4 the F tile with TM=4           */ {128, 32, 64, 32, 32, 32, 2, 4, 2, 1, 64, "ftm4"},
+    /* FTN4 the F tile with TN=4           */ {128, 32, 64, 32, 32, 32, 2, 2, 4, 1, 64, "ftn4"},
+    /* MWM4 medium with WMITER=4           */ {128, 64, 64, 32, 64, 32, 4, 2, 2, 1, 64, "mwm4"},
+    /* MBN128 medium with BN=128           */ {128, 64, 128, 32, 64, 64, 2, 2, 2, 1, 64, "mbn128"},
+};
+static int g_mm8_mode = -2;      /* -2 unread, 0 off (the default), 1 every eligible, -1 the fill rule */
+static int g_mm8_tile_sel = -2;  /* -2 the frozen F tile, -1 the per-shape rule, >=0 forced (the bench) */
+void vkc_mm8_set(int on) { g_mm8_mode = on; }
+void vkc_mm8_set_tile(int v) { g_mm8_tile_sel = v; }
+const char *vkc_mm8_tile_name(int v) { return v >= 0 && v < VKC_MM8_VAR ? vkc_mm8_tile[v].name : "?"; }
+int vkc_mm8_tile_count(void) { return VKC_MM8_VAR; }
+static int mm8_mode(void) {
+    if (g_mm8_mode == -2) {
+        const char *e = getenv("COLI_VK_MM8");
+        int v = e && *e ? atoi(e) : 0;
+        g_mm8_mode = v < 0 ? -1 : v > 0 ? 1 : 0;
+    }
+    return g_mm8_mode;
+}
+/* the per-shape tile: the frozen F tile by default, m16 on the large-O small-K class */
+static int mm8_variant_for(int O) {
+    if (g_mm8_tile_sel >= 0) return g_mm8_tile_sel;
+    if (g_mm8_tile_sel == -1) return O >= 16384 ? MM8_M16 : MM8_F;
+    return MM8_F;
+}
+/* one pipeline a tile set, made on first use (the shader's tile is a spec-constant set) */
+static VkPipeline mm8_pipe(int v) {
+    if (v < 0 || v >= VKC_MM8_VAR) v = MM8_F;
+    if (KC.mm8[v] || KC.mm8_tried[v] || !vkc_ready()) return KC.mm8[v];
+    KC.mm8_tried[v] = 1;
+    if (!KC.mod_mm8 && !(KC.mod_mm8 = load_module(KC.core.spv_path, "qmatmul_mm8.spv"))) return VK_NULL_HANDLE;
+    const VkcMm8Tile *t = &vkc_mm8_tile[v];
+    /* id 11 = NDBUF (ping-pong staging) when the DOUBLED shared memory fits the
+     * device's limit -- the fork's budget with the constant queried, not assumed */
+    uint32_t lds2 = 2u * (uint32_t)(t->bm + t->bn) * (uint32_t)(t->bk / 2 + 1) * 8u * 2u;
+    int32_t vals[12] = {t->blk, t->bm, t->bn, t->bk, t->wm, t->wn, t->wmiter, t->tm, t->tn,
+                        t->tk, t->warp, lds2 <= kc_shared_limit() ? 1 : 0};
+    VkSpecializationMapEntry e[12];
+    for (int i = 0; i < 12; i++) e[i] = (VkSpecializationMapEntry){(uint32_t)i, (uint32_t)(i * 4), 4};
+    VkSpecializationInfo si = {12, e, sizeof vals, vals};
+    return KC.mm8[v] = make_pipe(KC.mod_mm8, &si);
+}
+static void mm8_shutdown(void) {
+    for (int i = 0; i < VKC_MM8_VAR; i++) if (KC.mm8[i]) vkDestroyPipeline(KC.dev, KC.mm8[i], NULL);
+    if (KC.mod_mm8) vkDestroyShaderModule(KC.dev, KC.mod_mm8, NULL);
+    memset(KC.mm8, 0, sizeof KC.mm8); memset(KC.mm8_tried, 0, sizeof KC.mm8_tried);
+    KC.mod_mm8 = VK_NULL_HANDLE;
+}
+struct VkcMm8PC { int S, I, O, rowWords, gs, k_split; };   /* qmatmul_mm8.comp */
+static int mm8_record(const ColiVkTensorInfo *ti, VkcBind *bd, int S) {
+    int v = mm8_variant_for(ti->O);
+    VkPipeline p = mm8_pipe(v);
+    if (!p) return 0;
+    const VkcMm8Tile *t = &vkc_mm8_tile[v];
+    struct VkcMm8PC pc = {S, ti->I, ti->O, ti->rowWords, ti->gs, 1};
+    return record(p, bd, 4, &pc, sizeof pc, (uint32_t)((ti->O + t->bm - 1) / t->bm),
+                  (uint32_t)((S + t->bn - 1) / t->bn), 1);
+}
 static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcBuf *y, size_t yb, int S) {
     if (ti->fmt >= 100) return matmul_bd(ti, x, xb, y, yb, S);
     int path = -1;   /* GEMM slot, -1 the GEMV */
@@ -1317,6 +1404,18 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
     int v4 = path < 0 && KC.gemv4 && per && ti->rowWords % 4 == 0 && ti->I % 4 == 0 &&
              (ti->fmt != 4 || (ti->gs > 0 && ti->gs % 32 == 0)) && (xg ? KC.gemv4x : KC.gemv4);
     KC.kind = path >= 0 ? PK_GEMM : ti->fmt == 1 ? PK_GEMV8 : PK_GEMV;
+    /* mm8: the tiled weight-stationary GEMM for the fp8 matrices from 2 rows, opt-in
+     * (COLI_VK_MM8) and independent of the rows policy above -- a verify's rows take
+     * it too, the documented reassociation-class break; a refusal falls through to
+     * the same paths as with the knob off */
+    if (ti->fmt == 12 && S >= 2 && ti->I % 64 == 0 && mm8_mode() &&
+        (mm8_mode() > 0 || (KC.core.gemm_min_s && S >= KC.core.gemm_min_s &&
+                            (int64_t)S * ti->O >= KC.core.gemm_min_so)) &&
+        (ok = mm8_record(ti, bd, S))) {
+        KC.kind = PK_MM8;
+        KC.st.matmuls += ok; KC.st.mm8 += ok;
+        return ok;
+    }
     int xv = ti->I / 4 + ti->I / 32;   /* a row of x staged, with chain_gemv2's padding */
     /* a matrix of few long rows: a row a workgroup with every lane on it (an RTX PRO 4000,
      * Qwen3.8's 320 x 10240 hyper-connection mixer: 20 workgroups of 16 rows 34 us, 320 of
@@ -3133,6 +3232,7 @@ void vkc_shutdown(void) {
     if (KC.cpool) vkDestroyCommandPool(KC.dev, KC.cpool, NULL);
     kx_shutdown();
     kab_shutdown();
+    mm8_shutdown();
     cp2_shutdown();
     ke_shutdown();
     kf_shutdown();

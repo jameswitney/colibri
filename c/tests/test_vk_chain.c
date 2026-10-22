@@ -6,7 +6,9 @@
  * and in another order; the references sum in double):
  *   matmul   GEMV (chain_gemv.comp's vectorized one and qmatmul.comp's) and tiled
  *            GEMM, int8 rows, int4-g64, f32, bf16, offsets the device can bind and
- *            offsets it cannot (through the frame's temporaries)
+ *            offsets it cannot (through the frame's temporaries); mm8, the tiled
+ *            weight-stationary fmt-12 GEMM (COLI_VK_MM8) against the fp64/e4m3
+ *            reference at the six real projection shapes, determinism, refusals
  *   norm     zero-centred, plain, no weight, L2; heads with a gate between them, a
  *            weight slice per stream, in place
  *   rope     rotate-half from a host table, heads at a stride
@@ -2952,6 +2954,131 @@ static void bd_fix(int t, uint8_t *b) {
     }
     #undef F16AT
 }
+/* ---- mm8: the tiled weight-stationary fmt-12 GEMM (qmatmul_mm8.comp, COLI_VK_MM8) ----------
+ * The fp8 matrices' prompt rows on the tiled GEMM against a host fp64/e4m3 reference,
+ * and against the fmt-12 GEMV (qmatmul.spv) whose per-row bits the knob off keeps. The
+ * two kernels associate the same exact terms differently (the GEMV: a per-word fp32
+ * partial scaled per group, lanes striding the row, a subgroup tree; mm8: one fp32
+ * accumulator an output, k ascending), so the comparison against the GEMV is an
+ * observation, never a gate; the envelope against the fp64 reference is. The data is
+ * the production class: x values on the e4m3 grid, e4m3 weights, power-of-two scales
+ * (UE8M0-derived, one f32 a row a 128-input group). distinct scales make every (row,
+ * group) scale different, so a shader reading the fork's 128x128-blocked scale layout
+ * instead of the per-row per-group one cannot pass (mm8's port changed exactly that). */
+static float e4m3_val(uint8_t b) {   /* the CPU's E4M3_LUT semantics, as the shaders decode */
+    if ((b & 0x7f) == 0x7f) return NAN;
+    int e = (b >> 3) & 15, m = b & 7;
+    float v = e == 0 ? (float)m * 0.001953125f : ldexpf(1.0f + m * 0.125f, e - 7);
+    return (b & 0x80) ? -v : v;
+}
+static uint8_t e4m3_rnd(int emax) {  /* a random code, no NaN, exponent at most emax */
+    uint8_t b = (uint8_t)(rnd() & 0x7f);
+    if (b == 0x7f) b ^= 1;
+    if ((b >> 3) > emax) b = (uint8_t)((b & 0x07) | (uint8_t)((rnd() % (unsigned)(emax + 1)) << 3));
+    return b | (uint8_t)((rnd() & 1) << 7);
+}
+static double g_mm8_tol = 1e-4;   /* measured below on every shape: both kernels are pure fp32 sums of exact terms */
+static void test_mm8_case(int O, int I, int S, int distinct) {
+    int ng = (I + 127) / 128;
+    uint8_t *w = malloc((size_t)O * I);
+    float *sc = malloc((size_t)O * ng * sizeof(float));
+    for (size_t i = 0; i < (size_t)O * I; i++) w[i] = e4m3_rnd(10);
+    for (int o = 0; o < O; o++) for (int g = 0; g < ng; g++)
+        sc[o * ng + g] = ldexpf(1.f, -8 + (int)(distinct ? o + 3 * g : (int)rnd()) % 13);
+    float *x = malloc((size_t)S * I * sizeof(float));
+    for (size_t i = 0; i < (size_t)S * I; i++) x[i] = e4m3_val(e4m3_rnd(8));
+    ColiVkTensor *t = NULL;
+    if (!coli_vk_tensor_ensure(&t, w, sc, 12, I, O, 128)) {
+        CHECK(0, "mm8 %d x %d: the fmt-12 upload", O, I); free(w); free(sc); free(x); return;
+    }
+    float *ref = malloc((size_t)S * O * sizeof(float));   /* the fp64 sum, rounded once to f32 (a reference's own output rounding) */
+    for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
+        double a = 0;
+        for (int i = 0; i < I; i++) a += (double)x[(size_t)s * I + i] * (e4m3_val(w[(size_t)o * I + i]) * sc[o * ng + i / 128]);
+        ref[(size_t)s * O + o] = (float)a;
+    }
+    VkcBuf *xb = vkc_buf((size_t)S * I * 4, VKC_DEV), *yb = vkc_buf((size_t)S * O * 4, VKC_DOWN);
+    vkc_begin(); vkc_write(xb, 0, x, (size_t)S * I * 4); vkc_submit(1);
+    float *yg = malloc((size_t)S * O * sizeof(float)), *ym = malloc((size_t)S * O * sizeof(float));
+    vkc_gemm_rows(0);   /* the rows policy of the engine's default: the fmt-12 GEMV below, not qmatmul_gemm */
+    vkc_mm8_set(0);   /* the knob off: the fmt-12 GEMV, today's bits */
+    vkc_begin(); int okg = vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    memcpy(yg, vkc_ptr(yb), (size_t)S * O * 4);
+    vkc_mm8_set(1);   /* the tiled GEMM, twice: run-to-run determinism */
+    vkc_begin(); int okm = vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    memcpy(ym, vkc_ptr(yb), (size_t)S * O * 4);
+    vkc_begin(); int okm2 = vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    int same = !memcmp(vkc_ptr(yb), ym, (size_t)S * O * 4);
+    vkc_mm8_set(0); vkc_gemm_rows(-1);
+    double em = relerr(ym, ref, (size_t)S * O, 1e-3);
+    double eg = relerr(yg, ref, (size_t)S * O, 1e-3);
+    double ev = relerr(ym, yg, (size_t)S * O, 1e-3);
+    CHECK(okg && okm && okm2 && em < g_mm8_tol && eg < g_mm8_tol && !bad(ym, (size_t)S * O) && same,
+          "mm8 %d x %d S %d%s: ok %d/%d/%d err mm8 %.2e gemv %.2e mm8-vs-gemv %.2e%s",
+          O, I, S, distinct ? " (distinct scales)" : "", okg, okm, okm2, em, eg, ev,
+          !memcmp(ym, yg, (size_t)S * O * 4) ? ", bitwise vs the GEMV" : "");
+    printf("  mm8 [%5d x %5d] S %3d%s: mm8-vs-ref %.2e, gemv-vs-ref %.2e, mm8-vs-gemv %.2e%s\n",
+           O, I, S, distinct ? " distinct-scales" : "", em, eg, ev,
+           !memcmp(ym, yg, (size_t)S * O * 4) ? ", bitwise" : "");
+    vkc_free(xb); vkc_free(yb); coli_vk_tensor_free(t);
+    free(w); free(sc); free(x); free(ref); free(yg); free(ym);
+}
+/* the arm's gates and its default: what refuses (S < 2, I not a multiple of 64), what the
+ * rows policy does and does not govern, and the knob off leaving the dispatches alone */
+static void test_mm8_refusals(void) {
+    int I = 192, O = 64, ng = (I + 127) / 128;
+    uint8_t *w = malloc((size_t)O * I); float *sc = malloc((size_t)O * ng * sizeof(float));
+    for (size_t i = 0; i < (size_t)O * I; i++) w[i] = e4m3_rnd(10);
+    for (int i = 0; i < O * ng; i++) sc[i] = ldexpf(1.f, -(int)(i % 13));
+    ColiVkTensor *t = NULL;
+    int upt = coli_vk_tensor_ensure(&t, w, sc, 12, I, O, 128);
+    uint8_t *w2 = malloc((size_t)O * 100);   /* I a non-multiple of 64: never eligible */
+    ColiVkTensor *t2 = NULL;
+    int upt2 = coli_vk_tensor_ensure(&t2, w2, sc, 12, 100, O, 128);
+    float x[2 * 192];
+    for (size_t i = 0; i < sizeof x / sizeof *x; i++) x[i] = e4m3_val(e4m3_rnd(8));
+    VkcBuf *xb = up(x, 2 * 192), *yb = vkc_buf((size_t)2 * O * 4, VKC_DOWN);
+    VkcStats s0, s1;
+    vkc_stats(&s0);
+    if (upt) {   /* S = 1: the decode step's GEMV with the knob on */
+        vkc_mm8_set(1); vkc_begin(); int ok = vkc_matmul(t, xb, 0, yb, 0, 1); vkc_submit(1); vkc_mm8_set(0);
+        vkc_stats(&s1);
+        CHECK(ok && s1.mm8 == s0.mm8, "mm8: S 1 refused to the GEMV (dispatches %llu)", s1.mm8 - s0.mm8);
+    }
+    if (upt2) {  /* I = 100: no multiple of 64 */
+        VkcBuf *xb2 = up(x, 2 * 100), *yb2 = vkc_buf((size_t)2 * O * 4, VKC_DOWN);
+        vkc_mm8_set(1); vkc_begin(); int ok = vkc_matmul(t2, xb2, 0, yb2, 0, 2); vkc_submit(1); vkc_mm8_set(0);
+        vkc_stats(&s1);
+        CHECK(ok && s1.mm8 == s0.mm8, "mm8: I 100 refused to the GEMV (dispatches %llu)", s1.mm8 - s0.mm8);
+        vkc_free(xb2); vkc_free(yb2);
+    }
+    {   /* the knob off: an eligible S stays on the GEMV (the default's byte-for-byte) */
+        vkc_begin(); int ok = vkc_matmul(t, xb, 0, yb, 0, 2); vkc_submit(1);
+        vkc_stats(&s1);
+        CHECK(ok && s1.mm8 == s0.mm8, "mm8: the knob off left the GEMV (dispatches %llu)", s1.mm8 - s0.mm8);
+    }
+    {   /* vkc_gemm_rows(0) -- a verify's setting -- governs the qmatmul_gemm arm only:
+         * the mm8 knob still takes the tiled GEMM, the documented policy break */
+        vkc_gemm_rows(0); vkc_mm8_set(1);
+        vkc_begin(); int ok = vkc_matmul(t, xb, 0, yb, 0, 2); vkc_submit(1);
+        vkc_mm8_set(0); vkc_gemm_rows(-1);
+        vkc_stats(&s1);
+        CHECK(ok && s1.mm8 == s0.mm8 + 1, "mm8: the verify's rows take the tiled GEMM with the knob on");
+    }
+    if (upt) coli_vk_tensor_free(t);
+    if (upt2) coli_vk_tensor_free(t2);
+    vkc_free(xb); vkc_free(yb); free(w); free(w2); free(sc);
+}
+static void test_mm8(void) {
+    /* the fork's six real projection shapes (O x I) at the chunk rows the chain
+     * dispatches them with */
+    static const int shapes[6][2] = {{32768, 1024}, {4096, 8192}, {1024, 4096}, {512, 4096}, {2048, 4096}, {4096, 2048}};
+    static const int Ss[4] = {2, 8, 64, 128};
+    for (int k = 0; k < 6; k++) for (int j = 0; j < 4; j++) test_mm8_case(shapes[k][0], shapes[k][1], Ss[j], 0);
+    /* rows past a tile's BN (128) and a partial group column tail (I = 320 = 2x128 + 64) */
+    test_mm8_case(300, 320, 130, 1);
+    test_mm8_refusals();
+}
 /* vkc_moe_rows (a prompt chunk's routed experts on the device) against vkc_moe (chain_moe,
  * whose block path the GGUF gates hold to the CPU's): S rows of K experts of E, the experts
  * random blocks of gate/up type tg and down type td with sane scale fields, the same route */
@@ -3880,6 +4007,7 @@ int main(int argc, char **argv) {
         VkcStats s1; vkc_stats(&s1);
         printf("  prompt GEMMs on chain_gemm: %llu\n", s1.tile_gemms - s0.tile_gemms);
     }
+    test_mm8();
     printf("matmul done\n");
     test_norm(VKC_NORM_ADD1, 0); test_norm(VKC_NORM_ADD1, 1); test_norm(0, 0); test_norm(VKC_NORM_NOW, 1); test_norm(VKC_NORM_L2 | VKC_NORM_NOW, 0);
     printf("norm done\n");

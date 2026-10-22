@@ -777,6 +777,9 @@ VK_SPV   += shaders/chain_attnb.spv
 VK_SPV   += shaders/chain_copy2d.spv
 # the int8/int4 prompt GEMM on the matrix units (optional at run time)
 VK_SPV   += shaders/chain_gemm.spv
+# the tiled weight-stationary GEMM for the fp8 matrices (vk_chain.c: matmul_aligned's
+# mm8 arm, COLI_VK_MM8), optional at run time
+VK_SPV   += shaders/qmatmul_mm8.spv
 # the KV cache split between the device and the host past the device's budget
 # (vk_chain.h: vkc_kvs_*; vk_kvsplit.h)
 VK_SPV   += shaders/chain_kvs.spv
