@@ -147,9 +147,12 @@ typedef struct {
     /* chain_gemm.comp: int8/int4 prompt GEMMs, x rounded to f16 once (COLI_VK_CHAIN_GEMM) */
     VkShaderModule mod_tg; VkPipeline tg;
     /* qmatmul_mm8.comp: the tiled weight-stationary GEMM for fmt 12, one pipeline per
-     * tile set, made on first use (vk_chain.c's mm8 arm, COLI_VK_MM8) */
+     * tile set, made on first use (vk_chain.c's mm8 arm, COLI_VK_MM8); its split-K
+     * reduce (qmatmul_mm8_reduce.comp, COLI_VK_MM8_SPLITK) shares this layout (2 of
+     * the 8 binding slots, an 8-byte push constant) */
 #define VKC_MM8_VAR 9
     VkShaderModule mod_mm8; VkPipeline mm8[VKC_MM8_VAR]; uint8_t mm8_tried[VKC_MM8_VAR];
+    VkShaderModule mod_mm8red; VkPipeline mm8red; uint8_t mm8red_tried;
     VkShaderModule mmod[PM_N]; VkPipeline mpipe[PM_N]; int mla_ok;   /* chain_mla, chain_hgemv, chain_dsa */
     /* chain_attn_flash.comp: the attention core on the matrix units for prompt chunks,
      * one pipeline per (head dim, query heads per kv head) */
@@ -1372,16 +1375,92 @@ static void mm8_shutdown(void) {
     if (KC.mod_mm8) vkDestroyShaderModule(KC.dev, KC.mod_mm8, NULL);
     memset(KC.mm8, 0, sizeof KC.mm8); memset(KC.mm8_tried, 0, sizeof KC.mm8_tried);
     KC.mod_mm8 = VK_NULL_HANDLE;
+    if (KC.mm8red) vkDestroyPipeline(KC.dev, KC.mm8red, NULL);
+    if (KC.mod_mm8red) vkDestroyShaderModule(KC.dev, KC.mod_mm8red, NULL);
+    KC.mm8red = VK_NULL_HANDLE; KC.mm8red_tried = 0;
 }
 struct VkcMm8PC { int S, I, O, rowWords, gs, k_split; };   /* qmatmul_mm8.comp */
+/* ---- the split-K arm (COLI_VK_MM8_SPLITK, the fork's T2) ----------------------------------
+ * A small-O shape starves the tile grid (wkv: O 512 at bm 32 is 16 M-tiles), so the K
+ * range is cut into k chunks, each workgroup writing its partial tile into frame-scoped
+ * planes at ik*(S*O), and qmatmul_mm8_reduce.spv sums the planes in ascending k -- a
+ * reassociation class of the unsplit sum, deterministic (no atomics) but not bitwise.
+ * The partials live in the frame's temporaries (vkc_buf through f->tmp), never a permanent
+ * KC buffer: they are released with the frame, inside the vkc_fit* books. */
+static int g_mm8_splitk = -2;    /* -2 unread, 0 off (bitwise), -1 auto (the default), N forced */
+void vkc_mm8_set_splitk(int v) { g_mm8_splitk = v; }
+static int mm8_splitk_mode(void) {
+    if (g_mm8_splitk == -2) {
+        const char *e = getenv("COLI_VK_MM8_SPLITK");
+        g_mm8_splitk = !e || !*e ? -1 : atoi(e);
+        if (g_mm8_splitk < 0) g_mm8_splitk = -1;   /* 0 off, N forced, unset/negative auto */
+    }
+    return g_mm8_splitk;
+}
+/* the partition invariant: every split boundary a whole staged block of every tile in
+ * the table (BK spans 16-64, so a multiple of 64; that is word-aligned too, the fork's
+ * (I/k)%4). A chunk not a multiple of BK would stage past its end_k -- the next split
+ * counts those k again -- so a count that fails it degrades: the auto rule steps k down
+ * to the largest safe divisor, a forced count refuses to the unsplit arm (bitwise) */
+static int mm8_splitk_ok(int I, int k) { return I % k == 0 && (I / k) % 64 == 0; }
+/* the fork's choice (fill target 2048, k clamped to 8; the sweep there measured the
+ * 2048 target beating 512 on every underfilled shape): auto splits only a shape whose
+ * tiles cannot fill the device, forced N is taken as given and refused below */
+static int mm8_splitk_choose(int S, int I, int O, const VkcMm8Tile *t, int forced) {
+    if (forced > 1) return mm8_splitk_ok(I, forced) ? forced : 1;
+    if (I < 1024 || S < 2) return 1;
+    long wg = (long)((O + t->bm - 1) / t->bm) * (long)((S + t->bn - 1) / t->bn);
+    if (wg >= 2048) return 1;
+    long k = (2048 + wg - 1) / wg;
+    if (k > 8) k = 8;
+    if (k < 2) k = 2;
+    while (k > 1 && !mm8_splitk_ok(I, (int)k)) k--;
+    return (int)k;
+}
+int vkc_mm8_splitk_choose(int S, int I, int O) {   /* the bench's k, at the current tile */
+    const VkcMm8Tile *t = &vkc_mm8_tile[mm8_variant_for(O)];
+    int m = mm8_splitk_mode();
+    if (m == 0) return 1;   /* off: the unsplit arm, bitwise */
+    return mm8_splitk_choose(S, I, O, t, m);
+}
+/* qmatmul_mm8_reduce.spv: one thread an output element, the planes summed in ascending k */
+static VkPipeline mm8_red_pipe(void) {
+    if (KC.mm8red || KC.mm8red_tried || !vkc_ready()) return KC.mm8red;
+    KC.mm8red_tried = 1;
+    if (!(KC.mod_mm8red = load_module(KC.core.spv_path, "qmatmul_mm8_reduce.spv"))) return VK_NULL_HANDLE;
+    return KC.mm8red = make_pipe(KC.mod_mm8red, NULL);
+}
 static int mm8_record(const ColiVkTensorInfo *ti, VkcBind *bd, int S) {
     int v = mm8_variant_for(ti->O);
     VkPipeline p = mm8_pipe(v);
     if (!p) return 0;
     const VkcMm8Tile *t = &vkc_mm8_tile[v];
-    struct VkcMm8PC pc = {S, ti->I, ti->O, ti->rowWords, ti->gs, 1};
-    return record(p, bd, 4, &pc, sizeof pc, (uint32_t)((ti->O + t->bm - 1) / t->bm),
-                  (uint32_t)((S + t->bn - 1) / t->bn), 1);
+    int m = mm8_splitk_mode();
+    int k = m == 0 ? 1 : mm8_splitk_choose(S, ti->I, ti->O, t, m);
+    struct VkcMm8PC pc = {S, ti->I, ti->O, ti->rowWords, ti->gs, k};
+    uint32_t gx = (uint32_t)((ti->O + t->bm - 1) / t->bm) * (uint32_t)k, gy = (uint32_t)((S + t->bn - 1) / t->bn);
+    if (k <= 1) return record(p, bd, 4, &pc, sizeof pc, gx, gy, 1);
+    if (!mm8_red_pipe()) return 0;   /* no reduce: the unsplit arm below (bitwise) */
+    /* the partial planes, frame-scoped so they never outlive the submission */
+    VkcFrame *f = open_frame();
+    if (!f) return 0;
+    size_t out = (size_t)S * (size_t)ti->O;
+    VkcBuf *pb = vkc_buf(out * (size_t)k * 4, VKC_DEV);
+    if (!pb) return 0;
+    if (f->ntmp + 1 > f->ctmp) {
+        int c = f->ctmp ? 2 * f->ctmp : 8; while (c < f->ntmp + 1) c *= 2;
+        VkcBuf **n = realloc(f->tmp, (size_t)c * sizeof *n);
+        if (!n) { buf_release(pb); return 0; }
+        f->tmp = n; f->ctmp = c;
+    }
+    f->tmp[f->ntmp++] = pb;
+    VkcBind sbd[4] = {bd[0], bd[1], bd[2], {pb->buf, 0, 0, 1}};
+    if (!record(p, sbd, 4, &pc, sizeof pc, gx, gy, 1)) return 0;   /* the frame frees pb */
+    struct { uint32_t n, split; } rpc = {(uint32_t)out, (uint32_t)k};   /* qmatmul_mm8_reduce.comp */
+    VkcBind rbd[2] = {{pb->buf, 0, 0, 0}, bd[3]};
+    if (!record(KC.mm8red, rbd, 2, &rpc, sizeof rpc, (uint32_t)((out + 255) / 256), 1, 1)) return 0;
+    KC.st.mm8_split += 1;
+    return 1;
 }
 static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcBuf *y, size_t yb, int S) {
     if (ti->fmt >= 100) return matmul_bd(ti, x, xb, y, yb, S);

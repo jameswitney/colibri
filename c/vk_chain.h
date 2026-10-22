@@ -850,6 +850,7 @@ typedef struct {
     unsigned long long attn_dec;       /* decode attentions split over their positions' blocks (chain_attn_dec.comp) */
     unsigned long long moe_gv;         /* routed-expert decode steps in our formats on chain_moe_gv.comp */
     unsigned long long mm8;            /* fmt-12 matmuls on the tiled GEMM (qmatmul_mm8.comp, COLI_VK_MM8) */
+    unsigned long long mm8_split;      /* of those, the split-K ones (partial planes + the ascending-k reduce) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* mm8 (the tiled weight-stationary GEMM for fmt 12): the test/bench hooks over the
@@ -861,6 +862,10 @@ void vkc_mm8_set(int on);
 void vkc_mm8_set_tile(int v);
 const char *vkc_mm8_tile_name(int v);
 int vkc_mm8_tile_count(void);
+/* the split-K count a call takes (COLI_VK_MM8_SPLITK: 0 off/bitwise, unset auto -- the
+ * fill-target rule -- N forced): 1 the unsplit arm, k > 1 the partial planes + the reduce */
+void vkc_mm8_set_splitk(int v);
+int vkc_mm8_splitk_choose(int S, int I, int O);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */
 void vkc_prof_print(void);
 

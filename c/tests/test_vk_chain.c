@@ -3069,6 +3069,130 @@ static void test_mm8_refusals(void) {
     if (upt2) coli_vk_tensor_free(t2);
     vkc_free(xb); vkc_free(yb); free(w); free(w2); free(sc);
 }
+/* the split-K arm (COLI_VK_MM8_SPLITK): the K range cut into k chunks, the partial planes
+ * summed in ascending k. Deterministic run to run (byte-identical, no atomics), a
+ * reassociation class of the unsplit sum (an envelope, never bitwise); a count that
+ * breaks the partition invariant (I % k || (I/k) % 64 -- a chunk not a whole staged
+ * block would double-count its tail) refuses to the unsplit arm, BITWISE. The auto rule
+ * (unset) splits only a shape whose tiles cannot fill the device: the fill target 2048. */
+static void test_mm8_split_case(int O, int I, int S, int k, const char *what) {
+    int ng = (I + 127) / 128;
+    uint8_t *w = malloc((size_t)O * I);
+    float *sc = malloc((size_t)O * ng * sizeof(float));
+    for (size_t i = 0; i < (size_t)O * I; i++) w[i] = e4m3_rnd(10);
+    for (int i = 0; i < O * ng; i++) sc[i] = ldexpf(1.f, -(int)(i % 13));
+    float *x = malloc((size_t)S * I * sizeof(float));
+    for (size_t i = 0; i < (size_t)S * I; i++) x[i] = e4m3_val(e4m3_rnd(8));
+    ColiVkTensor *t = NULL;
+    if (!coli_vk_tensor_ensure(&t, w, sc, 12, I, O, 128)) {
+        CHECK(0, "mm8 split %d x %d: the fmt-12 upload", O, I); free(w); free(sc); free(x); return;
+    }
+    float *ref = malloc((size_t)S * O * sizeof(float));
+    for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
+        double a = 0;
+        for (int i = 0; i < I; i++) a += (double)x[(size_t)s * I + i] * (e4m3_val(w[(size_t)o * I + i]) * sc[o * ng + i / 128]);
+        ref[(size_t)s * O + o] = (float)a;
+    }
+    VkcBuf *xb = up(x, (size_t)S * I), *yb = vkc_buf((size_t)S * O * 4, VKC_DOWN);
+    float *yu = malloc((size_t)S * O * sizeof(float)), *ys = malloc((size_t)S * O * sizeof(float));
+    vkc_gemm_rows(0); vkc_mm8_set(1);
+    vkc_mm8_set_splitk(0);   /* the unsplit arm, the bitwise baseline */
+    VkcStats s0; vkc_stats(&s0);
+    vkc_begin(); int oku = vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    memcpy(yu, vkc_ptr(yb), (size_t)S * O * 4);
+    vkc_mm8_set_splitk(k);
+    vkc_begin(); int oks = vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    memcpy(ys, vkc_ptr(yb), (size_t)S * O * 4);
+    vkc_begin(); int oks2 = vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    int same = !memcmp(vkc_ptr(yb), ys, (size_t)S * O * 4);
+    vkc_mm8_set(0); vkc_mm8_set_splitk(-1); vkc_gemm_rows(-1);
+    VkcStats s1; vkc_stats(&s1);
+    int nsplit = (int)(s1.mm8_split - s0.mm8_split);
+    int inv = I % k != 0 || (I / k) % 64 != 0;   /* a forced count the invariant refuses */
+    double es = relerr(ys, ref, (size_t)S * O, 1e-3);
+    double ev = relerr(ys, yu, (size_t)S * O, 1e-3);
+    CHECK(oku && oks && oks2 && same && !bad(ys, (size_t)S * O) && es < g_mm8_tol &&
+          (inv ? nsplit == 0 && !memcmp(ys, yu, (size_t)S * O * 4)
+               : nsplit == 2 && ev < g_mm8_tol),
+          "mm8 split %d x %d S %d k %d%s: ok %d/%d/%d splits %d err ref %.2e vs unsplit %.2e%s",
+          O, I, S, k, what, oku, oks, oks2, nsplit, es, ev,
+          inv ? ", refused bitwise" : !memcmp(ys, yu, (size_t)S * O * 4) ? ", bitwise vs unsplit" : "");
+    printf("  mm8 split [%5d x %5d] S %3d k %2d%s: vs ref %.2e, vs unsplit %.2e%s\n",
+           O, I, S, k, inv ? " (invalid, refused)" : "", es, ev,
+           !memcmp(ys, yu, (size_t)S * O * 4) ? ", bitwise" : "");
+    vkc_free(xb); vkc_free(yb); coli_vk_tensor_free(t);
+    free(w); free(sc); free(x); free(ref); free(yu); free(ys);
+}
+static void test_mm8_split(void) {
+    /* wkv and wo_b, the shapes the fork split for: small O starves the M tiles */
+    test_mm8_split_case(512, 4096, 8, 8, "");
+    test_mm8_split_case(512, 4096, 8, 2, "");
+    test_mm8_split_case(4096, 8192, 2, 4, "");
+    test_mm8_split_case(4096, 8192, 2, 8, "");
+    /* counts the partition invariant refuses: not a divisor, or a chunk not a whole
+     * 64 (I 4096 k 3 or 7; I 320 k 2, chunk 160): bitwise the unsplit arm */
+    test_mm8_split_case(512, 4096, 8, 3, "");
+    test_mm8_split_case(512, 4096, 8, 7, "");
+    test_mm8_split_case(300, 320, 130, 2, "");
+    /* the auto rule (the knob back to unset): a starved shape splits, a filled one does not */
+    {   /* 512 x 4096 S 8: 16 M-tiles x 1 S-tile -- k 8; 32768 x 1024 S 128: 1024 x 2 -- unsplit */
+        int k1 = vkc_mm8_splitk_choose(8, 4096, 512), k2 = vkc_mm8_splitk_choose(128, 1024, 32768);
+        CHECK(k1 == 8 && k2 == 1, "mm8 split auto: wkv k %d (8), wq_b k %d (1)", k1, k2);
+        printf("  mm8 split auto: 512 x 4096 S 8 -> k %d, 32768 x 1024 S 128 -> k %d\n", k1, k2);
+    }
+    test_mm8_split_case(512, 4096, 8, -1, " (auto)");
+}
+/* COLI_VK_CHAIN_BENCH=mm8: the tiled weight-stationary GEMM over the fork's six real
+ * projection shapes (O x I), every tile of the table, split-K (the auto rule) against
+ * the unsplit arm, in GMAC/s of S*O*I MACs a dispatch (the best of 5; the fmt-12 GEMV
+ * the knob off keeps as the first line). COLI_VK_BENCH_S overrides the rows (128). */
+static void bench_mm8(void) {
+    static const int shapes[6][2] = {{32768, 1024}, {4096, 8192}, {1024, 4096}, {512, 4096}, {2048, 4096}, {4096, 2048}};
+    const char *se = getenv("COLI_VK_BENCH_S");
+    int S = se && atoi(se) > 0 ? atoi(se) : 128;
+    for (int k = 0; k < 6; k++) {
+        int O = shapes[k][0], I = shapes[k][1], ng = (I + 127) / 128;
+        uint8_t *w = malloc((size_t)O * I); float *sc = malloc((size_t)O * ng * sizeof(float));
+        for (size_t i = 0; i < (size_t)O * I; i++) w[i] = e4m3_rnd(10);
+        for (int i = 0; i < O * ng; i++) sc[i] = ldexpf(1.f, -(int)(i % 13));
+        ColiVkTensor *t = NULL;
+        if (!coli_vk_tensor_ensure(&t, w, sc, 12, I, O, 128)) {
+            printf("bench mm8 [%d x %d]: the fmt-12 upload refused\n", O, I); free(w); free(sc); continue;
+        }
+        float *x = malloc((size_t)S * I * sizeof(float));
+        for (size_t i = 0; i < (size_t)S * I; i++) x[i] = e4m3_val(e4m3_rnd(8));
+        VkcBuf *xb = up(x, (size_t)S * I), *yb = vkc_buf((size_t)S * O * 4, VKC_DOWN);
+        double macs = (double)S * O * I / 1e9;   /* GMACs a dispatch */
+        vkc_gemm_rows(0);   /* the engine's default: every row on the GEMV */
+        double best = 1e9;
+        for (int r = 0; r < 6 && xb && yb; r++) {
+            vkc_begin(); vkc_matmul(t, xb, 0, yb, 0, S); double t0 = bnow(); vkc_submit(1); double dt = bnow() - t0;
+            if (dt < best) best = dt;
+        }
+        printf("bench mm8 [%5d x %5d] S %3d: GEMV %8.1f GMAC/s", O, I, S, macs / best);
+        vkc_mm8_set(1);
+        for (int v = 0; v < vkc_mm8_tile_count(); v++) {
+            vkc_mm8_set_tile(v);
+            double bu = 1e9, bs = 1e9;
+            for (int r = 0; r < 6 && xb && yb; r++) {
+                vkc_mm8_set_splitk(0);   /* unsplit */
+                vkc_begin(); vkc_matmul(t, xb, 0, yb, 0, S); double t0 = bnow(); vkc_submit(1); double dt = bnow() - t0;
+                if (dt < bu) bu = dt;
+            }
+            for (int r = 0; r < 6 && xb && yb; r++) {
+                vkc_mm8_set_splitk(-1);   /* the auto rule */
+                vkc_begin(); vkc_matmul(t, xb, 0, yb, 0, S); double t0 = bnow(); vkc_submit(1); double dt = bnow() - t0;
+                if (dt < bs) bs = dt;
+            }
+            printf("\n  %-7s %8.1f unsplit, %8.1f split k %d", vkc_mm8_tile_name(v), macs / bu, macs / bs,
+                   vkc_mm8_splitk_choose(S, I, O));
+        }
+        printf("\n");
+        vkc_mm8_set(0); vkc_mm8_set_tile(-2); vkc_mm8_set_splitk(-1); vkc_gemm_rows(-1);
+        vkc_free(xb); vkc_free(yb); coli_vk_tensor_free(t);
+        free(w); free(sc); free(x);
+    }
+}
 static void test_mm8(void) {
     /* the fork's six real projection shapes (O x I) at the chunk rows the chain
      * dispatches them with */
@@ -3078,6 +3202,7 @@ static void test_mm8(void) {
     /* rows past a tile's BN (128) and a partial group column tail (I = 320 = 2x128 + 64) */
     test_mm8_case(300, 320, 130, 1);
     test_mm8_refusals();
+    test_mm8_split();
 }
 /* vkc_moe_rows (a prompt chunk's routed experts on the device) against vkc_moe (chain_moe,
  * whose block path the GGUF gates hold to the CPU's): S rows of K experts of E, the experts
@@ -3961,6 +4086,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "rows")) bench_rows();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "kda")) bench_kda();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "route")) bench_route();
+        else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "mm8")) bench_mm8();
         else bench_gemv();
         vkc_shutdown(); coli_vk_shutdown(); return 0;
     }

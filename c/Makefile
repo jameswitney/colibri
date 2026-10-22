@@ -780,6 +780,9 @@ VK_SPV   += shaders/chain_gemm.spv
 # the tiled weight-stationary GEMM for the fp8 matrices (vk_chain.c: matmul_aligned's
 # mm8 arm, COLI_VK_MM8), optional at run time
 VK_SPV   += shaders/qmatmul_mm8.spv
+# its split-K reduce (qmatmul_mm8_reduce.comp): the partial planes summed in
+# ascending k, deterministic, no atomics (COLI_VK_MM8_SPLITK)
+VK_SPV   += shaders/qmatmul_mm8_reduce.spv
 # the KV cache split between the device and the host past the device's budget
 # (vk_chain.h: vkc_kvs_*; vk_kvsplit.h)
 VK_SPV   += shaders/chain_kvs.spv
