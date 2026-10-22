@@ -262,3 +262,38 @@ not the half we assumed.**
 (the ~60 s, engine-side, no shaders), (2) the loader-thread ring (~15-25 s,
 threading), (3) mm8 decode projections (the fold's decode half, parity
 language first).
+
+## 11. The window sweep and the ring: both falsified — the cell pipeline is what's left
+
+Two structural hypotheses tested to destruction:
+
+**The MoE window size** (the chain's per-forward row window, `v4c_rows()` —
+capped at 128 when `COLI_VK_CHAIN_ROWS` is set, otherwise the whole auto-fit
+chunk):
+
+| window (rows) | sweeps | TTFT | store requests |
+|---:|---:|---:|---:|
+| 128 (CHAIN_ROWS set) | 20 | 583–928 | 116,296 |
+| **768 (the default fit)** | 4 | **195–202** | 30,932 |
+| 2516 (TIER_GB=5, one chunk) | 1 | **982** | — |
+
+The default is a broad optimum. One sweep is catastophic: the tier's slot
+groups and the chain's window-ring growth thrash at that width. The fork's
+104 s is not window sizing — its cell pipeline (the dense fold's cell-wise
+prefill: P3.5's wo_b/activation pass and P4.3's cell machinery we measured
+"neutral" in the fork's own frame) processes rows in cells with its own
+rings, and that architecture is what reads 68 GiB where every windowed
+layout reads 230-435.
+
+**The host-RAM stream ring** (implemented, gated, passing — then reverted):
+heat-ranked retention of streamed experts in front of the store. At any
+viable capacity (~3 GiB = 240 experts) it measured **0 hits**: the reuse
+distance of a layer's set is 43 layers × ~221 experts ≈ 9,500 experts —
+no capacity short of the model itself spans it, and per-layer partitioning
+divides capacity by 43. The ring's copies only added overhead (314 s vs
+202). Reverted rather than shipped dead.
+
+**Conclusion:** the remaining prefill gap is the fork's cell-pipeline
+dense-fold architecture (P3.5/P4.3 as a structure, not as knobs). That is
+the one port left, it is large, and it competes with simply upstreaming
+what already works: everything else in this campaign.
