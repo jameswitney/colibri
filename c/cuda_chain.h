@@ -60,12 +60,17 @@ typedef struct { int nseg, D, per_row, x_off, x_row, x_seg, y_off, y_row, y_seg,
 #define CC_NORM_ADD1 1
 #define CC_NORM_NOW  2
 #define CC_NORM_L2   4
+#define CC_NORM_PRESCALE 8   /* scale by w, then normalise (Muse Spark; cc_muse_ready) */
 /* chain_rope.comp */
 typedef struct { int nseg, per_row, x_off, x_row, x_seg, half_, cs_off, cs_row; } CcRope;
 /* chain_attn.comp (k_off/v_off: where the layer's cache starts in kc/vc; the cache
  * head-major, K[(kvh*cap + t)*hd + d]; sel_row > 0: a selection list per row) */
 typedef struct { int S, H, KVH, hd, pos_base, cap, q_off, q_row, q_seg, g_off, g_row, g_seg, has_gate,
                  o_off, o_row, sel_off, sel_row; float scale; int k_off, v_off; } CcAttn;
+/* The same with Flint's two (vk_chain.h VkcAttnW's win and sink): a sliding window of win
+ * positions (row s sees max(0, pos - win + 1)..pos; 0 = all), and with sink a logit per head
+ * at snk[sink_off + h] that joins the softmax's denominator only. No selection list. */
+typedef struct { CcAttn a; int win, sink, sink_off; } CcAttnW;
 /* chain_dnconv.comp */
 typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } CcDnConv;
 /* chain_dnrec.comp (KD a template parameter: 4, 8, 16, 32, 64, 128 or 256; VD <= 128). flags: 1 the gated
@@ -83,6 +88,8 @@ typedef struct { int S, VH, KH, VD, Ktot, cv_off, cv_row, b_off, b_row, a_off, a
 #define CC_EW_HC_APPLY 6
 #define CC_EW_SCALE    7
 #define CC_EW_GATE_ADD 8
+#define CC_EW_SIGMUL   9    /* y = a * sigmoid(b) (cc_muse_ready) */
+#define CC_EW_RESGATE  10   /* y = e[col] * a + c[col] * b (cc_muse_ready) */
 typedef struct { int op, n, D, C, flags, e_row, y_off, a_off, b_off, c_off, e_off; float fc; } CcEw;
 /* chain_qsa.comp (mode 0: nb block keys from b0; mode 1: S rows' selections) */
 typedef struct { int mode, ID, R, b0, half_, S, pos_base, budget, IQ, q_off, q_row, nbmax, sel_row; float eps;
@@ -238,6 +245,15 @@ typedef struct ColiCudaChainOps {
      * 1 once the copies up to ticket landed (an engine's experts moved into its slots) */
     int  (*host_up)(void *dst, const void *src, size_t bytes, unsigned *ticket);
     int  (*host_up_done)(unsigned ticket);
+    /* attn_w: cc_attn with a sliding window and sinks (CcAttnW) */
+    int  (*attn_w)(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *p);
+    /* muse: 1 when the norm takes CC_NORM_PRESCALE and ew CC_EW_SIGMUL and CC_EW_RESGATE (an
+     * older backend's kernels would skip them without a word) */
+    int  (*muse)(void);
+    /* attn_wr: attn_w over a cache that is a ring of `ring` rows (position t in row t % ring,
+     * p->a.cap == ring): a sliding layer's (qwen36 Flint, Muse Spark), whose rows must hold
+     * the step's rows and their windows (ring >= win + S - 1); 0: attn_w */
+    int  (*attn_wr)(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *p, int ring);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -300,6 +316,18 @@ static inline int cc_host_up(void *dst, const void *src, size_t bytes, unsigned 
 static inline int cc_host_up_done(unsigned ticket) { return cc_host_up_ready() ? cc_ops()->host_up_done(ticket) : 0; }
 static inline int cc_moe_stage_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, moe_stage) + sizeof t->moe_stage; }
 static inline int cc_moe_stage(CcBuf *b, size_t slot_bytes, int slots) { return cc_moe_stage_ready() ? cc_ops()->moe_stage(b, slot_bytes, slots) : 0; }
+static inline int cc_attn_w_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, attn_w) + sizeof t->attn_w; }
+static inline int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *p) {
+    return cc_attn_w_ready() ? cc_ops()->attn_w(q, kc, vc, o, gate, snk, p) : 0;
+}
+static inline int cc_attn_wr_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, attn_wr) + sizeof t->attn_wr; }
+static inline int cc_attn_wr(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *p, int ring) {
+    return cc_attn_wr_ready() ? cc_ops()->attn_wr(q, kc, vc, o, gate, snk, p, ring) : 0;
+}
+static inline int cc_muse_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, muse) + sizeof t->muse && t->muse && t->muse();
+}
 #endif
 
 #ifdef __cplusplus

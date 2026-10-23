@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <pthread.h>
 #include <time.h>
 #ifdef __linux__
@@ -66,6 +67,7 @@ static struct {
     float *is_x; size_t is_x_floats;      /* QT_MAX_ROWS*D input replicas per device */
     /* M3 */
     int *fill_order; int fill_cur;        /* warmstart order (heat desc) */
+    uint8_t *off;                         /* layers without experts (qt_layer_off): never planned */
     int issue_open;                       /* guard: no tensor_free while a group is in flight */
     pthread_cond_t cv_take;               /* signals qt_take done + queue space */
     uint64_t tick, swaps, inplace, pf_hits, pf_notes;
@@ -585,6 +587,9 @@ void qt_trunk_withdraw(const char *why){
  * is withdrawn: CUDA_EXPERT_GB as a number is the user's word. The engine calls this
  * before its warm start, so nothing is resident yet; the tier stays up for nothing else
  * and every expert call answers "not here". */
+/* qt_reserve: device bytes the engine places after the tier sized itself (qwen36_tier.h) */
+static size_t G_reserve;
+void qt_reserve(size_t bytes){ G_reserve = bytes; }
 void qt_experts_withdraw(const char *why){
     const char *bg = getenv("CUDA_EXPERT_GB");
     if(!G.on || G_trunk_only || (bg && strcmp(bg,"auto") && atof(bg) > 0)) return;
@@ -851,7 +856,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     }
 
     /* Per-device allowance for tier + trunk: CUDA_EXPERT_GB when numeric,
-     * else free minus 1 GB headroom. The heat table is loaded here too (it
+     * else free minus 1 GB headroom and what the engine reserved (qt_reserve). The heat table is loaded here too (it
      * used to be loaded after the budgets) because the placer prices
      * experts by heat. */
     size_t capacity[QT_MAX_DEV]; int capdev[QT_MAX_DEV]; int ncap = G.ndev;
@@ -861,7 +866,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         capdev[i] = G.dev[i];
         capacity[i] = (bg && strcmp(bg,"auto") && atof(bg)>0)
                    ? (size_t)(atof(bg)*1024.0*1024.0*1024.0)
-                   : (freeb>(1ull<<30) ? freeb-(1ull<<30) : 0);
+                   : (freeb>(1ull<<30)+G_reserve ? freeb-(1ull<<30)-G_reserve : 0);
         fprintf(stderr,"[qtier] dev %d: %.1f GB free, allowance %.1f GB\n",
                 G.dev[i], freeb/1073741824.0, capacity[i]/1073741824.0);
     }
@@ -1554,6 +1559,15 @@ int qt_fill_next(int *layer,int *eid){
 /* Plan the whole warmstart set in one pass -- same heat order and budget
  * reservation as qt_fill_next, but without loading. The experts are then
  * loaded by any number of threads and handed over via qt_note_planned. */
+/* Layer `layer` routes nothing (a Flint dense layer): no expert of it is ever planned. */
+void qt_layer_off(int layer){
+    if(!G.on || layer<0 || layer>=G.nl) return;
+    pthread_mutex_lock(&G.mx);
+    if(!G.off) G.off=calloc((size_t)G.nl,1);
+    if(G.off) G.off[layer]=1;
+    free(G.fill_order); G.fill_order=NULL;   /* planned again without it */
+    pthread_mutex_unlock(&G.mx);
+}
 int qt_plan_fill(int *layers,int *eids,int max){
     if(!G.on) return 0;
     size_t n=(size_t)G.nl*G.ne;
@@ -1570,6 +1584,7 @@ int qt_plan_fill(int *layers,int *eids,int max){
         if(full) break;
         int gi=G.fill_order[G.fill_cur++];
         int l=gi/G.ne, e=gi%G.ne, hd=home2(l,e);
+        if(G.off && G.off[l]) continue;   /* a layer with no experts (Flint's dense ones) */
         QSlot *s=qs(l,e);
         if(s->resident||s->queued||s->planned) continue;
         if(G.used[hd]+G.exp_bytes>G.budget[hd]) continue;
@@ -1828,7 +1843,8 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     return mask;
 }
 
-int qt_take(uint32_t mask,const float *val,int K,float *out){
+int qt_take(uint32_t mask,const float *val,int K,float *out){ return qt_take_scaled(mask,val,K,out,NULL,0.f); }
+int qt_take_scaled(uint32_t mask,const float *val,int K,float *out,const float *s,float eps){
     (void)K;
     if(!G.on) return mask==0;
     const float *result[QT_MAX_DEV]={0};
@@ -1847,6 +1863,12 @@ int qt_take(uint32_t mask,const float *val,int K,float *out){
         if(ok && result[di]) for(int j=0;j<G.is_cnt[di];j++){
             float w=val[G.is_k[di][j]];
             const float *row=result[di]+(size_t)j*G.D;
+            if(s){   /* Muse Spark: w * rmsnorm(row * s) */
+                double ms=0; for(int d=0;d<G.D;d++){ double v=(double)row[d]*s[d]; ms+=v*v; }
+                const float r=1.f/sqrtf((float)(ms/G.D)+eps);
+                for(int d=0;d<G.D;d++) out[d]+=w*(row[d]*s[d]*r);
+                continue;
+            }
             for(int d=0;d<G.D;d++) out[d]+=w*row[d];
         }
         G.is_cnt[di]=0;
@@ -1946,6 +1968,7 @@ void qt_shutdown(void){
     free(G.slot); G.slot=NULL;
     free(G.is_x); G.is_x=NULL; G.is_x_floats=0;
     free(G.fill_order); G.fill_order=NULL;
+    free(G.off); G.off=NULL;
     free(G.heat0); G.heat0=NULL;
     pthread_cond_destroy(&G.cv_take);
     pthread_cond_destroy(&G.cv);

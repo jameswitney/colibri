@@ -544,7 +544,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 \
 	test_ggml_quants test_gguf_c test_gq_dot
-TEST_EXCLUDE += test_vk_chain test_glm53_vk_f32
+TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32
 # needs a CUDA device and the CUDA objects: make tests/test_cu_tier CUDA=1
 TEST_EXCLUDE += test_cu_tier
 # test_vk_degrade forks per case (unistd/sys/wait) and links the VK objects: it
@@ -1545,8 +1545,8 @@ ifneq ($(EXE),)
 .PHONY: deepseek_v41
 deepseek_v41: deepseek_v41$(EXE)
 endif
-deepseek_v41$(EXE): deepseek_v41.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) deepseek_v41.c $(VK_OBJ) -o deepseek_v41$(EXE) $(LDFLAGS)
+deepseek_v41$(EXE): deepseek_v41.c $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) deepseek_v41.c $(CUDA_OBJ) $(VK_OBJ) -o deepseek_v41$(EXE) $(LDFLAGS)
 
 # Xiaomi MiMo-V2.6 (Flash 309B, Pro 1.02T): one file plus its ViT header, reading the
 # release as it is -- MXFP4 experts streamed per layer, FP8/BF16 dense resident.
@@ -1554,8 +1554,8 @@ ifneq ($(EXE),)
 .PHONY: mimo
 mimo: mimo$(EXE)
 endif
-mimo$(EXE): mimo.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) mimo.c $(VK_OBJ) -o mimo$(EXE) $(LDFLAGS)
+mimo$(EXE): mimo.c $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) mimo.c $(CUDA_OBJ) $(VK_OBJ) -o mimo$(EXE) $(LDFLAGS)
 
 # Tiny MiMo fixture + vendor oracle, the Kimi K3 pattern: the generator is numpy (and
 # Pillow for the test picture) and deterministic; ref.json is committed and comes from
@@ -1844,6 +1844,10 @@ tests/test_qwen36_dense_affine$(EXE): tests/test_qwen36_dense_affine.c qwen36.c 
 tests/test_qwen36_tok_merges$(EXE): tests/test_qwen36_tok_merges.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# The tokens a model ends a turn with, as it declares them (config.json, a GGUF's eog list).
+tests/test_qwen36_eos$(EXE): tests/test_qwen36_eos.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 # A byte-counted serving payload may end mid-character; the pre-tokenizer must
 # not read past it.  qwen38 already gates this (tests/test_qwen38_tokenizer.c).
 tests/test_qwen36_tok_truncated$(EXE): tests/test_qwen36_tok_truncated.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
@@ -1868,6 +1872,14 @@ tests/test_qwen36_dense_idot$(EXE): tests/test_qwen36_dense_idot.c qwen36.c $(QW
 
 # #1653: added tokens are split out before the regex pre-tokenizer, HF-style.
 tests/test_qwen36_tokenizer$(EXE): tests/test_qwen36_tokenizer.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# Flint's pre-tokenizer against HF's tokenizers (tests/fixtures/flint_tok_*).
+tests/test_qwen36_tokenizer_flint$(EXE): tests/test_qwen36_tokenizer_flint.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# o200k's pre-tokenizer (Muse Spark) against HF's tokenizers (tests/fixtures/o200k_tok_*).
+tests/test_qwen36_tokenizer_o200k$(EXE): tests/test_qwen36_tokenizer_o200k.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # The serve sampler draws the same tokens as a sort of the whole vocabulary.
@@ -1895,7 +1907,7 @@ inkling$(EXE): inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build
 # flags for these targets and say so once, loudly.
 comma := ,
 NOCUDA_CFLAGS  = $(filter-out -DCOLI_CUDA -DCOLI_ANS,$(CFLAGS))
-NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
+NOCUDA_LDFLAGS = $(filter-out -lcudart -lcublasLt -lcublas -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
                    -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
 
 # GLM-5.3-Flash: routed experts stream from the int4-gs64 container.
@@ -1904,8 +1916,8 @@ ifneq ($(EXE),)
 .PHONY: glm53
 glm53: glm53$(EXE)
 endif
-glm53$(EXE): glm53.c $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) glm53.c $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
+glm53$(EXE): glm53.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) glm53.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
 ifneq ($(EXE),)
 .PHONY: kimi_k3
@@ -2054,6 +2066,9 @@ tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c qwen38.c $(VK_OBJ)
 tests/test_qwen38_int4_experts$(EXE): tests/test_qwen38_int4_experts.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_qwen38_igpu_defaults$(EXE): tests/test_qwen38_igpu_defaults.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
@@ -2075,6 +2090,15 @@ tests/test_qwenimage_vae$(EXE): tests/test_qwenimage_vae.c
 
 .PHONY: test_qwenimage_vae
 test_qwenimage_vae: tests/test_qwenimage_vae$(EXE)
+
+# Bare invocation is dependency-free and participates in make check. The
+# opt-in oracle uses the existing pinned torch/diffusers environment on CPU.
+tests/test_qwenimage_encoder$(EXE): tests/test_qwenimage_encoder.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+.PHONY: qwenimage-encoder-check
+qwenimage-encoder-check: tests/test_qwenimage_encoder$(EXE) tests/test_qwenimage_vae$(EXE)
+	$(PYTHON) tools/check_qwenimage_encoder.py
 
 # Il percorso completo: frame IMAGE, torre, sostituzione degli embedding,
 # generazione. Prova che due immagini diverse danno risposte diverse, che e'
@@ -2333,6 +2357,31 @@ tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
 tests/test_i4_grouped_sse41$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -O3 -DCOLI_HAVE_GROUPED_PAIR -DCOLI_I4_GROUPED_SCALAR_EXACT -msse4.1 -mno-avx2 -mno-fma $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
+tests/test_lora$(EXE): tests/test_lora.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_train_linear$(EXE): tests/test_train_linear.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_train_tiny$(EXE): tests/test_train_tiny.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_train_resume$(EXE): tests/test_train_resume.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# QLoRA trainer (experimental). One translation unit, so -MMD writes a complete
+# coli_train.d. There is no coli_train.c for the engine discovery to find, so
+# the generated dependencies are hooked up here, the same way AUTODEP_BINS does
+# it: the binary depends on its own .d, and a missing .d forces the rebuild.
+coli_train$(EXE): train/train_main.c colibri.c $(METAL_OBJ) $(VK_OBJ) .build-config
+	$(CC) $(CFLAGS) train/train_main.c $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+coli_train$(EXE): coli_train.d
+coli_train.d: ;
+-include $(wildcard coli_train.d)
+ifneq ($(EXE),)
+coli_train: coli_train$(EXE)
+endif
+
 tests/test_i4_grouped_sse41_o1$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -O1 -DCOLI_HAVE_GROUPED_PAIR -DCOLI_I4_GROUPED_SCALAR_EXACT -msse4.1 -mno-avx2 -mno-fma $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
@@ -2367,6 +2416,13 @@ tests/test_kv_fp8$(EXE): tests/test_kv_fp8.c
 
 tests/test_kv_tq$(EXE): tests/test_kv_tq.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# #2096 gate: exercises coli_kv_share_adopt_rows (the COLI_KV_SHARE cross-slot
+# adoption routine) under KV8 and KV_TQ — donor "fully prefilled", receiver
+# adopts [from,from+n), rows dequantized and compared. Includes colibri.c
+# like test_kv_alloc (kv_alloc + the adopt routine live there).
+tests/test_kv_share_kv8$(EXE): tests/test_kv_share_kv8.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_kv_disk$(EXE): tests/test_kv_disk.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
@@ -2455,6 +2511,16 @@ else
 vk-strict-check:
 	@echo "vk-strict-check: VK=0, no Vulkan backend (skip)"
 endif
+
+# Checks the choice of memory type and the size, budget and room of the device memory
+# (vk_memtype.h) on memory-property tables written by the test. It needs the Vulkan headers
+# (VK=1) and no device, so `check` does not run it.
+tests/test_vk_memtype$(EXE): tests/test_vk_memtype.c
+	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_memtype needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+.PHONY: vk-memtype-check
+vk-memtype-check: tests/test_vk_memtype$(EXE)
+	./tests/test_vk_memtype$(EXE)
 
 # GLM-5.3's resident f32 dispatch and its dense memory reservation (#1863).
 # Run by vulkan_engines.sh shader; requires a real or software Vulkan device.
@@ -3316,9 +3382,13 @@ tests/test_glm53_image_key$(EXE): tests/test_glm53_image_key.c
 tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) tests/test_kimi_request_state.c $(VK_OBJ) -o tests/test_kimi_request_state$(EXE) $(NOCUDA_LDFLAGS)
 
-# Kimi CUDA dispatch/fallback with a fake backend; no CUDA toolkit required.
-tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c $(VK_OBJ)
-	$(CC) $(NOCUDA_CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+# Kimi CUDA dispatch/fallback with a fake backend; no CUDA toolkit required. cu_tier.c is the
+# CUDA tier's half of the engine's calls, built as a CUDA build sees it; with no backend table
+# (the fake's) the tier stays off.
+tests/cu_tier_fake.o: cu_tier.c
+	$(CC) $(NOCUDA_CFLAGS) -DCOLI_CUDA -c $< -o $@
+tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c tests/cu_tier_fake.o $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) -DCOLI_CUDA $< tests/cu_tier_fake.o $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 # ---------------------------------------------------------------------------
 # Generated header prerequisites (#1741)

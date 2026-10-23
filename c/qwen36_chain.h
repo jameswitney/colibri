@@ -91,14 +91,19 @@ typedef struct {
     VkcKvSplit ks;                             /* the split past the device's budget (ks.on) */
     VkcBuf *prm;                               /* every norm / conv / DeltaNet parameter */
     size_t *o_in, *o_post, *o_qn, *o_kn, *o_conv, *o_dn, o_final;
+    size_t *o_snk;                             /* Flint: a layer's sink logits in prm */
+    size_t *o_ra, *o_rf, *o_pre, *o_pf;        /* Muse Spark: residual gates (alpha | beta), pre_en, post_fn */
     ColiVkTensor **t_ab, **t_sg;               /* DeltaNet b|a rows, shared gate row (f32) */
     VkcBuf **rec, **ring, **kc, **vc;          /* per layer state */
     VkcBuf **rec_snap[Q36_SPEC_SNAPS], **ring_snap[Q36_SPEC_SNAPS];   /* a verify's copies, slot r after row r */
     int snap_slots, snap_valid;                /* allocated; written by the last verify */
     int *kv_valid, *attn_ord, n_attn;
+    int *kv_rows;                              /* per attention layer: its mirror's rows (a sliding layer's ring, else dev_rows) */
     int dn_where, host_zero;
     VkcBuf *x, *nrm, *tmp, *q, *k, *v, *ctx, *qkv, *z, *ab, *cv, *dny, *h2, *lg, *gs, *us, *hs, *ds, *sgd, *fin;
     VkcBuf *h2d, *lgd, *kvd, *outd, *xd, *lfd, *routed, *cs;
+    VkcBuf *kg, *vg;                           /* a long step's window over a ring: its rows before the step and the step's (q36c_attention) */
+    VkcBuf *agb, *lat, *latd;                  /* Muse Spark: the attention gate's rows, the experts' input rows */
     float *host_routed;
     unsigned long long forwards, frames, host_ms_n;
     double wait_ms, host_ms;
@@ -184,7 +189,8 @@ static int q36c_geometry_ok(const Cfg *c) {
  * and those the chain multiplies by, in its setup order (*chain of them first). */
 static int q36c_layer_all(Model *m, int i, QW **ws) {
     Layer *l = &m->L[i];
-    QW *all[] = {&l->q, &l->k, &l->v, &l->o, &l->gate, &l->sh_g, &l->sh_u, &l->sh_d, &l->dn_qkv, &l->dn_z, &l->dn_out};
+    QW *all[] = {&l->q, &l->k, &l->v, &l->o, &l->gate, &l->sh_g, &l->sh_u, &l->sh_d, &l->dn_qkv, &l->dn_z, &l->dn_out,
+                 &l->ag, &l->lat_d, &l->lat_u};
     for (size_t k = 0; k < sizeof all / sizeof *all; k++) ws[k] = all[k];
     return (int)(sizeof all / sizeof *all);
 }
@@ -192,8 +198,9 @@ static int q36c_layer_qws(Model *m, int i, QW **ws) {
     Cfg *c = &m->c; Layer *l = &m->L[i]; int n = 0;
     if (c->is_attn[i]) { ws[n++] = &l->q; ws[n++] = &l->k; ws[n++] = &l->v; ws[n++] = &l->o; }
     else { ws[n++] = &l->dn_qkv; ws[n++] = &l->dn_z; ws[n++] = &l->dn_out; }
-    if (c->n_experts > 0) ws[n++] = &l->gate;
-    if (c->shared_inter > 0) { ws[n++] = &l->sh_g; ws[n++] = &l->sh_u; ws[n++] = &l->sh_d; }
+    if (c->n_experts > 0 && !q36_dense_l(c, i)) ws[n++] = &l->gate;   /* a Flint dense layer has no router */
+    if (l->sh_I > 0) { ws[n++] = &l->sh_g; ws[n++] = &l->sh_u; ws[n++] = &l->sh_d; }
+    if (c->muse) { ws[n++] = &l->ag; ws[n++] = &l->lat_d; ws[n++] = &l->lat_u; }
     return n;
 }
 
@@ -276,12 +283,16 @@ static Q36Chain *q36c_setup_dev(Model *m, int d) {
     ch->lo = lo;
     ch->o_in = calloc(L, sizeof(size_t)); ch->o_post = calloc(L, sizeof(size_t)); ch->o_qn = calloc(L, sizeof(size_t));
     ch->o_kn = calloc(L, sizeof(size_t)); ch->o_conv = calloc(L, sizeof(size_t)); ch->o_dn = calloc(L, sizeof(size_t));
+    ch->o_snk = calloc(L, sizeof(size_t));
+    ch->o_ra = calloc(L, sizeof(size_t)); ch->o_rf = calloc(L, sizeof(size_t));
+    ch->o_pre = calloc(L, sizeof(size_t)); ch->o_pf = calloc(L, sizeof(size_t));
     ch->t_ab = calloc(L, sizeof(void *)); ch->t_sg = calloc(L, sizeof(void *));
     ch->rec = calloc(L, sizeof(void *)); ch->ring = calloc(L, sizeof(void *));
     ch->kc = calloc(L, sizeof(void *)); ch->vc = calloc(L, sizeof(void *));
-    ch->kv_valid = calloc(L, sizeof(int)); ch->attn_ord = calloc(L, sizeof(int));
-    if (!ch->o_in || !ch->o_post || !ch->o_qn || !ch->o_kn || !ch->o_conv || !ch->o_dn || !ch->t_ab || !ch->t_sg ||
-        !ch->rec || !ch->ring || !ch->kc || !ch->vc || !ch->kv_valid || !ch->attn_ord) return NULL;
+    ch->kv_valid = calloc(L, sizeof(int)); ch->attn_ord = calloc(L, sizeof(int)); ch->kv_rows = calloc(L, sizeof(int));
+    if (!ch->o_in || !ch->o_post || !ch->o_qn || !ch->o_kn || !ch->o_conv || !ch->o_dn || !ch->o_snk || !ch->o_ra || !ch->o_rf ||
+        !ch->o_pre || !ch->o_pf || !ch->t_ab || !ch->t_sg ||
+        !ch->rec || !ch->ring || !ch->kc || !ch->vc || !ch->kv_valid || !ch->attn_ord || !ch->kv_rows) return NULL;
     /* the parameter arena of the n layers: offsets, then one upload */
     size_t np = 0;
     int vh = c->dn_vheads, conv_dim = c->dn_conv_dim, convk = c->dn_convk;
@@ -290,6 +301,11 @@ static Q36Chain *q36c_setup_dev(Model *m, int d) {
         if (c->is_attn[i]) {
             if (m->L[i].qn) { ch->o_qn[i] = np; np += c->head_dim; }
             if (m->L[i].kn) { ch->o_kn[i] = np; np += c->k_head_dim; }
+            if (m->L[i].sinks) { ch->o_snk[i] = np; np += c->q_heads; }
+            if (c->muse) {
+                ch->o_ra[i] = np; np += 2 * (size_t)D; ch->o_rf[i] = np; np += 2 * (size_t)D;
+                ch->o_pre[i] = np; np += q36_eh(c); ch->o_pf[i] = np; np += D;
+            }
         } else {
             ch->o_conv[i] = np; np += (size_t)conv_dim * convk;
             ch->o_dn[i] = np; np += 2 * (size_t)vh + c->dn_vdim;
@@ -305,6 +321,13 @@ static Q36Chain *q36c_setup_dev(Model *m, int d) {
         if (c->is_attn[i]) {
             if (l->qn) memcpy(arena + ch->o_qn[i], l->qn, c->head_dim * sizeof(float));
             if (l->kn) memcpy(arena + ch->o_kn[i], l->kn, c->k_head_dim * sizeof(float));
+            if (l->sinks) memcpy(arena + ch->o_snk[i], l->sinks, c->q_heads * sizeof(float));
+            if (c->muse) {
+                memcpy(arena + ch->o_ra[i], l->ra_a, D * sizeof(float)); memcpy(arena + ch->o_ra[i] + D, l->ra_b, D * sizeof(float));
+                memcpy(arena + ch->o_rf[i], l->rf_a, D * sizeof(float)); memcpy(arena + ch->o_rf[i] + D, l->rf_b, D * sizeof(float));
+                memcpy(arena + ch->o_pre[i], l->pre_en, q36_eh(c) * sizeof(float));
+                memcpy(arena + ch->o_pf[i], l->post_fn, D * sizeof(float));
+            }
         } else {
             memcpy(arena + ch->o_conv[i], l->dn_conv, (size_t)conv_dim * convk * sizeof(float));
             memcpy(arena + ch->o_dn[i], l->dn_alog, vh * sizeof(float));
@@ -423,6 +446,8 @@ static void q36c_fit_layer(Model *m, int i, int kv_rows, size_t *dev, size_t *ma
     if (c->is_attn[i]) {
         if (l->qn) prm += c->head_dim;
         if (l->kn) prm += c->k_head_dim;
+        if (l->sinks) prm += c->q_heads;
+        if (c->muse) prm += 5 * (size_t)D + q36_eh(c);
         *dev += 2 * vkc_fit_buf((size_t)c->kv_heads * kv_rows * c->k_head_dim * sizeof(float));
     } else {
         prm += (size_t)c->dn_conv_dim * c->dn_convk + 2 * (size_t)vh + c->dn_vdim;
@@ -562,7 +587,10 @@ static int q36c_bufs(Q36Chain *ch, Model *m, int rows) {
     Cfg *c = &m->c; int D = c->hidden, H = c->q_heads, KV = c->kv_heads, hd = c->head_dim;
     int qo = H * c->q_head_dim, kvo = KV * c->k_head_dim, vd = c->dn_vheads * c->dn_vdim;
     int E = c->n_experts > 0 ? c->n_experts : 1, SI = c->shared_inter > 0 ? c->shared_inter : 1;
+    if (c->dense_layer && c->dense_inter > SI) SI = c->dense_inter;   /* Flint's dense layers: a wider MLP */
     size_t r = (size_t)rows;
+    /* the routed sum's rows: the experts' width (Muse Spark's latent), at least the hidden */
+    const size_t RW = (size_t)(q36_eh(c) > D ? q36_eh(c) : D), LT = (size_t)q36_eh(c), AG = (size_t)H * hd;
     int ok = q36c_res(&ch->x, r * D, VKC_DEV) && q36c_res(&ch->nrm, r * D, VKC_DEV) && q36c_res(&ch->tmp, r * D, VKC_DEV) &&
              q36c_res(&ch->q, r * qo, VKC_DEV) && q36c_res(&ch->k, r * kvo, VKC_DEV) && q36c_res(&ch->v, r * kvo, VKC_DEV) &&
              q36c_res(&ch->ctx, r * H * hd, VKC_DEV) && q36c_res(&ch->qkv, r * c->dn_conv_dim, VKC_DEV) &&
@@ -573,25 +601,61 @@ static int q36c_bufs(Q36Chain *ch, Model *m, int rows) {
              q36c_res(&ch->ds, r * D, VKC_DEV) && q36c_res(&ch->sgd, r, VKC_DEV) && q36c_res(&ch->fin, D, VKC_DEV) &&
              q36c_res(&ch->h2d, r * D, VKC_DOWN) && q36c_res(&ch->lgd, r * E, VKC_DOWN) &&
              q36c_res(&ch->kvd, (size_t)(ch->n_attn ? ch->n_attn : 1) * 2 * r * kvo, VKC_DOWN) &&
-             q36c_res(&ch->outd, c->vocab, VKC_DOWN) && q36c_res(&ch->routed, r * D, VKC_UP) &&
+             q36c_res(&ch->outd, c->vocab, VKC_DOWN) && q36c_res(&ch->routed, r * RW, VKC_UP) &&
              q36c_res(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2), VKC_UP);
+    /* Muse Spark's alone (the attention gate's rows, the experts' input rows): another
+     * model's scratch, and so coli plan's count of it, stays as it was */
+    if (ok && c->muse)
+        ok = q36c_res(&ch->agb, r * AG, VKC_DEV) && q36c_res(&ch->lat, r * LT, VKC_DEV) && q36c_res(&ch->latd, r * LT, VKC_DOWN);
+    if (ok && m->kv_ring)   /* the sliding layers' rings: a long step's window, linear (the window's rows before it and its own) */
+        ok = q36c_res(&ch->kg, (r + c->window) * kvo, VKC_DEV) && q36c_res(&ch->vg, (r + c->window) * kvo, VKC_DEV);
     return ok;
+}
+/* A sliding layer's mirror is a ring of the host's rows (q36_kv_rows), position t in row
+ * t % ring on both sides; 0 for a full layer. */
+static int q36c_ring(Model *m, int i) { return q36_kv_rows(m, i) != m->max_t ? m->kv_ring : 0; }
+/* What the chain's KV mirror takes at the context's capacity, after the tier has filled
+ * the device, for a model whose mirror cannot split (a sliding window, sinks: Flint, Muse
+ * Spark, whose chain stops when the mirror does not fit): the full layers' rows at ctx, a
+ * sliding layer's ring (q36_ring_for), at most half of what the device has free. The tier
+ * leaves it free (VktConfig.chain_bytes). Before, Flint int4 at 32K of context mirrored
+ * 6.6 GB beside a tier that had left 1 GiB, and its chain ran only with
+ * COLI_VK_TIER_RESERVE_GB=12. */
+static size_t q36c_late_bytes(Model *m, int ctx) {
+    Cfg *c = &m->c;
+    if (ctx < 1 || !(c->win_layer || c->attn_sinks)) return 0;
+    int R = q36_ring_for(c, ctx), hi = g_q36c_fit_on ? g_q36c_fit.n : c->n_layers;
+    size_t row = (size_t)c->kv_heads * c->k_head_dim * 2 * sizeof(float), kv = 0, half = vkc_dev_avail() / 2;
+    for (int i = 0; i < hi && i < c->n_layers; i++)
+        if (c->is_attn[i]) kv += row * (size_t)(R && c->win_layer && c->win_layer[i] ? R : ctx);
+    return kv > half ? half : kv;
 }
 /* Plan and allocate the KV mirror before sizing a prompt chunk. */
 static int q36c_mirror(Q36Chain *ch, Model *m) {
     Cfg *c = &m->c; int KV = c->kv_heads;
     if (ch->cap != m->kv_cap) {        /* the host cache grew: mirror it again (whole, or split past the budget) */
         size_t row = (size_t)KV * c->k_head_dim * 2 * sizeof(float);
-        int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, q36c_name(ch), ch->n_attn, row, m->kv_cap, 1, 0,
-                                            (size_t)ch->n_attn * ch->dev_rows * row) : 1;
+        /* the rings counted at their rows, as that many layers of the cache's length */
+        int nf = 0, nr = 0;
+        for (int i = ch->lo; i < ch->lo + ch->n; i++) if (c->is_attn[i]) { if (q36c_ring(m, i)) nr++; else nf++; }
+        int leq = nf + (nr ? (int)(((size_t)nr * m->kv_ring + m->kv_cap - 1) / m->kv_cap) : 0);
+        size_t held = 0;
+        for (int i = ch->lo; i < ch->lo + ch->n; i++) if (c->is_attn[i] && ch->kc[i]) held += (size_t)ch->kv_rows[i] * row;
+        int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, q36c_name(ch), leq, row, m->kv_cap, 1, 0, held) : 1;
         if (!plan) { ch->cap = 0; return 0; }
+        if (ch->ks.on && (c->attn_sinks || c->win_layer)) {   /* the split's attention knows no window or sinks */
+            fprintf(stderr, "[VK] qwen36 chain: the KV cache does not fit the device, and its split has no "
+                            "sliding window or sinks (Flint); the chain stops\n");
+            vkc_kv_free(&ch->ks); ch->cap = 0; return 0;
+        }
         ch->dev_rows = ch->ks.on ? ch->ks.rows : m->kv_cap;
         for (int i = ch->lo; i < ch->lo + ch->n; i++) {
             if (!c->is_attn[i]) continue;
             vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
             ch->kv_valid[i] = 0;
-            ch->kc[i] = vkc_buf((size_t)KV * ch->dev_rows * c->k_head_dim * sizeof(float), VKC_DEV);
-            ch->vc[i] = vkc_buf((size_t)KV * ch->dev_rows * c->k_head_dim * sizeof(float), VKC_DEV);
+            ch->kv_rows[i] = q36c_ring(m, i) ? m->kv_ring : ch->dev_rows;
+            ch->kc[i] = vkc_buf((size_t)KV * ch->kv_rows[i] * c->k_head_dim * sizeof(float), VKC_DEV);
+            ch->vc[i] = vkc_buf((size_t)KV * ch->kv_rows[i] * c->k_head_dim * sizeof(float), VKC_DEV);
             if (!ch->kc[i] || !ch->vc[i]) { ch->cap = 0; return 0; }
         }
         ch->cap = m->kv_cap;
@@ -601,7 +665,7 @@ static int q36c_mirror(Q36Chain *ch, Model *m) {
 
 /* scratch for `rows` rows, and the KV mirrors at the host's capacity */
 static int q36c_scratch(Q36Chain *ch, Model *m, int rows) {
-    Cfg *c = &m->c; int D = c->hidden;
+    Cfg *c = &m->c; int D = q36_eh(c) > c->hidden ? q36_eh(c) : c->hidden;   /* the routed sum's width */
     size_t r = (size_t)rows;
     if (!q36c_bufs(ch, m, rows)) return 0;
     if (ch->rows < rows) {
@@ -718,7 +782,22 @@ static int q36c_push_state(Q36Chain *ch, Model *m, int pos_base, int n_rows) {
             continue;
         }
         if (!c->is_attn[i] || ch->kv_valid[i] >= pos_base) continue;
-        int t0 = ch->kv_valid[i], n = pos_base - t0;
+        int t0 = ch->kv_valid[i], n = pos_base - t0, R = q36c_ring(m, i);
+        if (R) {   /* a ring: the window's rows before pos_base, the host's ring rows into the same device rows */
+            if (t0 < pos_base - c->window + 1) t0 = pos_base - c->window + 1;
+            if (t0 < 0) t0 = 0;
+            for (int t = t0; t < pos_base && ok; ) {
+                int r = t % R, run = pos_base - t < R - r ? pos_base - t : R - r;
+                for (int h = 0; h < KV && ok; h++) {
+                    size_t at = ((size_t)h * R + r) * kvd;
+                    ok = vkc_write(ch->kc[i], at, m->K[i] + at, (size_t)run * kvd * sizeof(float)) &&
+                         vkc_write(ch->vc[i], at, m->V[i] + at, (size_t)run * kvd * sizeof(float));
+                }
+                t += run;
+            }
+            ch->kv_valid[i] = pos_base;
+            continue;
+        }
         for (int h = 0; h < KV && ok; h++) {
             size_t src = ((size_t)h * m->max_t + t0) * kvd, dst = ((size_t)h * ch->dev_rows + t0) * kvd;
             ok = vkc_write(ch->kc[i], dst, m->K[i] + src, (size_t)n * kvd * sizeof(float)) &&
@@ -734,13 +813,27 @@ static int q36c_norm(VkcBuf *x, size_t xo, VkcBuf *w, size_t wo, VkcBuf *y, size
     VkcNorm p = {rows, D, 1, (int)xo, D, D, (int)yo, D, D, (int)wo, 0, VKC_NORM_ADD1, eps, 1.f};
     return vkc_norm(x, w, y, &p);
 }
+/* The heads' output (ctx) through o_proj into tmp; Muse Spark normalises every head's
+ * output first, then gates it by sigmoid(attn_gate(x)) (agb, recorded with q/k/v). */
+static int q36c_attn_out(Q36Chain *ch, Model *m, Layer *l, int n) {
+    Cfg *c = &m->c; int H = c->q_heads, hd = c->head_dim;
+    if (c->muse) {
+        VkcNorm p = {n * H, hd, H, 0, H * hd, hd, 0, H * hd, hd, 0, 0, VKC_NORM_NOW, c->eps, 1.f};
+        VkcEw g = {VKC_EW_SIGMUL, n * H * hd, H * hd, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+        if (!vkc_norm(ch->ctx, ch->prm, ch->ctx, &p) || !vkc_ew(ch->ctx, ch->ctx, ch->agb, NULL, NULL, &g)) return 0;
+    }
+    return vkc_matmul(vk_qw_tensor(&l->o), ch->ctx, 0, ch->tmp, 0, n);
+}
 static int q36c_attention(Q36Chain *ch, Model *m, Layer *l, int i, int n, int pb) {
     Cfg *c = &m->c;
     int H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, qdim = c->q_head_dim, kvd = c->k_head_dim;
     int qo = H * qdim, kvo = KV * kvd, half = c->rotary_dim / 2, gate_dim = qdim > hd ? qdim - hd : 0;
+    if (c->nope_layer && c->nope_layer[i]) half = 0;   /* Flint: a layer without RoPE */
+    const int win = c->win_layer && c->win_layer[i] ? c->window : 0;
     int ok = vkc_matmul(vk_qw_tensor(&l->q), ch->nrm, 0, ch->q, 0, n) &&
              vkc_matmul(vk_qw_tensor(&l->k), ch->nrm, 0, ch->k, 0, n) &&
              vkc_matmul(vk_qw_tensor(&l->v), ch->nrm, 0, ch->v, 0, n);
+    if (ok && c->muse) ok = vkc_matmul(vk_qw_tensor(&l->ag), ch->nrm, 0, ch->agb, 0, n);
     if (ok && l->qn) { VkcNorm p = {n * H, hd, H, 0, qo, qdim, 0, qo, qdim, (int)ch->o_qn[i], 0, VKC_NORM_ADD1, c->eps, 1.f};
                        ok = vkc_norm(ch->q, ch->prm, ch->q, &p); }
     if (ok && half) { VkcRope p = {n * H, H, 0, qo, qdim, half, 0, 2 * half}; ok = vkc_rope(ch->q, ch->cs, &p); }
@@ -757,20 +850,58 @@ static int q36c_attention(Q36Chain *ch, Model *m, Layer *l, int i, int n, int pb
         return vkc_kv_store(&ch->ks, ch->attn_ord[i], &pk, ch->k, 0, (size_t)kvo, (size_t)kvd, pb, n) &&
                vkc_kv_store(&ch->ks, ch->attn_ord[i], &pv, ch->v, 0, (size_t)kvo, (size_t)kvd, pb, n) &&
                vkc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) && vkc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo) &&
-               vkc_kv_gqa(&a) && vkc_matmul(vk_qw_tensor(&l->o), ch->ctx, 0, ch->tmp, 0, n);
+               vkc_kv_gqa(&a) && q36c_attn_out(ch, m, l, n);
     }
     /* the new rows into the device cache, and to the host's */
+    const int R = q36c_ring(m, i), rows = ch->kv_rows[i];   /* a ring: position t in row t % R */
+    if (R && n > R - win + 1) {
+        /* A step longer than the ring's spare rows would overwrite rows its first rows still see:
+         * its window is gathered instead, as MiMo's chain does, the ring's rows of the positions
+         * before it and then its own, head-major in kg/vg, where the attention reads them as a
+         * cache from position b0 (the same values in the same order: the same bits); then its
+         * last R rows go into the ring. */
+        int b0 = pb - win + 1 > 0 ? pb - win + 1 : 0, nh = pb - b0, tot = nh + n;
+        VkcRegion *g = malloc(sizeof *g * (size_t)KV * (n > 2 ? n : 2));
+        if (!g) return 0;
+        int ng = 0;
+        for (int h = 0; h < KV; h++)
+            for (int t = b0; t < pb; ) {
+                int r = t % R, run = pb - t < R - r ? pb - t : R - r;
+                g[ng++] = (VkcRegion){((size_t)h * tot + (t - b0)) * kvd, ((size_t)h * R + r) * kvd, (size_t)run * kvd};
+                t += run;
+            }
+        ok = (!ng || (vkc_copy_regions(ch->kg, ch->kc[i], g, ng) && vkc_copy_regions(ch->vg, ch->vc[i], g, ng)));
+        ng = 0;
+        for (int s = 0; s < n; s++) for (int h = 0; h < KV; h++)
+            g[ng++] = (VkcRegion){((size_t)h * tot + nh + s) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
+        ok = ok && vkc_copy_regions(ch->kg, ch->k, g, ng) && vkc_copy_regions(ch->vg, ch->v, g, ng);
+        VkcAttn a = {n, H, KV, hd, nh, tot, 0, qo, qdim, hd, qo, qdim, gate_dim > 0, 0, H * hd, 0, 0,
+                     1.f / sqrtf((float)hd), 0, 0};
+        VkcAttnW w = {a, win, 0, 0, 0, l->sinks != NULL, (int)ch->o_snk[i]};
+        ok = ok && vkc_attn_w(ch->q, ch->kg, ch->vg, ch->ctx, ch->q, NULL, l->sinks ? ch->prm : NULL, &w);
+        ng = 0;   /* after the attention read the ring's rows: the step's last R into it */
+        for (int s = n > R ? n - R : 0; s < n; s++) for (int h = 0; h < KV; h++)
+            g[ng++] = (VkcRegion){((size_t)h * R + (pb + s) % R) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
+        ok = ok && vkc_copy_regions(ch->kc[i], ch->k, g, ng) && vkc_copy_regions(ch->vc[i], ch->v, g, ng) &&
+             vkc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) && vkc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo);
+        free(g);
+        return ok && q36c_attn_out(ch, m, l, n);
+    }
     VkcRegion *rg = malloc(sizeof *rg * (size_t)n * KV);
     if (!rg) return 0;
     for (int s = 0; s < n; s++) for (int h = 0; h < KV; h++)
-        rg[s * KV + h] = (VkcRegion){((size_t)h * ch->dev_rows + pb + s) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
+        rg[s * KV + h] = (VkcRegion){((size_t)h * rows + (R ? (pb + s) % R : pb + s)) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
     ok = vkc_copy_regions(ch->kc[i], ch->k, rg, n * KV) && vkc_copy_regions(ch->vc[i], ch->v, rg, n * KV) &&
          vkc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) && vkc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo);
     free(rg);
-    VkcAttn a = {n, H, KV, hd, pb, ch->dev_rows, 0, qo, qdim, hd, qo, qdim, gate_dim > 0, 0, H * hd, 0, 0,
+    VkcAttn a = {n, H, KV, hd, pb, rows, 0, qo, qdim, hd, qo, qdim, gate_dim > 0, 0, H * hd, 0, 0,
                  1.f / sqrtf((float)hd), 0, 0};
-    return ok && vkc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, NULL, &a) &&
-           vkc_matmul(vk_qw_tensor(&l->o), ch->ctx, 0, ch->tmp, 0, n);
+    if (win || l->sinks) {   /* Flint: a sliding window and a sink per head (vkc_attn_w, as MiMo's) */
+        VkcAttnW w = {a, win, R, 0, 0, l->sinks != NULL, (int)ch->o_snk[i]};
+        return ok && vkc_attn_w(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, NULL, l->sinks ? ch->prm : NULL, &w) &&
+               q36c_attn_out(ch, m, l, n);
+    }
+    return ok && vkc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, NULL, &a) && q36c_attn_out(ch, m, l, n);
 }
 /* ns: the chunk's rows a verify copies the state after (rows 0..ns-1, slots c0..). One
  * copy rides on the one dispatch as the shaders pass its row; more split the
@@ -798,7 +929,7 @@ static int q36c_deltanet(Q36Chain *ch, Model *m, Layer *l, int i, int n, int c0,
     return ok && vkc_matmul(vk_qw_tensor(&l->dn_out), ch->dny, 0, ch->tmp, 0, n);
 }
 static int q36c_shared(Q36Chain *ch, Model *m, Layer *l, int i, int n) {
-    Cfg *c = &m->c; int ok = 1, SI = c->shared_inter;
+    int ok = 1, SI = l->sh_I;   /* shared_inter, or a Flint dense layer's MLP width */
     if (SI > 0) {
         VkcEw p = {VKC_EW_SWIGLU, n * SI, SI, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
         ok = vkc_matmul(vk_qw_tensor(&l->sh_g), ch->h2, 0, ch->gs, 0, n) &&
@@ -813,7 +944,15 @@ static int q36c_shared(Q36Chain *ch, Model *m, Layer *l, int i, int n) {
  * routed: the host's sum (ch->routed) or the device's (ch->dm.y) */
 static int q36c_combine(Q36Chain *ch, Model *m, int i, int n, VkcBuf *routed) {
     Cfg *c = &m->c;
-    int flags = (c->n_experts > 0 ? 1 : 0) | (c->shared_inter > 0 ? 2 : 0) | (m->L[i].sh_gate && c->shared_inter > 0 ? 4 : 0);
+    if (c->muse) {   /* Muse Spark: the routed sum back to the hidden width, normalised, through the residual gate */
+        const int D = c->hidden;
+        VkcNorm p = {n, D, 1, 0, D, D, 0, D, D, (int)ch->o_pf[i], 0, VKC_NORM_PRESCALE, c->post_eps, 1.f};
+        VkcEw g = {VKC_EW_RESGATE, n * D, D, 1, 0, 1, 0, 0, 0, (int)ch->o_rf[i] + D, (int)ch->o_rf[i], 1.f};
+        return vkc_matmul(vk_qw_tensor(&m->L[i].lat_u), routed, 0, ch->tmp, 0, n) &&
+               vkc_norm(ch->tmp, ch->prm, ch->tmp, &p) && vkc_ew(ch->x, ch->x, ch->tmp, ch->prm, ch->prm, &g);
+    }
+    const int routed_l = c->n_experts > 0 && !q36_dense_l(c, i), SI = m->L[i].sh_I;   /* a Flint dense layer routes nothing */
+    int flags = (routed_l ? 1 : 0) | (SI > 0 ? 2 : 0) | (m->L[i].sh_gate && SI > 0 ? 4 : 0);
     VkcEw p = {VKC_EW_COMBINE, n * c->hidden, c->hidden, 1, flags, 1, 0, 0, 0, 0, 0, 1.f};
     return vkc_ew(ch->x, ch->x, routed, ch->ds, ch->sgd, &p);
 }
@@ -822,10 +961,14 @@ static void q36c_kv_down(Q36Chain *ch, Model *m, int i, int n, int pb) {
     Cfg *c = &m->c; int kvo = c->kv_heads * c->k_head_dim;
     if (!c->is_attn[i]) return;
     const float *kv = (const float *)vkc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
-    for (int s = 0; s < n; s++) for (int h = 0; h < c->kv_heads; h++) {
-        size_t dst = ((size_t)h * m->max_t + pb + s) * c->k_head_dim, src = (size_t)s * kvo + (size_t)h * c->k_head_dim;
-        memcpy(m->K[i] + dst, kv + src, c->k_head_dim * sizeof(float));
-        memcpy(m->V[i] + dst, kv + (size_t)ch->rows * kvo + src, c->k_head_dim * sizeof(float));
+    const int R = q36c_ring(m, i);
+    for (int s = 0; s < n; s++) {
+        for (int h = 0; h < c->kv_heads; h++) {
+            size_t dst = q36_kv_at(m, i, h, pb + s), src = (size_t)s * kvo + (size_t)h * c->k_head_dim;
+            memcpy(m->K[i] + dst, kv + src, c->k_head_dim * sizeof(float));
+            memcpy(m->V[i] + dst, kv + (size_t)ch->rows * kvo + src, c->k_head_dim * sizeof(float));
+        }
+        if (R && m->ring_pos) m->ring_pos[(pb + s) % R] = pb + s;
     }
 }
 
@@ -843,7 +986,7 @@ static void q36c_kv_down(Q36Chain *ch, Model *m, int i, int n, int pb) {
 static int q36c_dmoe(Q36Chain *ch, Model *m, int rows) {
     Cfg *c = &m->c; int E = c->n_experts;
     int ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1;
-    if (ch->d || E <= 0 || g_cache_route || g_route_agree || c->has_bias || qq_active() || qt_ready() ||
+    if (ch->d || E <= 0 || g_cache_route || g_route_agree || c->has_bias || c->muse || qq_active() || qt_ready() ||
         (ng > 1 && (ng > 64 || E % ng || c->topk_group < 1 || c->topk_group > ng))) return 0;
     ch->dm.big = 1;   /* a prompt chunk too: a GGUF's experts and ours through the grouped GEMMs */
     return vkc_dmoe_prepare(&ch->dm, ch->lo, ch->n, E, c->topk, c->hidden, c->inter, rows);
@@ -933,12 +1076,19 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
             ok = ok && (c->is_attn[i] ? q36c_attention(ch, m, l, i, n, pb) : q36c_deltanet(ch, m, l, i, n, c0, ns));
             if (ok && lf) ok = vkc_copy(ch->lfd, (size_t)(i - lo) * 3 * D, ch->tmp, (size_t)(n - 1) * D, D);
             VkcEw add = {VKC_EW_ADD, n * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+            if (c->muse) {   /* Muse Spark: the branch normalised, then the residual gate */
+                VkcNorm pn = {n, D, 1, 0, D, D, 0, D, D, 0, 0, VKC_NORM_NOW, c->post_eps, 1.f};
+                VkcEw g = {VKC_EW_RESGATE, n * D, D, 1, 0, 1, 0, 0, 0, (int)ch->o_ra[i] + D, (int)ch->o_ra[i], 1.f};
+                ok = ok && vkc_norm(ch->tmp, ch->prm, ch->tmp, &pn) && vkc_ew(ch->x, ch->x, ch->tmp, ch->prm, ch->prm, &g);
+            } else
             ok = ok && vkc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
             if (ok && lf) ok = vkc_copy(ch->lfd, ((size_t)(i - lo) * 3 + 1) * D, ch->x, (size_t)(n - 1) * D, D);
             ok = ok && q36c_norm(ch->x, 0, ch->prm, ch->o_post[i], ch->h2, 0, n, D, c->eps);
-            if (ok && E > 0 && dmoe && vkc_dmoe_on(&ch->dm, i)) {   /* everything here, and on to the next layer */
+            const int routed_l = E > 0 && !q36_dense_l(c, i);   /* a Flint dense layer: its MLP only */
+            if (ok && routed_l && dmoe && vkc_dmoe_on(&ch->dm, i)) {   /* everything here, and on to the next layer */
                 int ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1;
-                VkcRoute rp = {.kind = 0, .n_group = ng, .topk_group = ng > 1 ? c->topk_group : 1, .norm = 1, .temp = 1.f, .scale = 1.f};
+                VkcRoute rp = {.kind = c->router_sigmoid ? 1 : 0, .n_group = ng, .topk_group = ng > 1 ? c->topk_group : 1,
+                               .norm = 1, .temp = 1.f, .scale = 1.f};
                 VkcMoe mp = {.D = D, .I = c->inter, .act = 0, .blocks = g_gguf};
                 ok = vkc_matmul(vk_qw_tensor(&l->gate), ch->h2, 0, ch->lg, 0, n) && q36c_shared(ch, m, l, i, n) &&
                      vkc_dmoe_layer(&ch->dm, i, n, ch->lg, NULL, ch->h2, &rp, &mp);
@@ -946,9 +1096,14 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
                 if (ok && i + 1 < hi) ok = vkc_layer_recorded(&sent);   /* the device starts on these layers */
                 continue;
             }
-            if (ok && E > 0) {
-                ok = vkc_matmul(vk_qw_tensor(&l->gate), ch->h2, 0, ch->lg, 0, n) &&
-                     vkc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && vkc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D);
+            if (ok && routed_l) {
+                ok = vkc_matmul(vk_qw_tensor(&l->gate), ch->h2, 0, ch->lg, 0, n) && vkc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E);
+                if (c->muse) {   /* Muse Spark: the experts read the rows at their width, normalised */
+                    VkcNorm pn = {n, q36_eh(c), 1, 0, q36_eh(c), q36_eh(c), 0, q36_eh(c), q36_eh(c), (int)ch->o_pre[i], 0, VKC_NORM_ADD1, c->eps, 1.f};
+                    ok = ok && vkc_matmul(vk_qw_tensor(&l->lat_d), ch->h2, 0, ch->lat, 0, n) && vkc_norm(ch->lat, ch->prm, ch->lat, &pn) &&
+                         vkc_copy(ch->latd, 0, ch->lat, 0, (size_t)n * q36_eh(c));
+                } else
+                ok = ok && vkc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D);
                 double t0 = tm_now();
                 /* A1; while it runs, the tier loads the experts this layer will likely
                  * stream (a big prompt chunk only) */
@@ -964,8 +1119,8 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
                 ok = vkc_begin() && q36c_shared(ch, m, l, i, n) && vkc_submit(0);
                 ch->frames++;
                 double t1 = tm_now();
-                moe_ex(m, l, i, (float *)vkc_ptr(ch->h2d), n, ch->host_routed, (const float *)vkc_ptr(ch->lgd), 1);
-                memcpy(vkc_ptr(ch->routed), ch->host_routed, (size_t)n * D * sizeof(float));
+                moe_ex(m, l, i, (float *)vkc_ptr(c->muse ? ch->latd : ch->h2d), n, ch->host_routed, (const float *)vkc_ptr(ch->lgd), 1);
+                memcpy(vkc_ptr(ch->routed), ch->host_routed, (size_t)n * q36_eh(c) * sizeof(float));
                 double t2 = tm_now();
                 tm_add(n, 2, t2 - t1); ch->host_ms += t2 - t1;
                 ok = ok && vkc_begin();
@@ -996,7 +1151,11 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
         ok = ok && vkc_submit(1);
         ch->frames++; ch->wait_ms += tm_now() - t0;
         if (!ok) goto lost;
-        if (E == 0) for (int i = lo; i < hi; i++) q36c_kv_down(ch, m, i, n, pb);   /* a dense model reads its K/V rows back here */
+        /* A dense model reads its K/V rows back here, and so does a Flint dense layer (its MLP
+         * only, layers 0 and 1): no expert step ends its frame. Without it the host's rows of
+         * those layers stayed unwritten, and the first turn to grow the cache mirrored them
+         * back to the device: a continued agent turn answered "!!!!" (NaN). */
+        for (int i = lo; i < hi; i++) if (E == 0 || q36_dense_l(c, i)) q36c_kv_down(ch, m, i, n, pb);
         if (dmoe) q36c_dmoe_done(ch, m, from, hi, n, pb);
         if (want_x) memcpy(xh + (size_t)c0 * D, vkc_ptr(ch->xd), (size_t)n * D * sizeof(float));
         for (int i = lo; i < hi; i++) if (c->is_attn[i]) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, ch->attn_ord[i], pb + n); }

@@ -6,6 +6,8 @@ That includes cards the vendor stacks have dropped (ROCm 7 removed Polaris:
 an RX 580 runs here via RADV) and, measured on an RX 9070 (RDNA4), it is
 *faster* than the ROCm/HIP backend on the same card.
 
+The same models on the CPU, Vulkan and CUDA, one machine and one build: [gpu-parity.md](gpu-parity.md).
+
 ```bash
 cd c
 make glm VK=1                # needs the Vulkan headers + glslc (shaderc) for the shaders
@@ -88,7 +90,7 @@ $env:SNAP = "$env:TEMP\vkprobe"; $env:COLI_VULKAN = "1"; $env:COLI_NO_OMP_TUNE =
 |---|---|---|
 | Routed experts | on with `COLI_VULKAN=1` (`COLI_VK_TIER=0` turns it off) | The shared routed-expert tier ([below](#the-routed-expert-tier-vk_tierc)): warm from `.coli_usage` at startup, then adapting while you chat, under a budget (`COLI_VK_TIER_GB`). The resident experts of each MoE step, prefill included, run as one async batch while the CPU loads and computes the others; they need **no RAM slot and no disk read**. Shown as the `vk` bucket in the hit-rate line, and in a `[VK] tier colibri run:` line at exit. `COLI_VK_EXPERTS=N`, the fixed top-N set this engine used to upload, is a deprecated alias: N caps the tier at N experts, `0` turns it off. |
 | Dense projections | `COLI_VK_DENSE=1` | q_a+kv_a fused into one submit, q_b, o; shared expert as a single fused expert-group submit. Resident int4/int8 weights upload once. |
-| MLA attention core | `COLI_VK_ATTN=1` | One dispatch per layer: absorbed query, scores over the KV window, softmax, weighted latent, value rows, **fused with the o-projection** (the context vector never leaves the GPU). The latent/rope KV lives in a persistent per-layer device mirror, appended ~2.3 KB/token/layer with the same invalidation points as the CUDA KV shadow. |
+| MLA attention core | `COLI_VK_ATTN=1` | One dispatch per layer: absorbed query, scores over the KV window, softmax, weighted latent, value rows, **fused with the o-projection** (the context vector never leaves the GPU). The latent/rope KV lives in a persistent per-layer device mirror, appended ~2.3 KB/token/layer with the same invalidation points as the CUDA KV shadow. The mirror grows with the conversation (256 rows a layer, then powers of two up to the context), filled again from the host when it grows; a layer the device has no room for computes its attention on the CPU, and one line says so. |
 
 The `PIN_GB=0` (with `PIN` still set) in the example is deliberate: the expert
 tier warms from the same history a RAM pin would, so the pin's RAM is better
@@ -979,7 +981,9 @@ fixed set it replaces served S <= 4 only.
   deprecated alias: `N` caps the tier at N experts, `0` turns it off as `COLI_VK_TIER=0`
   does, and a line says so. `COLI_VK_RESERVE_GB` (the old reserve, 3 GB) adds what it
   asks beyond `COLI_VK_TIER_RESERVE_GB`. With `COLI_VK_ATTN=1` the absorb core's KV
-  mirror (`CTX` rows a layer) is reserved too. The dense set (`COLI_VK_DENSE=1`) is
+  mirror (`CTX` rows a layer) is reserved too, at most half of what the device has free:
+  the gateway's automatic context (131072 tokens on a large RAM) asked GLM-5.3 for 23.6 GB
+  of mirror on a 24 GB card and left the tier no expert (#2314). The dense set (`COLI_VK_DENSE=1`) is
   uploaded before the tier sizes itself, so the budget is what remains; the trunk's
   default here stays off. On an integrated GPU the tier takes its default share of RAM
   after the expert cache's (the startup reservation of the fixed set is gone).
@@ -1144,7 +1148,8 @@ integrated GPU that made the dense part slower on the device than on the CPU (se
 command buffer instead, and keeps the residual stream on the device from one layer
 to the next. qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) and qwen38 (Qwen3.8 Flash
 Next) run it: by default on a discrete GPU, and for qwen36 on an integrated one with
-the expert tier (see [the default](#the-chain-on-a-radeon-780m)); `COLI_VK_CHAIN=1`
+the expert tier, and for qwen38 on one with 32 or more compute units too (see [the
+default](#the-chain-on-a-radeon-780m)); `COLI_VK_CHAIN=1`
 anywhere. `COLI_VK_DENSE=0` keeps it off too, unless `COLI_VK_CHAIN` says otherwise: the
 chain's copy of the trunk would take the expert tier's budget (on an 8 GB RTX 4070
 Laptop with qwen38, disk-bound, the tier got 1.87 GiB instead of 6.00 and decode went
@@ -1297,7 +1302,7 @@ f32 throughout, as the CPU's f32 path.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `COLI_VK_CHAIN` | on for a discrete GPU; on an integrated GPU with the expert tier, what the engine measured (qwen36 and olmoe on, qwen38 off; mimo, inkling, colibri, glm53, kimi_k3, deepseek_v41 and deepseek_v4 off: not measured); off on a CPU device | `1`: every layer's dense chain on the device; `2`: prompts only (forwards of more than two rows that are not a speculative verify; decode and verifies on the per-matrix path, the state moving between the two); `0`: the per-matrix path. The `[VK] <engine>: dense chain ...` line says which and why. |
+| `COLI_VK_CHAIN` | on for a discrete GPU; on an integrated GPU with the expert tier, what the engine measured (qwen36 and olmoe on, qwen38 on with 32 or more compute units and off with fewer; mimo, inkling, colibri, glm53, kimi_k3, deepseek_v41 and deepseek_v4 off: not measured); off on a CPU device | `1`: every layer's dense chain on the device; `2`: prompts only (forwards of more than two rows that are not a speculative verify; decode and verifies on the per-matrix path, the state moving between the two); `0`: the per-matrix path. The `[VK] <engine>: dense chain ...` line says which and why. |
 | `COLI_VK_CHAIN_ROWS` | from the budget, up to 8192 | Prompt rows per chunk: a longer prompt runs every layer chunk by chunk (the device's scratch is sized for one chunk). Unset or `auto`: the most rows whose buffers fit half the free device memory, up to `COLI_VK_CHAIN_ROWS_MAX` (8192); see [big prompt chunks](#big-prompt-chunks-and-expert-streaming). It was 512 before. |
 | `COLI_VK_CHAIN_LAYERS` | what fits | The engines on [the partial chain](#a-partial-chain): the first N layers on the device, the CPU the rest and the head. Unset or `auto`: the most layers the device's free memory holds (every layer when they fit, the chain as before); `n`: n layers; `0`: the chain off. |
 | `COLI_VK_CHAIN_FLASH` | `16` | Rows from which a forward's plain causal attention runs on the matrix units (`chain_attn_flash.comp`: query heads of one kv head folded into 16-row tiles, K/V staged once per block as f16, two passes); `0` never. Needs cooperative matrices at subgroup size 64 or 32 (at 32 the first four of the workgroup's eight subgroups take the matrix work, all of them stage and run the softmax); otherwise, and for a selection list, a window, a ring or a sink, the blocked shader or `chain_attn.comp`. On a Radeon 8060S (Qwen3.6, 1011-token prompt) the attention went from 186 ms (`chain_attnb`) to 22 ms, the first token from 2.08 to 1.85 s, perplexity unchanged (7.65). On an RTX PRO 4000 (Qwen3.6 int4-g64, 467-token prompt) the prefill went from 1413-1477 to 1521-1580 tok/s. |
@@ -1380,15 +1385,39 @@ What the numbers say:
 
 **The default** (`coli_vk_chain_decide`, next to `coli_vk_dense_decide`): on a discrete
 GPU the chain is on. On an integrated GPU with the expert tier on, each engine passes
-what it measured here: qwen36 on, qwen38 off (decode, a chat's steady state, is slower
-in both modes; `COLI_VK_CHAIN=2` is the choice for long prompts). Without the tier, and
-on a CPU device such as Lavapipe, it is off. An engine not timed on an integrated GPU
-passes `COLI_VK_CHAIN_UNMEASURED`: off there, and the line says "not measured". The
-startup line says which and why:
+what it measured here: qwen36 on, qwen38 off with fewer than 32 compute units (decode, a
+chat's steady state, is slower in both modes; `COLI_VK_CHAIN=2` is the choice for long
+prompts) and on with 32 or more. Without the tier, and on a CPU device such as Lavapipe, it
+is off. An engine not timed on an integrated GPU passes `COLI_VK_CHAIN_UNMEASURED`: off
+there, and the line says "not measured". The startup line says which and why:
 
 ```
 [VK] qwen36: dense chain on (an integrated GPU with the expert tier: measured faster on decode and prefill; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only)
 ```
+
+**Compute units.** An integrated GPU reports its active compute units in
+`VK_AMD_shader_core_properties2`. From 32 units on, qwen38 turns the chain on by default. With
+the MTP head on beside the chain and the expert tier, qwen38 also drafts one token per verify
+and gives the expert cache of the head a slot for every expert. The tier reserves RAM for that
+cache. `Q38_MTP_DRAFTS` and `Q38_MTP_CAP` set either. A chain that holds every layer leaves the
+head off unless `Q38_MTP=1` asks for it ([speculative.md](speculative.md)). `coli plan` reads
+the units through the Vulkan loader. Where only `vulkaninfo` is available, it warns and prices
+fewer than 32 units.
+
+A verify of two drafts is three rows and took 1.67 times a one-row forward, against 1.22 for
+one draft. It returned 2.20 tokens per forward against 1.76. A cache of 32 slots misses the FP8
+experts of the head, which are then read from disk on every draft (2,707 to 3,111 loads a run
+against 614 with a slot for every expert). Qwen3.8 Flash Next with the int4-g64 sidecar on a Radeon 8060S (40 compute
+units), `COLI_VULKAN=1`, the head's layer on the CPU (`Q38_MTP_CHAIN=0` keeps it there), an 84-token prompt and 300 new
+tokens, greedy, single runs:
+
+| Arm | tok/s |
+|---|---|
+| trunk on the CPU, 2 drafts, head cache 32 | 8.3 |
+| chain on, 2 drafts, head cache 32 | 17.4 |
+| chain on, 1 draft, head cache 32 | 19.8 |
+| chain on, 2 drafts, head cache 512 | 20.0 |
+| chain on, 1 draft, head cache 512 | 22.2 to 23.4 |
 
 **What was not measured.** No discrete GPU was available. On one the trunk sits in
 VRAM, read at several times the CPU's bandwidth, the clock is not held at a floor
@@ -2273,6 +2302,12 @@ every expert on the card:
 
 The int4-g64 row's teacher-forced loss after a 600-token prompt (125 tokens scored,
 `PPL=1`) is 3.2181 nats a token either way.
+
+Measured again on the same card once the matrix units ran at subgroups of 32 and the
+frame took the experts' grouped GEMMs, two series alternated, the same 467-token prompt and
+every expert on the card: colibri's int4-g64 container 1796-1902 tok/s of prefill and
+83.8-84.6 of decode, the GGUF Q4_K_M 1412-1556 and 73.7-81.9. Our container (22 GB) now leads
+the GGUF (21 GB) in both phases.
 
 The matrix units at subgroups of 32 then took the same prompt further, each step started
 on its own server twice, three runs a start (prefill / decode):
@@ -3208,14 +3243,24 @@ in short:
 
 Resident data (the dense weights, the routed-expert tier, the MLA KV mirror) is written
 by the host once and read by the device for the rest of the run. The mapped path puts it
-in the HOST_VISIBLE|DEVICE_LOCAL memory type and writes it through a mapping. On an
-integrated GPU, a CPU device (Lavapipe) or a discrete card with Resizable BAR, that type
-covers the device's memory. A discrete card without Resizable BAR (every Turing card,
-every Ampere card on its launch VBIOS, older AMD cards with the option off) exposes it
-as a window of about 256 MB of 8 GB or more. NVIDIA's driver refuses allocations past the
-window: on an RTX 3070 with its launch VBIOS the backend warned "only 246 of 8192 MB VRAM
-is host-visible", placed no matrix, every tier upload failed and the chain stopped at its
-first matrix. RADV places them in system RAM instead, where every access crosses PCIe.
+in the memory type for what the CPU writes (HOST_VISIBLE|DEVICE_LOCAL, or system memory
+on an integrated GPU) and writes it through a mapping. On an integrated GPU, a CPU device
+(Lavapipe) or a discrete card with Resizable BAR, that type covers the device's memory. A
+discrete card without Resizable BAR (every Turing card, every Ampere card on its launch
+VBIOS, older AMD cards with the option off) exposes it as a window of about 256 MB of 8 GB
+or more. NVIDIA's driver refuses allocations past the window: on an RTX 3070 with its
+launch VBIOS the backend warned "only 246 of 8192 MB VRAM is host-visible", placed no
+matrix, every tier upload failed and the chain stopped at its first matrix. RADV places
+them in system RAM instead, where every access crosses PCIe.
+
+**Memory types by use.** The backend chooses the memory type of a buffer by what the buffer
+is used for: only the GPU uses it, the CPU writes it, or the CPU reads it back. A discrete
+GPU and Lavapipe get device-local memory where the use allows it, and a host-cached type
+for what the CPU reads back. An integrated GPU with a heap of system memory gets
+host-visible system memory for all three uses, so no buffer is placed in the VRAM
+carve-out reserved by the BIOS. An allocation that runs out of memory there is retried in a
+device-local type. `COLI_VK_DEVICE_CAP_MB`, the budget and the expert batch count the
+device memory: the device-local heaps, and every heap of an integrated GPU.
 
 **Staged uploads** put resident data in a DEVICE_LOCAL memory type the host does not map
 and copy it there from a host staging buffer with `vkCmdCopyBuffer`.
@@ -3558,7 +3603,7 @@ predict a layer more than the engine places.
 | deepseek_v41 | the hc_mult streams and the last site's mix; the candidate mask and the published index list a chain layer made for the CPU's layers; DSpark's target means from whichever side ran them | yes |
 | kimi_k3 | the AttnRes prefix, the block snapshots and their count; with every layer but not the head, the final rows for the CPU's head | yes |
 
-**`COLI_VK_DEVICE_CAP_MB=n`** (tests) makes the device hold at most n MiB of device-local
+**`COLI_VK_DEVICE_CAP_MB=n`** (tests) limits the device to n MiB of device
 memory (a fraction is taken): every allocation of the backend and the chain (tensors, the
 tier's pool, the chain's buffers, staging, the second device's) is counted, one past the
 cap fails as out of device memory would, and every budget the engines read reports the cap.

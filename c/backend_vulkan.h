@@ -10,7 +10,7 @@ extern "C" {
 
 /* Opaque persistent device copy of one resident quantized tensor,
  * mirroring backend_cuda.h. On Strix Halo the "upload" writes into
- * HOST_VISIBLE|DEVICE_LOCAL memory — same physical RAM the iGPU reads,
+ * host-visible memory (vk_memtype.h) — same physical RAM the iGPU reads,
  * so there is no PCIe copy, unlike the discrete-CUDA path. */
 typedef struct ColiVkTensor ColiVkTensor;
 
@@ -47,22 +47,22 @@ double coli_vk_profile_plan_gb(void);             /* the resolved preset's plan 
  * (VK_EXT_memory_priority; scratches and the KV mirror pin themselves at 1.0) —
  * the engine brackets the bulk expert-tier fill at 0.4 so an oversubscribed heap
  * evicts cold experts, never the per-token attention working set.
- * mem_budget reports device-local usage/budget in GB (VK_EXT_memory_budget);
+ * mem_budget reports usage/budget of the device memory in GB (VK_EXT_memory_budget);
  * returns 0 if unavailable. */
 void coli_vk_alloc_priority(float p);
 int  coli_vk_mem_budget(double *used_gb, double *budget_gb);
 
 /* Device memory books (docs/vulkan.md, "A partial chain"). Every device memory allocation
- * of the backend and of the chain is counted per device when its heap is device-local.
- * COLI_VK_DEVICE_CAP_MB=n (tests; n may be a fraction) makes the device hold at most n MiB:
+ * of the backend and of the chain is counted per device when it comes from device memory.
+ * COLI_VK_DEVICE_CAP_MB=n (tests; n may be a fraction) limits the device to n MiB:
  * an allocation past it fails as out of device memory, and coli_vk_mem_budget (and
  * _budget2, coli_vk_free_bytes, coli_vk_device_local_bytes) report the cap and this
  * process's bytes, so a CPU device behaves like a small card.
  *   coli_vk_device_cap      the cap in bytes (0: none)
- *   coli_vk_device_used     device-local bytes this process holds on the device
+ *   coli_vk_device_used     bytes of device memory this process has allocated on the device
  *   coli_vk_free_bytes      free device memory now: the cap less what is held, else the
- *                           budget less its usage (VK_EXT_memory_budget), else the largest
- *                           device-local heap less what is held
+ *                           budget less its usage (VK_EXT_memory_budget), else the size of
+ *                           the device memory less what is held
  *   coli_vk_block_bytes     the block size a memory pool of `def` bytes takes (smaller
  *                           under the cap, at most about 4096 blocks to fill it)
  *   coli_vk_mem_alloc/free  vkAllocateMemory / vkFreeMemory through the books (vk_chain.c):
@@ -161,12 +161,15 @@ int  coli_vk_expert_group2(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
 
 /* MLA absorb attention core (decode). The KV latent/rope caches live in persistent
  * per-layer device buffers: _ensure allocates a layer's cache at max_rows (once; resize
- * via _reset), _row mirrors one host row (absolute position), _reset drops all layers.
+ * via _reset); _grow gives it room for `need` rows, growing in powers of two up to
+ * max_rows (1: it had them, 2: a new buffer, its rows to mirror again from 0, 0: no room
+ * on the device); _row mirrors one host row (absolute position), _reset drops all layers.
  * The caller keeps a valid-watermark and re-mirrors rows after any invalidation.
  * absorb runs S causal query rows over cache rows [st0, T) in one submit:
  * q [S,H*(Q+R)] roped, kv_b [H*(Q+V), K] uploads once (fmt 1=int8/2=int4),
  * ctx out [S,H*V]. Returns 0 -> caller falls back to CPU. */
 int  coli_vk_kv_ensure(int layer, int max_rows, int K, int Rd);
+int  coli_vk_kv_grow(int layer, int need, int max_rows, int K, int Rd);
 int  coli_vk_kv_row(int layer, int pos, const float *L, const float *R);
 void coli_vk_kv_reset(void);
 int  coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc, int fmt, int grp,
@@ -439,6 +442,9 @@ void coli_vk_xb_stats_dev(int dev, ColiVkXbStats *st);
 /* 1 if the selected device is an integrated GPU (shares physical memory with
  * the host), 0 otherwise or when no device is selected. */
 int coli_vk_device_integrated(void);
+/* 1 if the selected device is an integrated GPU with many active compute units
+ * (COLI_VK_IGPU_MANY_CU, vk_igpu_threshold.h), 0 otherwise or when it reports none. */
+int coli_vk_device_igpu_many_cu(void);
 /* 1 for an integrated GPU or a CPU device (Lavapipe): device memory is host RAM. */
 int coli_vk_device_shares_ram(void);
 /* VK_KHR_shader_integer_dot_product on the primary device: 0 none, 1 supported, 2 with
@@ -451,7 +457,7 @@ int coli_vk_timeline(void);
 const void *coli_vk_tensor_host_rows(const ColiVkTensor *t, const void **scales);
 /* An expert's three tensors (gate, up, down), for coli_vk_tensor_host_rows. */
 void coli_vk_xb_expert_tensors(const ColiVkExpert *e, ColiVkTensor **g, ColiVkTensor **u, ColiVkTensor **d);
-/* The largest DEVICE_LOCAL heap in bytes (for a budget without VK_EXT_memory_budget). */
+/* The size of the device memory in bytes (for a budget without VK_EXT_memory_budget). */
 size_t coli_vk_device_local_bytes(void);
 const char *coli_vk_device_name(void);
 

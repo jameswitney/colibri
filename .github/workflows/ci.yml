@@ -170,6 +170,10 @@ jobs:
           # choose staging on its own; then the formats, the tier and the chain's ops staged.
           bash tests/vulkan_engines.sh staged
           COLI_VK_STAGED=1 bash tests/vulkan_engines.sh shader
+      - name: Memory types and budgets against tables
+        run: |
+          cd c
+          make vk-memtype-check VK=1
 
   # Every engine with a Vulkan hook, run twice on its tiny fixture: on the CPU and on
   # Lavapipe, with the same snapshot and settings. The gate is the CPU's tokens (and
@@ -766,6 +770,10 @@ jobs:
           gcc -fsyntax-only -DCOLI_CUDA -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-unused-function cu_tier.c
           gcc -fsyntax-only -D_GNU_SOURCE -DCOLI_CUDA -fopenmp -pthread -include pthread.h -Wall -Wextra \
             -Wno-unused-parameter -Wno-unused-function -Wno-misleading-indentation deepseek_v4.c
+          for f in kimi_k3.c glm53.c deepseek_v41.c mimo.c; do
+            gcc -fsyntax-only -DCOLI_CUDA -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+              -Wno-misleading-indentation $f
+          done
           echo "CUDA tier syntax check passed"
       - name: Compile backend_cuda_ink.cu (syntax only, no GPU)
         run: |
@@ -1610,6 +1618,10 @@ jobs:
           cd c
           python3 tools/make_qwenimage_vae_tiny.py qwenimage_vae_tiny
           tests/test_qwenimage_vae qwenimage_vae_tiny
+      - name: Single-frame VAE encoder against diffusers, normal and ASan/UBSan
+        run: |
+          make -C c qwenimage-encoder-check
+          python3 c/tools/check_qwenimage_encoder.py --sanitizers
       - name: The shipping defaults (int8 weights) end to end, and the serve protocol
         run: |
           cd c
@@ -1717,6 +1729,16 @@ jobs:
           SNAP=./glm_tiny COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16
       - name: Oracle allowance and failure regressions
         run: cd c && python3 tests/test_glm_oracle.py
+      - name: The MTP head under the draft gate (docs/speculative.md)
+        # Greedy stays exact whatever the gate picks (a draft is only ever verified),
+        # with the gate deciding from measured times and with every draft carried.
+        run: |
+          cd c
+          python3 tools/make_glm_mtp_tiny.py --src glm_tiny --out glm_tiny_mtp
+          cp ref_glm.json glm_tiny_mtp/
+          for g in COLI_SPEC_GATE=1 COLI_SPEC_GATE=0; do
+            env $g SNAP=./glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json COLI_TEMP=0 ORACLE_STRICT=1 DRAFT=2 ./colibri 64 16 16
+          done
       - name: Structural efficiency tests
         # test_cpu_vs_cpu_tok_s_stability is NOT in this list: it is a tok/s
         # bound (two runs within 25%) over a ~15 ms tiny replay -- it measured
