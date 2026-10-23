@@ -7,6 +7,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `COLI_VK_DMOE` + `COLI_VK_DMOE_ROWS` (DeepSeek V4's chain): the L2 Stage A
+  wiring — DeepSeek V4 joins `vk_dmoe.h`, the shape upstream's own MoE engines
+  (olmoe, qwen36, qwen38) already have. `COLI_VK_DMOE=n` (default `0`, changing
+  nothing) arms one non-hash layer on the primary device: a step of up to 8 rows
+  (decode, a short verify) whose tier holds all of that layer's experts routes
+  and computes its routed experts in the dense chain's frame — the gate logits
+  (`ffn.gate.weight`, the chain's GEMV) and the router through `vkc_route` with
+  `route_bf16_impl`'s exact parameters (sqrt(softplus), the gate bias for the
+  pick only, the weights score/sum x `routed_scaling_factor`, no eps), the
+  experts through `vkc_dmoe_prepare/on/layer`, the shared expert recorded beside
+  them, no wait and no host step at that layer, the join taking `dm.y`, the
+  tier's books (`vkt_dev_count`) from the ids after the frame, and
+  `vkc_dmoe_upload` at every frame start (after each host layer too — the epoch
+  discipline, a layer the host steps through may evict what an in-flight
+  frame's table names). A layer the tier does not hold whole keeps the host's
+  step (the exit report says so whatever the run did), as do hash layers
+  (`vkc_route` cannot express their token table), the second device and
+  `COLI_VK_CHAIN_MOE=0`; the arm's parse runs before any `vkc_dmoe_*` call, so
+  unset arms nothing and reserves nothing. `COLI_VK_DMOE_ROWS=1` (default `0`)
+  lifts the 8-row cap through `vkc_moe_rows`' fmt-7 grouped GEMMs — the same
+  chunking invariant `COLI_VK_CHAIN_GEMM_ROWS` documents, so it stays opt-in;
+  the tier's `COLI_VK_TIER_PIN_LAYER` (0c6ddae2) is the arm's residency
+  scaffolding. The experts' weighted sum is `chain_moe.comp`'s rank order
+  against the CPU block's ascending expert id — the chain's float-reassociation
+  class, gated by the token-exact oracle, not bit equality. Measured on the
+  whole-layer pin variant: **a negative** — a 3.75 GiB all-or-nothing layer
+  strangled prefetch and doubled TTFT on 16 GiB (prefetch 12,644->1,890,
+  `docs/HANDOVER-2026-10-23.md` 2.3; the disk-load figures live only in the
+  `98fcee51` message), so this lands as wiring and alignment, not a TTFT claim;
+  the pool-placed lever (Stage C) is untried. New gate
+  `make VK=1 deepseek-v4-tiny-check-dmoe` = the tiny check with the arm on
+  (layer 1, and the chunk path for the 72-token case), token-exact; the tier's
+  test gains the pin lever's plan/table row and the chain's gains `COLI_VK_DMOE`'s
+  parse cases and V4's kind-2 router shape against the reference arithmetic.
 - `vkc_moe_rows` takes fmt 7 (MXFP4): a prompt chunk's routed experts in the
   tier's native format, through `qmatmul_grp_mx.comp` (the expert batch's
   mode-4 GEMM, in floats — no matrix-unit variant exists for it) beside the

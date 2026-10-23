@@ -837,7 +837,7 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 		--fixture ./kimi_k3_tiny
 
 .PHONY: deepseek-v4 deepseek_v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
-	deepseek-v4-tiny-check deepseek-v4-clean
+	deepseek-v4-tiny-check deepseek-v4-tiny-check-dmoe deepseek-v4-clean
 ifeq ($(COLI_V4_SUPPORTED),1)
 # Every shader the other engines build (VK_SPV, empty without VK=1): backend_vulkan.c
 # looks for them at run time and goes without one that is not there, and
@@ -870,6 +870,31 @@ deepseek-v4-tiny-check: deepseek-v4-tiny-generate
 		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
 		--fixture $(CURDIR)/deepseek_v4_tiny
 
+# COLI_VK_DMOE's own gate (the L2 Stage A wiring, specs/L2-chain-moe-vkdmoe.md section
+# 5.3): the tiny check with the arm on -- the same three harnesses, the same token-exact
+# oracle, one non-hash layer's routed experts in the frame instead of the host's step.
+# Layer 1 (layer 0 is the fixture's hash layer, which vkc_route cannot express), VK=1
+# because the arm is the device's, and the tier's 12 experts of the fixture all resident
+# so the all-or-nothing gate passes. The arm's numerics are chain_moe.comp's rank order
+# against the CPU block's ascending expert id -- a float-reassociation class, so the gate
+# is the token-exact oracle, not bit equality; the pre-registered fallback if that ever
+# breaks (max |dlogit| <= 1e-3*max(1,|logit|) on the first-token logits and >= 32 greedy
+# tokens equal, as a new expectations file) is in the spec, not silently widened here.
+# COLI_VK_DMOE_ROWS=1 adds the prompt-chunk path (chain_moe_rows.comp's grouped GEMMs);
+# the long case's 72-token prompt crosses the chunk boundary, so both paths run.
+deepseek-v4-tiny-check-dmoe: deepseek-v4-tiny-generate
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) VK=1 deepseek-v4
+	COLI_VULKAN=1 COLI_VK_DMOE=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_DMOE=1 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_DMOE=1 COLI_VK_DMOE_ROWS=1 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+
 deepseek-v4-oracle: deepseek-v4
 	@test -n "$(MODEL)" || { echo "usage: make deepseek-v4-oracle MODEL=/path/to/checkpoint" >&2; exit 2; }
 	$(PYTHON) tools/make_deepseek_v4_oracle.py --model "$(MODEL)" \
@@ -887,6 +912,8 @@ deepseek-v4-clean:
 	@:
 deepseek-v4-tiny-check:
 	@echo "SKIP deepseek-v4-tiny-check: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
+deepseek-v4-tiny-check-dmoe:
+	@echo "SKIP deepseek-v4-tiny-check-dmoe: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
 deepseek-v4-tiny-generate:
 	@echo "SKIP deepseek-v4-tiny-generate: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
 endif
@@ -3363,7 +3390,7 @@ clean:
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
 .PHONY: all deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
-	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
+	deepseek-v4-tiny-generate deepseek-v4-tiny-check deepseek-v4-tiny-check-dmoe \
 	qwen38-tiny-generate qwen38-tiny-check \
 	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench cuda-dll hip-dll portable \
 	test-c test-python test check clean install uninstall bench
