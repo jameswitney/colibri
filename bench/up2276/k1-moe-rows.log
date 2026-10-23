@@ -1,0 +1,23 @@
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] ready: AMD Radeon RX 6900 XT (RADV NAVI21), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096
+K1: fmt 7 gs 32, E 256 K 6 D 4096 I 2048, a layer's experts 3.75 GiB, 48 layers a frame
+K1 S     1: routed ok=1
+K1 S     1: vkc_moe phase done (291.8 us/layer best)
+K1 S     1: vkc_moe_rows phase done (1313.0 us/layer best)
+K1 S     1: vkc_moe    291.8 us/layer, vkc_moe_rows   1313.0 us/layer, pair/rows  0.22x
+K1 S     8: routed ok=1
+K1 S     8: vkc_moe phase done (1653.8 us/layer best)
+K1 S     8: vkc_moe_rows phase done (8113.6 us/layer best)
+K1 S     8: vkc_moe   1653.8 us/layer, vkc_moe_rows   8113.6 us/layer, pair/rows  0.20x
+K1 S    64: routed ok=1
+K1 S    64: vkc_moe phase done (12218.4 us/layer best)
+K1 S    64: vkc_moe_rows phase done (35674.6 us/layer best)
+K1 S    64: vkc_moe  12218.4 us/layer, vkc_moe_rows  35674.6 us/layer, pair/rows  0.34x
+K1 S   128: routed ok=1
+K1 S   128: vkc_moe phase done (24307.1 us/layer best)
+K1 S   128: vkc_moe_rows phase done (43723.9 us/layer best)
+K1 S   128: vkc_moe  24307.1 us/layer, vkc_moe_rows  43723.9 us/layer, pair/rows  0.56x
+radv/amdgpu: The CS has been cancelled because the context is lost. This context is guilty of a hard recovery.
+[VK] chain: queue submit failed (-4): the device is lost
+K1 S   256: routed ok=0
+K1 S 256: a frame failed (moe not reached, rows not reached)
