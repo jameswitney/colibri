@@ -848,10 +848,28 @@ static int load_batch_cb(void *ctx, int layer, const int *eids, int n, VktExpert
     for (int i = 0; i < got; i++) { srcs[i] = src_of(&ex[layer][eids[i]]); h[i] = &ex[layer][eids[i]]; g_loads++; }
     return got;
 }
+/* The load-path contract's own hooks (stream_batch): a loader that counts its holds so a
+ * leak fails the test, and a batch reader that returns a cut prefix -- g_cut experts of
+ * the n asked, a partial batch whenever the group was bigger -- the way an engine whose
+ * reads run through a bounded pool of stage buffers must. */
+static int g_holds_live, g_cut = 1, g_cut_partial;
+static int load_live_cb(void *ctx, int layer, int eid, VktExpertSrc *src, void **h) {
+    (void)ctx; *src = src_of(&ex[layer][eid]); *h = &ex[layer][eid]; g_holds_live++; return 1;
+}
+static void release_live_cb(void *ctx, void *h) { (void)ctx; (void)h; g_holds_live--; }
+static int load_cut_cb(void *ctx, int layer, const int *eids, int n, VktExpertSrc *srcs, void **h) {
+    (void)ctx;
+    int got = n < g_cut ? n : g_cut;
+    if (got < n) g_cut_partial++;
+    for (int i = 0; i < got; i++) { srcs[i] = src_of(&ex[layer][eids[i]]); h[i] = &ex[layer][eids[i]]; g_holds_live++; }
+    return got;
+}
 /* One big step (vk_tier.h step 3, with the prefetch while "attention" runs); the device
- * rows of cold experts counted apart. */
+ * rows of cold experts counted apart. capture (optional) receives the step's output
+ * rows as they were summed, for the load-path tests' byte-exact comparisons. */
 static double stream_step(int layer, int S, const int *idx, const float *w, int v4, Books *bk,
-                          unsigned long long *streamed, unsigned long long *kept, int prefetch) {
+                          unsigned long long *streamed, unsigned long long *kept, int prefetch,
+                          float *capture) {
     float *x = calloc((size_t)S * H, sizeof(float)), *xq = calloc((size_t)S * H, sizeof(float));
     float *cpu = calloc((size_t)S * K * H, sizeof(float)), *out = calloc((size_t)S * H, sizeof(float));
     float *ref = calloc((size_t)S * H, sizeof(float)), *y = malloc(sizeof(float) * H);
@@ -891,6 +909,7 @@ static double stream_step(int layer, int S, const int *idx, const float *w, int 
         }
     double r = rel(out, ref, S * H);
     if (!(r <= worst)) worst = r;
+    if (capture) memcpy(capture, out, sizeof(float) * (size_t)S * H);
     if (getenv("VKT_TEST_DUMP") && n) fprintf(stderr, "dump: ref %g %g dev %g %g\n", ref[0], ref[1], out[0], out[1]);
     free(x); free(xq); free(cpu); free(out); free(ref); free(y); free(taken); free(dev); free(res);
     return worst;
@@ -938,7 +957,7 @@ static void stream(void) {
                 int S = Ss[t], idx[64 * K]; float w[64 * K];
                 route(S, 0, E, idx, w);
                 vkt_begin_forward();
-                double r = stream_step(l, S, idx, w, v4, &bk, &streamed, &kept, t >= 3);
+                double r = stream_step(l, S, idx, w, v4, &bk, &streamed, &kept, t >= 3, NULL);
                 if (r > worst) worst = r;
             }
         int same = 1;
@@ -1009,7 +1028,7 @@ static void layers(void) {
                     int S = Ss[mode / 2][t], idx[64 * K]; float w[64 * K];
                     route(S, 0, E, idx, w);
                     vkt_begin_forward();
-                    double r = mode == 2 ? stream_step(l, S, idx, w, 0, &bk, &streamed, &kept, 0) : step(l, S, idx, w, &bk);
+                    double r = mode == 2 ? stream_step(l, S, idx, w, 0, &bk, &streamed, &kept, 0, NULL) : step(l, S, idx, w, &bk);
                     if (!(r <= worst)) worst = r;
                 }
         for (int e = 0; e < E; e++) res1 += vkt_resident(mode == 1 ? 0 : 1, e);   /* the budget of four: layer 0's */
@@ -1052,6 +1071,71 @@ static void scratch_budget(void) {
 /* A failed multi-expert upload may have copied only one projection. None of
  * that group may run; its complete CPU replay must be exact. Reusing the same
  * staging slots on the next step must replace every matrix before publishing. */
+/* S1, the group reader's contract: a batch hook may return any prefix and cut a group
+ * anywhere, and whichever expert's bytes the tier asked for must land in that expert's
+ * slot -- so the same steps over the same model must give the same output rows with the
+ * serial loader and with batch loaders cut at one, two and four experts, byte for byte,
+ * and no hold may outlive the step that asked for it. */
+static void stream_batch(void) {
+    VktFmt f = {VKT_SRC_I4U_PAIRS_GS, 64};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    set_budget(16, f, f);
+    setenv("COLI_VK_TIER_RATE", "0", 1);
+    setenv("COLI_VK_TIER_STREAM_SLOTS", "8", 1);
+    setenv("COLI_VK_TIER_STREAM_ROWS", "3", 1);   /* a cold expert with 3 rows or more streams */
+    setenv("COLI_VK_TIER_FILL", "0", 1);          /* two warm a layer, the rest cold: what streams */
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    vc.load = load_live_cb; vc.release = release_live_cb;
+    uint32_t hist[L][E], *rows[L];
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = e < 2 ? 100 - e : 0; }
+    static const int Ss[] = {48, 33, 64, 40};
+    enum { T = sizeof Ss / sizeof *Ss };
+    float *refs[T * L] = {0};
+    int rows_of[T * L] = {0};
+    for (int mode = 0; mode < 4; mode++) {   /* the serial loader, then batches cut at 1, 2 and 3: the sub-batches hold 4 */
+        g_cut = mode ? mode : 1; g_holds_live = 0; g_cut_partial = 0;
+        vc.load_batch = mode ? load_cut_cb : NULL;
+        rng = 7;                     /* the same routing and the same inputs every mode */
+        int on = vkt_init(&vc, rows);
+        CHECK(on, "stream batch %d: the tier did not start", mode);
+        if (!on) break;
+        int pl[L * E], pe[L * E], np = vkt_plan(pl, pe, L * E);
+        for (int i = 0; i < np; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+        vkt_put_done();
+        unsigned long long streamed = 0;
+        float *mine[T * L];
+        int at = 0;
+        for (int t = 0; t < T; t++)
+            for (int l = 0; l < L; l++) {
+                int S = Ss[t], idx[64 * K]; float w[64 * K];
+                route(S, 0, E, idx, w);
+                vkt_begin_forward();
+                Books bk = {0, 0}; unsigned long long kept = 0;
+                mine[at] = malloc(sizeof(float) * (size_t)S * H);
+                rows_of[at] = S;
+                stream_step(l, S, idx, w, 0, &bk, &streamed, &kept, 0, mine[at]);
+                CHECK(g_holds_live == 0, "stream batch %d: %d holds outlive a step", mode, g_holds_live);
+                at++;
+            }
+        if (mode)
+            for (int i = 0; i < T * L; i++) {
+                CHECK(refs[i] && mine[i] &&
+                      memcmp(refs[i], mine[i], sizeof(float) * (size_t)rows_of[i] * H) == 0,
+                      "stream batch %d: step %d's rows differ from the serial load's", mode, i);
+                free(mine[i]);
+            }
+        else
+            for (int i = 0; i < T * L; i++) refs[i] = mine[i];
+        CHECK(streamed > 0, "stream batch %d: nothing streamed", mode);
+        if (mode) CHECK(g_cut_partial > 0, "stream batch %d: no partial batch was exercised", mode);
+        printf("  %s: %llu assignments streamed, %d partial batches\n", mode ? "cut" : "serial", streamed, g_cut_partial);
+        vkt_shutdown();
+    }
+    for (int i = 0; i < T * L; i++) free(refs[i]);
+    model_free();
+    unsetenv("COLI_VK_TIER_RATE"); unsetenv("COLI_VK_TIER_STREAM_SLOTS");
+    unsetenv("COLI_VK_TIER_STREAM_ROWS"); unsetenv("COLI_VK_TIER_FILL");
+}
 static void stream_commit_failure(const char *spv) {
     setenv("COLI_VK_STAGED", "1", 1);
     setenv("COLI_VK_STAGED_FAULT", "commit:1", 1);
@@ -1073,12 +1157,12 @@ static void stream_commit_failure(const char *spv) {
         int idx[S * K]; float w[S * K];
         for (int i = 0; i < S * K; i++) { idx[i] = i % 2; w[i] = 1.0f / K; }
         Books books = {0, 0}; unsigned long long streamed = 0, kept = 0;
-        double error = stream_step(0, S, idx, w, 0, &books, &streamed, &kept, 0);
+        double error = stream_step(0, S, idx, w, 0, &books, &streamed, &kept, 0, NULL);
         CHECK(books.dev == 0 && kept == S * K && error == 0,
               "stream fault: partial upload used (GPU %llu, CPU %llu, error %.3g)", books.dev, kept, error);
         books = (Books){0, 0}; streamed = kept = 0;
         vkt_begin_forward();
-        error = stream_step(0, S, idx, w, 0, &books, &streamed, &kept, 0);
+        error = stream_step(0, S, idx, w, 0, &books, &streamed, &kept, 0, NULL);
         CHECK(books.dev == S * K && !kept && error < 2e-3,
               "stream fault: refill did not recover (GPU %llu, CPU %llu, error %.3g)", books.dev, kept, error);
         puts("stream fault: whole group replayed on CPU, staging slots refilled correctly");
@@ -1813,7 +1897,7 @@ static void pool_copy_case(void) {
             for (int l = 0; l < L; l++) {
                 route(Ss[t], 0, E, idx, w);
                 vkt_begin_forward();
-                double r = stream_step(l, Ss[t], idx, w, 0, &bk, &streamed, &kept, 0);
+                double r = stream_step(l, Ss[t], idx, w, 0, &bk, &streamed, &kept, 0, NULL);
                 if (r > worst) worst = r;
             }
         char line[4096]; report_line(line, sizeof line);
@@ -2130,6 +2214,7 @@ int main(int argc, char **argv) {
     printf("hot set:\n"); hotset();
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
+    printf("stream batch:\n"); stream_batch();
     printf("layers:\n"); layers();
     printf("promote2:\n"); promote_partial_case();
     printf("promote:\n"); promote_case();
