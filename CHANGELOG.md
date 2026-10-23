@@ -7,6 +7,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `COLI_VK_TIER_STREAM_BYPASS` (DeepSeek V4): the stream fills' cache-bypassing
+  reads and the engine's parallel batch reader — the S1+S2 pair of the L1
+  byte-economy map (`docs/research/R-l1-byte-economy-map-2026-10-23.md`). The
+  tier's `load_batch` hook existed unused; the engine now fills it, reading a
+  group of up to 8 experts at once (the prewarm's parallel-lookup shape), and a
+  cold expert of a stream fill is read straight from the disk into a bounded
+  stage pool (8 x 16 MiB, 4096-aligned, process lifetime) through
+  `coli_v4_expert_store_read_private` — the warm start's reader, which takes no
+  lease, no LRU slot and no store counter — instead of through a lease, whose
+  every fill evicted a slot the decode hot set or the rows16 pins could have
+  kept (~192 GiB of one-shot experts a run through it; the store's hit rate
+  stays a real measure of service). An expert the store already holds is still
+  leased (a RAM hit beats the disk), `note_routed` keeps the `.coli_usage`
+  history whatever loaded the expert, a bypass read that fails falls back to
+  the lease, and the bytes are the lease path's bit for bit — so the arm is
+  numerics-identical, only which cache sees the bytes differs. Default `0`
+  wires no `load_batch` and changes no bit; the tier's run line now carries the
+  `R` it settled at (an arm that moves the load path moves `bw_up`, so `R`
+  moves with it — arms compare at the same `R`).
+- `COLI_VK_TIER_HOT`/`_SCOPE`/`_UPDATE`/`_HOT_HASH`: the routed-expert tier's
+  hot set — the history's top share of the resident places, ranked on the raw
+  `.coli_usage` counts (the same ranking the warm start uses, never the scaled
+  1..31 heat), marked on the slots and skipped by every victim path, so the
+  adaptive tail's promotions cannot churn the warm start's head. Default `0`
+  is byte-identical (the guards are pure skips); `COLI_VK_TIER_PIN_LAYER`, the
+  dmoe arm's lever, is the explicit form (a whole layer pinned and planned
+  first), and streaming's staging slots are clamped so they cannot eat the
+  frozen section. The tier's report line gains the pin count (`pins N (hot P%
+  of K resident places, scope, fixed or re-pinned)`) and a decode-only device
+  share (`decode: N of M routed experts on the device`) — the run-level `device
+  N of M` is dominated by a prompt's rows.
 - `COLI_VK_PROFILE`: one knob for the measured operating points. `RDNA2`, the
   headline value, is the hardware profile tuned on the RX 6900 XT and applies
   the stage-aware best set itself (a queued prompt of 1,000 tokens or more

@@ -13781,24 +13781,150 @@ static void v4_vkt_note(const ColiExpertView *view) {
 
 /* The tier's streaming (a big prompt chunk's cold experts on the device): an expert as
  * the store leases it (its RAM cache, else the disk), a pinned rows16 one unpacked to
- * rows as v4_vkt_note does, held until the tier has copied it. */
-typedef struct { ColiExpertView view; unsigned char *buffer; } V4VkHold;
-static int v4_vkt_load(void *ctx, int layer, int expert, VktExpertSrc *src, void **h) {
-    ColiExpertStore *store = ctx;
-    if (!v4_vkt_thread()) return 0;
-    V4VkHold *hold = calloc(1, sizeof *hold);
-    if (!hold) return 0;
-    if (coli_expert_lookup(store, (ColiExpertKey){layer, expert}, &hold->view)) { free(hold); return 0; }
-    if (v4_vkt_rows(&hold->view, src, &hold->buffer)) { coli_expert_release(store, &hold->view); free(hold); return 0; }
-    *h = hold;
+ * rows as v4_vkt_note does, held until the tier has copied it.
+ *
+ * The bypass (COLI_VK_TIER_STREAM_BYPASS=1, the S1+S2 pair): a cold expert is read
+ * straight from the disk into a bounded stage pool -- coli_v4_expert_store_read_private,
+ * the warm start's reader, which touches no lease, no LRU slot and no store counter --
+ * instead of through a lease, whose every fill evicts a slot of the store's cache that
+ * the decode hot set or the rows16 pins could have kept (the stream reads ~192 GiB of
+ * one-shot experts a run through it). An expert the store already holds is still leased
+ * (the RAM read is cheaper than the disk, and the hit keeps counting), and note_routed
+ * keeps the .coli_usage history whatever loaded the expert -- only a fill's own lookup
+ * is spared, and a routing's count was always the one that mattered. The pool is
+ * 8 x 16 MiB, 4096-aligned, made once and kept for the process; the engine thread
+ * alone hands buffers out (vkt_issue and vkt_stream_prefetch both fill on it) and
+ * release hands them back, so there is no lock. Without the flag the engine wires no
+ * load_batch and every fill leases exactly as before. Only BC_STREAM fills ever come
+ * through here: residents are never loaded, the warm start goes through vkt_put, and
+ * the CPU path leases on its own. */
+typedef struct { ColiExpertView view; unsigned char *buffer; int stage; } V4VkHold;
+enum { V4_VKT_STAGE_N = 8, V4_VKT_STAGE_CAP = 16u << 20 };
+static unsigned char *v4_vkt_stage[V4_VKT_STAGE_N];
+static unsigned char v4_vkt_stage_busy[V4_VKT_STAGE_N];
+static int v4_vkt_stage_state;   /* 0 not made, 1 ready, -1 unusable (record or memory) */
+static int v4_vkt_bypass;
+static int v4_vkt_stage_init(ColiExpertStore *store) {
+    if (v4_vkt_stage_state) return v4_vkt_stage_state > 0;
+    v4_vkt_stage_state = -1;
+    uint64_t record = coli_v4_expert_store_record_bytes(store);
+    if (!record || record + 8192u > V4_VKT_STAGE_CAP) {   /* the read's O_DIRECT window wants the record and a page of slack */
+        fprintf(stderr, "%s tier deepseek_v4: an expert's %.1f MiB does not fit a %d MiB stage; "
+                "the stream's fills take the store's lease as before\n",
+                XT_TAG, record / 1048576.0, V4_VKT_STAGE_CAP >> 20);
+        return 0;
+    }
+    for (int i = 0; i < V4_VKT_STAGE_N; i++) {
+        if (posix_memalign((void **)&v4_vkt_stage[i], 4096, V4_VKT_STAGE_CAP)) {
+            while (i > 0) compat_aligned_free(v4_vkt_stage[--i]);
+            fprintf(stderr, "%s tier deepseek_v4: no memory for the %d x %d MiB stage pool; "
+                    "the stream's fills take the store's lease as before\n",
+                    XT_TAG, V4_VKT_STAGE_N, V4_VKT_STAGE_CAP >> 20);
+            return 0;
+        }
+    }
+    v4_vkt_stage_state = 1;
     return 1;
+}
+static int v4_vkt_stage_take(void) {
+    for (int i = 0; i < V4_VKT_STAGE_N; i++)
+        if (!v4_vkt_stage_busy[i]) { v4_vkt_stage_busy[i] = 1; return i; }
+    return -1;
 }
 static void v4_vkt_unhold(void *ctx, void *h) {
     V4VkHold *hold = h;
     if (!hold) return;
-    coli_expert_release((ColiExpertStore *)ctx, &hold->view);
+    if (hold->stage >= 0) v4_vkt_stage_busy[hold->stage] = 0;   /* the pool's buffer back */
+    else coli_expert_release((ColiExpertStore *)ctx, &hold->view);
     free(hold->buffer); free(hold);
 }
+/* One expert for a stream fill: `stage` is a pool buffer this call owns (marked busy,
+ * handed back on every way out) or -1 for the store's lease. A bypass read that fails
+ * falls back to the lease, so a fill never fails while the store could still serve it.
+ * Called on the engine thread, or a load_batch worker whose lease is the prewarm's
+ * parallel lookup: the store holds no lock over its disk read. */
+static int v4_vkt_load_one(ColiExpertStore *store, int layer, int expert,
+                           VktExpertSrc *src, void **h, int stage) {
+    V4VkHold *hold = calloc(1, sizeof *hold);
+    if (!hold) { if (stage >= 0) v4_vkt_stage_busy[stage] = 0; return 0; }
+    if (stage >= 0) {
+        if (!coli_v4_expert_store_read_private(store, (ColiExpertKey){layer, expert},
+                                               v4_vkt_stage[stage], &hold->view) &&
+            !v4_vkt_rows(&hold->view, src, &hold->buffer)) {
+            hold->stage = stage;
+            *h = hold;
+            return 1;
+        }
+        free(hold->buffer);
+        v4_vkt_stage_busy[stage] = 0;
+    }
+    hold->stage = -1;
+    if (coli_expert_lookup(store, (ColiExpertKey){layer, expert}, &hold->view)) { free(hold); return 0; }
+    if (v4_vkt_rows(&hold->view, src, &hold->buffer)) {
+        coli_expert_release(store, &hold->view);
+        free(hold);
+        return 0;
+    }
+    *h = hold;
+    return 1;
+}
+static int v4_vkt_load(void *ctx, int layer, int expert, VktExpertSrc *src, void **h) {
+    if (!v4_vkt_thread()) return 0;
+    ColiExpertStore *store = ctx;
+    int stage = v4_vkt_bypass && v4_vkt_stage_init(store) &&
+                !coli_v4_expert_store_in_ram(store, (ColiExpertKey){layer, expert})
+                ? v4_vkt_stage_take() : -1;
+    return v4_vkt_load_one(store, layer, expert, src, h, stage);
+}
+/* The group reader (vk_tier.h's load_batch): up to V4_VKT_STAGE_N experts a call -- the
+ * pool bounds the bypassing reads, and with them the leases -- each expert read by its
+ * own thread, a cold one into its own stage buffer and one the store holds leased (the
+ * warm start and the prewarm read this way; cold disk reads want the queue depth).
+ * Returns the leading count it loaded; the tier uploads and releases those before
+ * asking for the rest, which is what returns the buffers to the pool. */
+static int v4_vkt_load_batch(void *ctx, int layer, const int *eids, int n,
+                             VktExpertSrc *srcs, void **hs) {
+    if (!v4_vkt_thread()) return 0;
+    ColiExpertStore *store = ctx;
+    if (n > 64) n = 64;
+    if (n < 1) return 0;
+    int plan = n < V4_VKT_STAGE_N ? n : V4_VKT_STAGE_N, st[64];
+    if (v4_vkt_bypass && v4_vkt_stage_init(store)) {
+        int free_n = 0;
+        for (int i = 0; i < V4_VKT_STAGE_N; i++) free_n += !v4_vkt_stage_busy[i];
+        plan = 0;
+        for (int i = 0; i < n && plan < V4_VKT_STAGE_N; i++) {
+            int stage = -1;
+            if (!coli_v4_expert_store_in_ram(store, (ColiExpertKey){layer, eids[i]})) {
+                if (!free_n) break;   /* the pool bounds the batch; the rest come next call */
+                stage = v4_vkt_stage_take();
+                if (stage < 0) break;
+                free_n--;
+            }
+            st[plan++] = stage;
+        }
+    } else
+        for (int i = 0; i < plan; i++) st[i] = -1;
+    if (!plan) return 0;
+    void *hh[64];
+    unsigned char ok[64];
+    #pragma omp parallel for schedule(dynamic, 1) if (plan > 1) \
+            num_threads(plan > V4_VKT_STAGE_N ? V4_VKT_STAGE_N : plan)
+    for (int i = 0; i < plan; i++) {
+        void *h = NULL;
+        ok[i] = (unsigned char)v4_vkt_load_one(store, layer, eids[i], &srcs[i], &h, st[i]);
+        hh[i] = h;
+    }
+    int got = 0;
+    while (got < plan && ok[got]) got++;
+    for (int i = 0; i < plan; i++) {
+        if (i < got) hs[i] = hh[i];
+        else if (hh[i]) v4_vkt_unhold(store, hh[i]);          /* a hold made past a failure */
+        else if (st[i] >= 0) v4_vkt_stage_busy[st[i]] = 0;     /* a buffer nothing was read into */
+    }
+    return got;
+}
+
 static void v4_vk_tier_start(const ColiV4Engine *engine) {
     const ColiDeepSeekV4Config *c = &engine->config;
     ColiExpertStore *store = engine->experts;
@@ -13859,6 +13985,8 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
         fprintf(stderr, ")\n");
         if (!mixed) { free(lgu); free(ldn); lgu = ldn = NULL; }
     }
+    const char *bypass = getenv("COLI_VK_TIER_STREAM_BYPASS");   /* 1: the stream's fills read past the cache (v4_vkt_load_batch) */
+    v4_vkt_bypass = bypass && *bypass && atoi(bypass) != 0;
     VktConfig vc = {.engine = "deepseek_v4", .layers = c->num_hidden_layers,
                     .experts = c->n_routed_experts, .hidden = c->hidden_size,
                     .inter = c->moe_intermediate_size, .topk = c->num_experts_per_tok,
@@ -13878,7 +14006,8 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
                     .ram_spare = engine->runtime.ram_budget_bytes > engine->runtime.ram_planned_bytes
                         ? (size_t)(engine->runtime.ram_budget_bytes - engine->runtime.ram_planned_bytes) : 0,
                     .in_ram = v4_vkt_in_ram, .ram_ctx = store,
-                    .load = v4_vkt_load, .release = v4_vkt_unhold, .load_ctx = store};
+                    .load = v4_vkt_load, .release = v4_vkt_unhold, .load_ctx = store,
+                    .load_batch = v4_vkt_bypass ? v4_vkt_load_batch : NULL};
     /* The device goes before the drivers unload, after the tier's teardown (atexit runs
      * last-registered first), and whether or not the tier starts: XT(init) makes the
      * expert batch's pipelines before it can refuse (no room). */
@@ -13887,6 +14016,10 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
     free(lgu); free(ldn);   /* read during XT(init) only */
     if (!tier_on) return;
     atexit(XT(shutdown));
+    if (v4_vkt_bypass)
+        fprintf(stderr, "%s tier deepseek_v4: the stream's fills read past the expert cache "
+                "(%d stages of %d MiB, groups of %d in parallel; COLI_VK_TIER_STREAM_BYPASS)\n",
+                XT_TAG, V4_VKT_STAGE_N, V4_VKT_STAGE_CAP >> 20, V4_VKT_STAGE_N);
     g_v4_vkt = (ColiV4VkTier){store, v4_vkt_issue, v4_vkt_join, v4_vkt_note, v4_vkt_routed};
     int all = c->num_hidden_layers * c->n_routed_experts;
     int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));

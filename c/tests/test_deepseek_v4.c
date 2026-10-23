@@ -1404,6 +1404,129 @@ out:
     puts("DeepSeek-V4 ExpertStore prewarm: ok");
     return 0;
 }
+
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+/* S2's primitive, the stream fills' bypass reader: coli_v4_expert_store_read_private
+ * must return bit for bit the bytes a lease returns -- whichever loaded an expert, the
+ * same bytes reach the device -- while touching none of the store's counters or slots:
+ * a fill through it neither fills nor evicts the cache, and a slot a lease holds
+ * survives it. The lease path's own counters then still move as always (the
+ * counter-assert), which is what lets an arm compare hit rates. */
+static int tensor_bytes_equal(const ColiTensorView *a, const ColiTensorView *b) {
+    return a->format == b->format && a->rows == b->rows && a->columns == b->columns &&
+           a->block_rows == b->block_rows && a->block_columns == b->block_columns &&
+           a->data_bytes == b->data_bytes && a->scale_bytes == b->scale_bytes &&
+           memcmp(a->data, b->data, a->data_bytes) == 0 &&
+           memcmp(a->scales, b->scales, a->scale_bytes) == 0;
+}
+static int test_expert_store_read_private(void) {
+    char directory[] = "colibri-v4-bypass-XXXXXX";
+    char path[256], error[256];
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
+    if (!mkdtemp(directory)) { perror("mkdtemp bypass"); return 1; }
+    snprintf(path, sizeof(path), "%s/model.safetensors", directory);
+    if (write_fixture(path) != 0) { perror("write_fixture"); return 1; }
+    ColiDeepSeekV4ExpertStoreOptions options = { directory, 1, 7, 306, -1, 0, 0, 0 };
+    ColiExpertStore *store = NULL;
+    unsigned char *stage = NULL;
+    int failed = 0;
+    if (coli_deepseek_v4_expert_store_open(&options, &store,
+                                            error, sizeof(error)) != 0) {
+        fprintf(stderr, "%s\n", error);
+        failed = 1;
+        goto out;
+    }
+    uint64_t record = coli_v4_expert_store_record_bytes(store);
+    if (record != 51) {
+        fprintf(stderr, "record bytes %llu, want 51\n", (unsigned long long)record);
+        failed = 1;
+        goto out;
+    }
+    if (posix_memalign((void **)&stage, 4096, (size_t)record + 8192u)) {
+        fprintf(stderr, "no stage buffer\n");
+        failed = 1;
+        goto out;
+    }
+    /* the lease's bytes of expert 3, held so its slot cannot be evicted under the test */
+    ColiExpertView leased;
+    if (coli_expert_lookup(store, (ColiExpertKey){0, 3}, &leased) != 0 ||
+        !expect_fixture_expert(&leased, 3)) {
+        fprintf(stderr, "lease of expert 3 failed\n");
+        failed = 1;
+        goto out;
+    }
+    ColiExpertStoreStats before, after;
+    store->ops->stats(store, &before);
+    if (before.requests != 1 || before.misses != 1 || before.resident_bytes != 51) {
+        fprintf(stderr, "stats before the bypass: requests=%llu misses=%llu resident=%llu\n",
+                (unsigned long long)before.requests, (unsigned long long)before.misses,
+                (unsigned long long)before.resident_bytes);
+        failed = 1;
+        goto out;
+    }
+    for (int expert = 0; expert < 7 && !failed; expert++) {
+        ColiExpertView view;
+        if (coli_v4_expert_store_read_private(store, (ColiExpertKey){0, expert},
+                                              stage, &view) != 0 ||
+            !expect_fixture_expert(&view, expert)) {
+            fprintf(stderr, "bypass read of expert %d failed\n", expert);
+            failed = 1;
+            break;
+        }
+        if (expert == 3 &&   /* bit for bit the lease's bytes, expert 3's own */
+            !(tensor_bytes_equal(&view.gate, &leased.gate) &&
+              tensor_bytes_equal(&view.up, &leased.up) &&
+              tensor_bytes_equal(&view.down, &leased.down))) {
+            fprintf(stderr, "bypass bytes differ from the lease's\n");
+            failed = 1;
+        }
+    }
+    store->ops->stats(store, &after);
+    if (after.requests != before.requests || after.hits != before.hits ||
+        after.misses != before.misses || after.bytes_read != before.bytes_read ||
+        after.resident_bytes != before.resident_bytes) {
+        fprintf(stderr, "the bypass moved the store: requests %llu->%llu hits %llu->%llu "
+                "misses %llu->%llu bytes %llu->%llu resident %llu->%llu\n",
+                (unsigned long long)before.requests, (unsigned long long)after.requests,
+                (unsigned long long)before.hits, (unsigned long long)after.hits,
+                (unsigned long long)before.misses, (unsigned long long)after.misses,
+                (unsigned long long)before.bytes_read, (unsigned long long)after.bytes_read,
+                (unsigned long long)before.resident_bytes, (unsigned long long)after.resident_bytes);
+        failed = 1;
+    }
+    coli_expert_release(store, &leased);
+    /* the counter-assert: the lease path still counts as always, the leased slot
+     * survived every bypass read (a hit) and a cold lease still misses */
+    ColiExpertView again;
+    if (coli_expert_lookup(store, (ColiExpertKey){0, 3}, &again) != 0) {
+        fprintf(stderr, "re-lease of expert 3 failed\n");
+        failed = 1;
+    } else coli_expert_release(store, &again);
+    ColiExpertView cold;
+    if (coli_expert_lookup(store, (ColiExpertKey){0, 4}, &cold) != 0) {
+        fprintf(stderr, "lease of expert 4 failed\n");
+        failed = 1;
+    } else coli_expert_release(store, &cold);
+    store->ops->stats(store, &after);
+    if (after.requests != 3 || after.hits != 1 || after.misses != 2 ||
+        after.resident_bytes != 102) {
+        fprintf(stderr, "stats after the re-leases: requests=%llu hits=%llu misses=%llu "
+                "resident=%llu (want 3/1/2/102)\n",
+                (unsigned long long)after.requests, (unsigned long long)after.hits,
+                (unsigned long long)after.misses, (unsigned long long)after.resident_bytes);
+        failed = 1;
+    }
+out:
+    compat_aligned_free(stage);
+    if (store) store->ops->destroy(store);
+    if (scratch_remove(directory, path)) return 1;
+    if (failed) return 1;
+    puts("DeepSeek-V4 ExpertStore read_private: ok");
+    return 0;
+}
+#endif /* COLI_VULKAN || COLI_CUDA */
 /* ==== end test_deepseek_v4_expert_store.c ==== */
 
 /* ==== begin test_deepseek_v4_kv_cache.c ==== */
@@ -1999,6 +2122,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "FAIL: test_expert_store_prewarm\n");
         return 1;
     }
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+    if (test_expert_store_read_private() != 0) {
+        fprintf(stderr, "FAIL: test_expert_store_read_private\n");
+        return 1;
+    }
+#endif
     if (test_kv_cache() != 0) {
         fprintf(stderr, "FAIL: test_kv_cache\n");
         return 1;
