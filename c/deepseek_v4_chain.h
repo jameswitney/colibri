@@ -89,6 +89,7 @@
  * there (the host's state is current: nothing to rebuild); lost, both chains go off. */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
+#include "vk_dmoe.h"
 
 typedef struct {
     int ratio, idx, kind;                       /* compress ratio (0 none), an indexer, its list */
@@ -119,6 +120,10 @@ typedef struct {
     VkcBuf *xs, *xn, *mix, *hpa, *hpf, *col, *nrm, *nq, *qa, *qr, *qrq, *q, *kv, *heads, *grp, *br;
     VkcBuf *craw, *cscr, *icraw, *icscr, *iq, *ihw, *isc, *list, *cs, *sq, *gs, *us, *hs, *ds;
     VkcBuf *h2d, *routed, *xd, *taps, *pull;
+    VkcBuf *lg, *gbias;                     /* COLI_VK_DMOE: the router's logits, its gate bias */
+    VkcDmoe dm;                             /* that arm: one layer's routed experts in the frame */
+    ColiVkTensor *gate;                     /* the layer's ffn.gate.weight, bf16 on the device */
+    const float *gate_bias;                 /* and its ffn.gate.bias, written in every armed frame */
     float *host_routed;
     unsigned long long forwards;
     double host_ms;
@@ -639,11 +644,66 @@ static void v4c_layer_free(V4Chain *ch, int i) {
     ly->ccap = ly->icap = ly->kv_valid = ly->ik_valid = ly->ring_ok = ly->iring_ok = 0;
     ly->built = 0;
 }
+/* COLI_VK_DMOE's arm (below) off: its buffers, after the frames that read them. */
+static void v4c_dmoe_drop(V4Chain *ch) {
+    if (vkc_ready()) vkc_finish();
+    vkc_dmoe_free(&ch->dm);
+    vkc_free(ch->lg); vkc_free(ch->gbias); ch->lg = ch->gbias = NULL;
+    void (*forget)(ColiVkTensor *) = ch->d ? v4c_d2_forget : v4_vk_forget;
+    forget(ch->gate); ch->gate = NULL; ch->gate_bias = NULL;
+}
+/* ---- COLI_VK_DMOE: one layer's routed experts in the frame (vk_dmoe.h) -------------------
+ * Scaffolding for the L2 measurement (docs/research/Q-l2-dmoe-map-2026-10-22.md, S1):
+ * with COLI_VK_DMOE=n and the tier holding all of layer n's experts on the primary
+ * device (a warm start that pins them, COLI_VK_TIER_PIN_LAYER, over a COLI_VK_TIER_GB
+ * that holds them), a step of up to VKC_DMOE_ROWS rows (decode, a short verify) routes
+ * and computes that one layer's experts in the frame (vkc_route + vkc_moe) instead of
+ * the host's coli_v4_moe_routed step -- the shared expert and the gate logits recorded
+ * with them, no wait at the layer, the tier's books after the frame from the ids
+ * (vkt_dev_count). The router's parameters are route_bf16_impl's: sqrt(softplus) of the
+ * logit, the gate bias for the pick only, the weights score/sum * routed_scaling_factor.
+ * The experts' sum is chain_moe.comp's rank order, not the CPU block's ascending expert
+ * id, and the logits come from the chain's GEMV: a token's bits can differ where a bf16
+ * round does not absorb it -- the greedy/oracle check is the gate, not bit equality. A
+ * hash layer (vkc_route cannot express its token table), a layer outside this chain and
+ * the second device keep the host's step. 0, the default, changes nothing. */
+static int v4c_dmoe_arm(V4Chain *ch, int rows) {
+    const ColiDeepSeekV4Config *c = &ch->engine->config;
+    int n = vkc_dmoe_layer_env();
+    static int told = 0;
+    if (!n || ch->d || n < ch->lo || n >= ch->L || rows > VKC_DMOE_ROWS) return 0;
+    if (ch->engine->dense_resident.layers[n].plan.uses_hash_router) {
+        if (!told) fprintf(stderr, "[VK] %s chain: COLI_VK_DMOE=%d is a hash layer (vkc_route cannot give its token "
+                                   "table); the host's step keeps it\n", v4c_name(ch), n);
+        told = 1;
+        return 0;
+    }
+    const ColiDeepSeekV4LayerWeights *w = &ch->engine->dense_resident.layers[n];
+    if (!ch->gate && !(ch->gate = v4c_plain(w, "ffn.gate.weight", 11))) {
+        if (!told) fprintf(stderr, "[VK] %s chain: layer %d's ffn.gate.weight did not reach the device; COLI_VK_DMOE "
+                                   "stays off\n", v4c_name(ch), n);
+        told = 1;
+        return 0;
+    }
+    if (!ch->gate_bias) ch->gate_bias = v4c_val(w, "ffn.gate.bias");
+    if ((ch->gate_bias && !vkc_reserve(&ch->gbias, (size_t)c->n_routed_experts * sizeof(float), VKC_DEV)) ||
+        !vkc_reserve(&ch->lg, (size_t)rows * c->n_routed_experts * sizeof(float), VKC_DEV)) return 0;
+    if (!vkc_dmoe_prepare(&ch->dm, n, 1, c->n_routed_experts, c->num_experts_per_tok, ch->D, ch->I, rows)) {
+        if (!told && !ch->dm.off && vkt_ready())
+            fprintf(stderr, "[VK] %s chain: COLI_VK_DMOE=%d: the tier does not hold all %d of layer %d's experts yet; "
+                            "the host's step keeps it (pin them warm: COLI_VK_TIER_PIN_LAYER=%d, over a COLI_VK_TIER_GB "
+                            "that holds them)\n", v4c_name(ch), n, c->n_routed_experts, n, n);
+        told = 1;
+        return 0;
+    }
+    return 1;
+}
 /* Layer i did not reach the device: the chain keeps the layers before it, and with the
  * dense weights on the device only, the layers from i on keep their host copies. */
 static void v4c_cut(V4Chain *ch, int i, const char *why) {
     ColiV4Engine *e = ch->engine;
     if (i < ch->L) ch->L = i;
+    if (vkc_dmoe_layer_env() >= i) v4c_dmoe_drop(ch);   /* the armed layer left the chain */
     if (ch->d) { vkc_fit_shrink("deepseek_v4 dev2", &g_v4c_fit2, i - ch->lo, why); return; }
     if (e->dense_resident.device_only && e->dense_resident.device_layers > i) {
         fprintf(stderr, "[VK] deepseek_v4: layers %d to %d keep their host copies after all (the RAM plan had counted "
@@ -1077,10 +1137,11 @@ static int v4c_shared(V4Chain *ch, V4cLayer *ly, int nr) {
            v4c_e4m3(ch->hs, ch->hs, nr, ch->I) && vkc_matmul(ly->sh2, ch->hs, 0, ch->ds, 0, nr) &&
            v4c_bf16(ch->ds, nr, ch->D, 0, ch->D);
 }
-/* the FFN branch joins: br = bf16(routed + shared), then mHC's exit */
-static int v4c_join(V4Chain *ch, int nr) {
+/* the FFN branch joins: br = bf16(routed + shared), then mHC's exit; routed the device
+ * wrote (dm.y, a layer that ran its experts in the frame) or the host's copy */
+static int v4c_join(V4Chain *ch, int nr, int dev) {
     VkcEw add = {VKC_EW_ADD, nr * ch->D, ch->D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
-    return vkc_ew(ch->br, ch->routed, ch->ds, NULL, NULL, &add) && v4c_bf16(ch->br, nr, ch->D, 0, ch->D) &&
+    return vkc_ew(ch->br, dev ? ch->dm.y : ch->routed, ch->ds, NULL, NULL, &add) && v4c_bf16(ch->br, nr, ch->D, 0, ch->D) &&
            v4c_post(ch, ch->hpf, nr);
 }
 
@@ -1100,7 +1161,7 @@ static int v4c_read_count(ColiDeepSeekV4WindowAttentionState *s, int *count, int
  * layers from there. Returns the layer after its last (ch->L); 0: not taken (nothing
  * changed; *lost = 1: a frame failed, the device marked lost); -1: the MoE failed (error
  * set, as a CPU forward failing at that layer leaves the host state). */
-static void v4c_off(V4Chain *ch) { ch->failed = 1; if (!ch->d) g_v4c_mode = 0; }
+static void v4c_off(V4Chain *ch) { v4c_dmoe_drop(ch); ch->failed = 1; if (!ch->d) g_v4c_mode = 0; }
 static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr, float **next_ptr,
                            ColiDeepSeekV4WindowAttentionState **attention, const ColiDeepSeekV4Config *config,
                            ColiExpertStore *experts, const int *tokens, int start, int n, int pool,
@@ -1159,6 +1220,7 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
     }
     int ok = v4c_scratch(ch, rows, E, LR);
     for (int i = lo; ok && i < L; i++) ok = v4c_cache(ch, &ch->ly[i], E / (ch->ly[i].ratio > 0 ? ch->ly[i].ratio : 1) + 1);
+    int dmoe = ok && v4c_dmoe_arm(ch, rows);   /* COLI_VK_DMOE: one layer's experts in the frame, or none */
     /* what comes back at the end: the window rows, each layer's new compressed rows and
      * keys, the rings (a ring of ratio r without the overlap: the slots this forward wrote) */
     size_t pn = 0;
@@ -1284,17 +1346,43 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
         }
         if (!ok) goto lost;
         for (int s = 0; s < nr; s++) ch->slot_pos[(pb + s) % ch->Wd] = pb + s;   /* this chunk's rows go in below */
-        int pending = 0;
+        int pending = 0, prev_dev = 0, dm_ran = 0, sent = 0;   /* prev_dev: the layer before ran its experts in the frame */
+        if (dmoe) {   /* the table again for this frame (the host's steps ran the tier), the router's bias with it */
+            if (!vkc_dmoe_upload(&ch->dm) ||
+                (ch->gbias && !vkc_write(ch->gbias, 0, ch->gate_bias, (size_t)c->n_routed_experts * sizeof(float)))) goto lost;
+        }
         for (int i = lo; i < L && ok; i++) {
             V4cLayer *ly = &ch->ly[i];
             if (pending) {                                  /* the FFN branch of the layer before */
-                ok = v4c_join(ch, nr);
+                ok = v4c_join(ch, nr, prev_dev);
                 if (ok && taps && i - 1 >= T0) ok = vkc_copy(ch->taps, (size_t)(i - 1 - T0) * nr * HD, ch->xs, 0, (size_t)nr * HD);
                 pending = 0;
             }
             ok = ok && v4c_pre(ch, ly->fna, ly->o_hca, ch->hpa, ly->o_an, nr) && v4c_attention(ch, i, &f) &&
-                 v4c_post(ch, ch->hpa, nr) && v4c_pre(ch, ly->fnf, ly->o_hcf, ch->hpf, ly->o_fn, nr) &&
-                 vkc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)nr * D) && vkc_submit(0);    /* A1 */
+                 v4c_post(ch, ch->hpa, nr) && v4c_pre(ch, ly->fnf, ly->o_hcf, ch->hpf, ly->o_fn, nr);
+            if (ok && dmoe && vkc_dmoe_on(&ch->dm, i)) {     /* COLI_VK_DMOE: this layer's experts in the frame */
+                float lim = c->swiglu_limit;
+                VkcRoute rp = {.kind = 2, .n_group = 1, .topk_group = 1, .has_bias = ch->gbias ? 1 : 0,
+                               .norm = 1, .temp = 1.f, .scale = c->routed_scaling_factor};
+                VkcMoe mp = {.D = D, .I = ch->I, .act = 0, .limit = lim > 0.0f ? lim : 0.0f};
+                /* the shared expert and the router's logits in the same frame: no wait, no host step */
+                ok = v4c_shared(ch, ly, nr) && vkc_matmul(ch->gate, ch->nrm, 0, ch->lg, 0, nr) &&
+                     vkc_dmoe_layer(&ch->dm, i, nr, ch->lg, ch->gbias, ch->nrm, &rp, &mp);
+                if (ok && ch->ks.on) {   /* the split's host mirror takes this chunk's rows: the frame ends here */
+                    ok = vkc_submit(0) && vkc_finish();
+                    if (ok && ly->ratio > 0) {
+                        int r = ly->ratio, g0 = pb / r, np = (pb + nr) / r - g0;
+                        ColiV4AttentionView v;
+                        if (np > 0 && !coli_v4_attention_view(attention[i], &v))
+                            memcpy(v.compressed + (size_t)g0 * hd, vkc_ptr(ch->cdn), (size_t)np * hd * sizeof(float));
+                    }
+                    ok = ok && vkc_begin();
+                } else if (ok && i + 1 < L)
+                    ok = vkc_layer_recorded(&sent);   /* a long frame: the device starts on these layers */
+                prev_dev = 1; dm_ran = 1; pending = 1;
+                continue;
+            }
+            ok = ok && vkc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)nr * D) && vkc_submit(0);    /* A1 */
             /* while it runs, the tier loads the experts this layer will likely stream (a
              * big prompt chunk only) */
             if (ok) vkt_stream_prefetch(i, nr);
@@ -1323,10 +1411,12 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
             memcpy(vkc_ptr(ch->routed), ch->host_routed, (size_t)nr * D * sizeof(float));
             ch->host_ms += (spec_now() - t1) * 1e3;
             ok = vkc_begin();
+            if (ok && dmoe) ok = vkc_dmoe_upload(&ch->dm);   /* the host's step ran the tier: the table again */
+            prev_dev = 0;
             pending = 1;
         }
         if (ok && pending) {
-            ok = v4c_join(ch, nr);
+            ok = v4c_join(ch, nr, prev_dev);
             if (ok && taps && L - 1 >= T0) ok = vkc_copy(ch->taps, (size_t)(L - 1 - T0) * nr * HD, ch->xs, 0, (size_t)nr * HD);
         }
         ok = ok && vkc_copy(ch->xd, 0, ch->xs, 0, (size_t)nr * HD);
@@ -1362,6 +1452,8 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
         }
         ok = ok && vkc_submit(1);
         if (!ok) goto lost;
+        if (dmoe && dm_ran)   /* the frame's books: the tier's heat from the ids it routed */
+            vkt_dev_count(ch->dm.lo, nr, ch->dm.K, vkc_dmoe_ids(&ch->dm, ch->dm.lo));
         memcpy(next + (size_t)c0 * HD, vkc_ptr(ch->xd), (size_t)nr * HD * sizeof(float));
         if (taps) {
             const float *tp = (const float *)vkc_ptr(ch->taps);
@@ -1492,6 +1584,10 @@ static void v4c_report(void) {
                 v4c_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
                 st.dev_bytes / 1048576.0);
         vkc_kv_report(&ch->ks);
+        if (ch->dm.steps)
+            fprintf(stderr, "[VK] %s chain: %llu layer steps ran their routed experts in the frame (COLI_VK_DMOE=%d)\n",
+                    v4c_name(ch), ch->dm.steps, vkc_dmoe_layer_env());
+        vkc_dmoe_hyb_report(v4c_name(ch), &ch->dm);
         vkc_prof_print();
         vkc_device(was);
     }

@@ -69,6 +69,7 @@
 #include "../backend_vulkan.h"
 #include "../vk_chain.h"
 #include "../vk_tier.h"           /* vkt_host_pairs: the bench's CPU in place */
+#include "../vk_dmoe.h"           /* COLI_VK_DMOE's parse: the one-layer arm's lever */
 #include "../vk_kvsplit.h"        /* the KV cache split between the device and the host */
 #include "../delta_attention.h"      /* the KDA step the KDA ops follow */
 #include "../hyper_connections.h"    /* the mHC arithmetic */
@@ -1696,6 +1697,22 @@ static void test_route(const char *what, int S, int E, int K, int kind, int has_
     if (getenv("VKC_TEST_VERBOSE")) printf("route %s: weights %.2e\n", what, worst);
     vkc_free(lb); vkc_free(bb); vkc_free(ib); vkc_free(wb);
     free(lg); free(bias); free(rid); free(rw); free(gi); free(gw);
+}
+
+/* COLI_VK_DMOE's parse (vk_dmoe.h): a layer index arms that one layer; 0, unset,
+ * junk and negatives are off, so the default run arms nothing -- no dmoe buffers, no
+ * dispatch (the arm's parse is what decides, before any vkc_dmoe_* call). */
+static void test_dmoe_parse(void) {
+    CHECK(vkc_dmoe_layer_env() == 0, "dmoe parse: the default (unset) is off");
+    CHECK(vkc_dmoe_layer_parse(NULL) == 0, "dmoe parse: NULL");
+    CHECK(vkc_dmoe_layer_parse("") == 0, "dmoe parse: empty");
+    CHECK(vkc_dmoe_layer_parse("0") == 0, "dmoe parse: 0");
+    CHECK(vkc_dmoe_layer_parse("5") == 5, "dmoe parse: 5");
+    CHECK(vkc_dmoe_layer_parse("60") == 60, "dmoe parse: 60");
+    CHECK(vkc_dmoe_layer_parse("-3") == 0, "dmoe parse: -3");
+    CHECK(vkc_dmoe_layer_parse("junk") == 0, "dmoe parse: junk");
+    CHECK(vkc_dmoe_layer_parse("7x") == 7, "dmoe parse: a trailing word");
+    printf("dmoe parse done\n");
 }
 
 /* ---- the routed experts (chain_moe.comp) ------------------------------------------------ */
@@ -4212,6 +4229,7 @@ int main(int argc, char **argv) {
     }
     if (!coli_vk_init(spv)) { printf("FAIL: no Vulkan device (shaders %s)\n", spv); return 1; }
     if (!vkc_init()) { printf("FAIL: the chain's pipelines did not come up\n"); return 1; }
+    test_dmoe_parse();   /* COLI_VK_DMOE's parse (vk_dmoe.h): no device needed */
     if (getenv("COLI_VK_CHAIN_BENCH")) {
         if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "bd")) bench_bd();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "moe")) bench_moe();
@@ -4461,6 +4479,11 @@ int main(int argc, char **argv) {
         /* V4's own form of it (route_bf16_impl): norm 1, no eps, the routed scaling factor */
         test_route_bf16(7, 256, 6, 2.5f, 0);
         test_route_bf16(2, 64, 4, 1.f, 1);
+        /* and the same shape through the generic harness (COLI_VK_DMOE's arm,
+         * route_bf16_impl's parameters): sqrt(softplus), the bias for the pick only,
+         * norm 1 with no eps, temp 1 */
+        test_route("deepseek v4 sqrt(softplus), bias pick, norm 1", 6, 256, 6, 2, 1, 1, 1, 1, 1.f, 2.5f, 0.f, 0);
+        test_route("deepseek v4, ties to the lower expert", 4, 256, 6, 2, 1, 1, 1, 1, 1.f, 2.5f, 0.f, 1);
         test_route("1024 experts, top-32", 2, 1024, 32, 0, 0, 1, 1, 1, 1.f, 1.f, 0.f, 0);
         test_route("896 experts, top-32, bias", 3, 896, 32, 1, 1, 1, 1, 1, 1.f, 2.5f, 0.f, 0);
         test_route("fewer kept experts than K", 2, 64, 32, 0, 0, 8, 2, 1, 1.f, 1.f, 0.f, 0);

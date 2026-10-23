@@ -127,6 +127,20 @@ static int vkc_dmoe_wanted(void) {
     if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_MOE"); on = !(e && *e == '0'); }
     return on;
 }
+/* COLI_VK_DMOE: an engine's opt-in single-layer arm of this (scaffolding for a
+ * measurement: one layer, the decode path) -- the one layer whose routed experts run
+ * in the frame. A layer index >= 1 arms layer n; 0, unset or anything else is off, the
+ * host's step as before. Distinct from COLI_VK_CHAIN_MOE, which the engines that follow
+ * this header default on. */
+static int vkc_dmoe_layer_parse(const char *v) {
+    int n = v && *v ? atoi(v) : 0;
+    return n > 0 ? n : 0;
+}
+static int vkc_dmoe_layer_env(void) {
+    static int n = -1;
+    if (n < 0) n = vkc_dmoe_layer_parse(getenv("COLI_VK_DMOE"));
+    return n;
+}
 static int vkc_hybrid_wanted(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_VK_HYBRID"); on = !(e && *e == '0'); }

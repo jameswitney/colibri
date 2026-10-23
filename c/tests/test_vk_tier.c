@@ -523,7 +523,43 @@ static void fill(void) {
     model_free();
 }
 
-/* a third of the experts fit; the hot set moves halfway */
+/* COLI_VK_TIER_PIN_LAYER (test-only, the COLI_VK_DMOE arm's scaffolding): the pinned
+ * layer's experts planned ahead of the history, whatever the heat says, and resident
+ * after the warm start so vkt_dev_table counts them all (vk_dmoe.h's all-or-nothing
+ * gate); without the lever the plan is the history's, as before. */
+static void pin_layer(void) {
+    VktFmt f = {VKT_SRC_I4U_PAIRS_GS, 64};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    set_budget(E, f, f);                     /* one layer's experts fit, of the two */
+    uint32_t hist[L][E], *rows[L];           /* layer 0 the hot one: the pin must override it */
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = l ? 1u : 1000u; }
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    setenv("COLI_VK_TIER_PIN_LAYER", "1", 1);
+    CHECK(vkt_init(&vc, rows), "pin: the tier did not start");
+    int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+    int per[L] = {0}, first = 1;
+    for (int i = 0; i < n; i++) { per[pl[i]]++; first &= pl[i] == 1; }
+    CHECK(n == E && per[1] == E && per[0] == 0 && first, "pin: planned %d experts (layer counts %d/%d), not layer 1's %d first",
+          n, per[0], per[1], E);
+    for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+    vkt_put_done();
+    uint32_t *tab = malloc((size_t)E * COLI_VK_XB_ENTRY * sizeof(uint32_t));
+    CHECK(tab && vkt_dev_table(1, tab) == E, "pin: the tier does not hold all %d of layer 1 for the dmoe gate", E);
+    int res = 0; for (int i = 0; i < n; i++) res += vkt_resident(pl[i], pe[i]);
+    CHECK(res == n, "pin: %d of %d pinned experts resident", res, n);
+    printf("  pin layer: %d of %d experts of layer 1 planned first and resident, the table whole\n", res, E);
+    free(tab);
+    vkt_shutdown();
+    /* without the lever (the default): the history's hottest layer takes the budget */
+    unsetenv("COLI_VK_TIER_PIN_LAYER");
+    CHECK(vkt_init(&vc, rows), "pin: the tier did not start again");
+    n = vkt_plan(pl, pe, L * E);
+    per[0] = per[1] = 0;
+    for (int i = 0; i < n; i++) per[pl[i]]++;
+    CHECK(n == E && per[0] == E && per[1] == 0, "pin: the default plan took layer 1 (%d/%d of %d)", per[0], per[1], n);
+    vkt_shutdown();
+    model_free();
+}
 static void adapt(void) {
     VktFmt f = {VKT_SRC_FP8_GS, 32};
     model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
@@ -2212,6 +2248,7 @@ int main(int argc, char **argv) {
     printf("extra:\n"); extra();
     printf("fill:\n"); fill();   /* after extra: its exact pool capacities assume no tier came before with more experts */
     printf("hot set:\n"); hotset();
+    printf("pin layer:\n"); pin_layer();
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
     printf("stream batch:\n"); stream_batch();
