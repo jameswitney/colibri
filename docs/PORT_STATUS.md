@@ -92,3 +92,12 @@ the remainder is the ring/whole-stack overlap and mm8 (parity-class).
 3. decide the PR queue: #2253 follow-up (Makefile fix) → strict-gate →
    tier-host-pool (now composed with #2258) → cold tier
 4. F14-v2 design before any 8k claim
+
+
+## Session 2026-10-23 (the parity campaign, manager-run)
+
+Landed on port/up-2276 (through 9739c812): mm8 tiled fp8 GEMM (reviewed; PR branch pr/vk-mm8 staged off upstream/dev @ 05a5bca5), COLI_VK_PROFILE (RDNA2), S1+S2 stream bypass (COLI_VK_TIER_STREAM_BYPASS), the rig's VRAM guard, the L3 overlay (default-off capability). Numbers: TTFT record 187.7 (stacked) -> 148 (S1+S2, replicated), decode record 0.670. Fresh fork A/B: 103-106 s / 1.15-1.17 tok/s — remaining gaps: TTFT 1.40x (loop order + ring = Option B), decode 2.1x (engine-store hit-rate 35% vs 68.5%).
+
+Falsified (see HANDOVER-2026-10-23.md §2): mm8-as-decode-fix, tier-side hot-set placement (L3 neutral, replicated), whole-layer dmoe (TTFT doubled), byte-economy-as-2.8x (counter mismatch; 1.24x real).
+
+PORT_PLAN below is the 2026-10-19/22 decision record; its F-number statuses are historical. The live queue is in HANDOVER-2026-10-23.md.

@@ -1,3 +1,7 @@
+> **Historical decision record (2026-10-19/22).** The F-number statuses below predate the
+> 2026-10-23 parity campaign; several items are landed, falsified or re-attributed since.
+> The live state is `HANDOVER-2026-10-23.md`; falsifications are its §2.
+
 # PORT_PLAN — transplant `colibri-ds4-vulkan` onto a fresh upstream fork
 
 **Status:** decisions taken 2026-10-19 (D3/D4/D5/D10/D11); baseline running · 2026-10-19
