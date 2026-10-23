@@ -5488,8 +5488,16 @@ static void v4_vk_token_issue(V4VkToken *vk, ColiExpertStore *store, int layer,
                               float *expert_weights, int *selected) {
     memset(vk, 0, sizeof(*vk));
     const ColiV4VkTier *tier = coli_v4_vk_tier;
-    if (!tier || tier->store != store || *selected < 1) return;
-    int full = *selected;
+    /* S-store map §5b: this seam is decode (and the MTP/spec drafts, which run
+     * the same S=1 path) -- every ROUTED selection of the token counts in the
+     * mfu table and the store's decode-only hit counters, whichever side
+     * computes it. Before the tier check: a CPU-only run still counts. */
+    int routed = *selected > 0 ? *selected : 0;
+    coli_v4_expert_store_decode_phase(store, 1);
+    for (int k = 0; k < routed; k++)
+        coli_v4_expert_store_mfu_record(store, (ColiExpertKey){layer, expert_ids[k]});
+    if (!tier || tier->store != store || routed < 1) return;
+    int full = routed;
     float *xq = v4_vk_round_rows(input, 1, d);
     int *ids = malloc((size_t)full * sizeof(*ids));
     float *w = malloc((size_t)full * sizeof(*w));
@@ -6375,6 +6383,9 @@ static void v4_vk_batch_issue(V4VkBatch *vk, ColiExpertStore *store, int layer,
                               unsigned char *used) {
     memset(vk, 0, sizeof(*vk));
     const ColiV4VkTier *tier = coli_v4_vk_tier;
+    /* The prefill union: never decode -- its store lookups leave the
+     * decode-only counters, and it never records in the mfu table. */
+    coli_v4_expert_store_decode_phase(store, 0);
     if (!tier || tier->store != store) return;
     size_t routes = (size_t)batch * topk;
     float *xq = v4_vk_round_rows(inputs, batch, d);
@@ -8416,6 +8427,14 @@ failed:
  * banner says so below at store creation. */
 #include "route_trace.h"
 
+/* The decode-only popularity table (the fork's mfu_table.c, lifted as-is —
+ * S-store map §5b). Included inside THIS unit only, like route_trace.h: the
+ * amalgam builds one object per COLI_V4_UNIT_*, the static inline mfu_record
+ * must have a single owner, and the hot store is the unit that loads, counts
+ * and saves the table (<model>/.coli_mfu). The token path records through the
+ * exported coli_v4_expert_store_mfu_record, so no other unit needs the type. */
+#include "mfu_table.h"
+
 
 #ifdef COLI_V4_EXPERIMENTAL_PREFETCH_BATCH
 int coli_st_prefetch_many(
@@ -8507,6 +8526,8 @@ typedef struct {
                         * (#1852): coli_v4_expert_store_add_wait */
     uint8_t *ehit;     /* layers*experts_per_layer: experts routed in the current turn */
     uint8_t *eheat;    /* layers*experts_per_layer: cumulative routing selections, capped 63 */
+    int decode_phase;  /* the token path holds 1, the batch (prefill) path 0: gates
+                        * the decode-only requests_decode/hits_decode counters */
 } V4ExpertStoreState;
 
 static int set_error(char *error, size_t size, const char *format, ...) {
@@ -9300,6 +9321,18 @@ fail:
 typedef struct V4HotPolicy {
     ColiExpertStore *store;
     int pin_count;
+    /* pin_stride: the pins[] row stride = pin_count + frozen_count. The usage
+     * pins keep their exact semantics (merged .coli_usage history, repin
+     * cadence, ramp); the frozen section (COLI_V4_FROZEN_PCT) is ranked by the
+     * decode-only mfu table and sits beside them in the same victim-exempt,
+     * rows16-packing set (hot_is_pinned), so no new victim selector exists. */
+    int pin_stride;
+    int frozen_count;   /* per-layer frozen section size; 0 = today's exact policy */
+    MfuTable mfu;       /* the decode-only popularity table (mfu_table.h): ranks the
+                         * frozen section and the prewarm seed; the fork's .coli_mfu */
+    int mfu_seeded;     /* the loaded table has at least one count: a seed exists */
+    int mfu_dirty;      /* a decode selection was recorded since load: save at destroy */
+    char *mfu_path;     /* <model>/.coli_mfu */
     uint64_t repin_interval;
     uint64_t *usage;
     uint64_t *layer_requests;
@@ -9328,6 +9361,18 @@ static double hot_now(void) {
 static char *hot_history_path(const char *model_dir) {
     if (!model_dir) return NULL;
     const char suffix[] = "/.coli_usage";
+    size_t length = strlen(model_dir) + sizeof(suffix);
+    char *path = malloc(length);
+    if (path) snprintf(path, length, "%s%s", model_dir, suffix);
+    return path;
+}
+
+/* The mfu table's own file, never merged into .coli_usage (the fork's rule:
+ * decode-only popularity is a different population than the merged usage
+ * history, and the fork's .coli_mfu is directly readable by this store). */
+static char *hot_mfu_path(const char *model_dir) {
+    if (!model_dir) return NULL;
+    const char suffix[] = "/.coli_mfu";
     size_t length = strlen(model_dir) + sizeof(suffix);
     char *path = malloc(length);
     if (path) snprintf(path, length, "%s%s", model_dir, suffix);
@@ -9404,7 +9449,7 @@ static V4HotPolicy *hot_find(ColiExpertStore *store) {
 #endif
 
 static int hot_is_pinned(const V4HotPolicy *policy, int layer, int expert) {
-    if (!policy || policy->pin_count < 1 || layer < 0 || expert < 0) return 0;
+    if (!policy || policy->pin_stride < 1 || layer < 0 || expert < 0) return 0;
     int active = policy->pin_count;
 #if COLI_V4_PIN_RAMP_REQUESTS > 0
     if (!policy->history_seeded && active > 4) {
@@ -9414,9 +9459,16 @@ static int hot_is_pinned(const V4HotPolicy *policy, int layer, int expert) {
             ? active : 4 + (int)grown;
     }
 #endif
-    const int *pins = policy->pins + (size_t)layer * policy->pin_count;
+    const int *pins = policy->pins + (size_t)layer * policy->pin_stride;
     for (int i = 0; i < active; i++)
         if (pins[i] == expert) return 1;
+    /* The frozen section (COLI_V4_FROZEN_PCT) rides the same exemption in
+     * every victim selector and the rows16 packing gate: it is history-seeded
+     * at open, so the usage pins' ramp must not gate it. -1 (no K-th expert in
+     * the mfu history yet) never matches. */
+    const int *frozen = pins + policy->pin_count;
+    for (int i = 0; i < policy->frozen_count; i++)
+        if (frozen[i] == expert) return 1;
     return 0;
 }
 
@@ -9859,7 +9911,7 @@ static void hot_repin_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
     if (!policy || policy->pin_count < 1) return;
     uint64_t *usage = policy->usage +
         (size_t)layer * state->experts_per_layer;
-    int *pins = policy->pins + (size_t)layer * policy->pin_count;
+    int *pins = policy->pins + (size_t)layer * policy->pin_stride;
     for (int rank = 0; rank < policy->pin_count; rank++) {
         int best = -1;
         for (int expert = 0; expert < state->experts_per_layer; expert++) {
@@ -9888,6 +9940,50 @@ static void hot_repin_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
         policy->layer_requests[layer] % decay_interval == 0)
         for (int expert = 0; expert < state->experts_per_layer; expert++)
             usage[expert] = (usage[expert] + 1) / 2;
+}
+
+/* The frozen MFU section (S-store map §5a): rank each layer's experts by the
+ * decode-only mfu table and write the top frozen_count beside the usage pins,
+ * in the same pins[] row. Victim exemption, the pool borrow guard and the
+ * rows16 packing gate all read hot_is_pinned, so the section is frozen without
+ * a new victim selector; the re-touch below keeps already-resident members at
+ * their partition's recency head exactly like hot_repin_locked, so the MRU
+ * tail left beside them serves recency. state->mutex held; same callers and
+ * cadence as hot_repin_locked. Ranks re-derive from live counts, and counts
+ * only grow, so there is no demote/ping-pong step here. */
+static void hot_freeze_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
+                              int layer) {
+    if (!policy || policy->frozen_count < 1 || layer < 0 ||
+        layer >= state->layers || layer >= MFU_NUM_LAYERS) return;
+    const uint32_t *ref =
+        policy->mfu.counts + (size_t)layer * MFU_EXPERTS_PER_LAYER;
+    int limit = state->experts_per_layer < MFU_EXPERTS_PER_LAYER
+        ? state->experts_per_layer : MFU_EXPERTS_PER_LAYER;
+    int *frozen = policy->pins + (size_t)layer * policy->pin_stride +
+                  policy->pin_count;
+    for (int rank = 0; rank < policy->frozen_count; rank++) {
+        int best = -1;
+        for (int expert = 0; expert < limit; expert++) {
+            int already = 0;
+            for (int prior = 0; prior < rank; prior++)
+                if (frozen[prior] == expert) { already = 1; break; }
+            if (!already && ref[expert] &&
+                (best < 0 || ref[expert] > ref[best] ||
+                 (ref[expert] == ref[best] && expert < best)))
+                best = expert;
+        }
+        frozen[rank] = best;   /* -1: the history has no rank-K expert yet */
+    }
+    for (int rank = 0; rank < policy->frozen_count; rank++) {
+        int expert = frozen[rank];
+        if (expert < 0) continue;
+        V4ExpertSlot *slot = indexed_expert_slot(
+            state, (ColiExpertKey){layer, expert});
+        if (slot && slot->slab && slot->expert == expert) {
+            slot->used = ++state->clock;
+            touch_lru_slot(state, slot);
+        }
+    }
 }
 
 /* Return the exact oldest unreferenced, non-pinned slot.  The fallback is the
@@ -9993,6 +10089,7 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     pthread_mutex_lock(&state->mutex);
     if (!policy->warming) {   /* the fill before the first request is not a use */
     state->stats.requests++;
+    if (state->decode_phase) state->stats.requests_decode++;
     policy->usage[(size_t)key.layer * state->experts_per_layer + key.expert]++;
     if (state->ehit) {
         size_t expert_index =
@@ -10013,8 +10110,10 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     }
     uint64_t layer_requests = ++policy->layer_requests[key.layer];
     if (policy->repin_interval &&
-        layer_requests % policy->repin_interval == 0)
+        layer_requests % policy->repin_interval == 0) {
         hot_repin_locked(policy, state, key.layer);
+        hot_freeze_locked(policy, state, key.layer);
+    }
     }
 
     V4ExpertSlot *slot;
@@ -10024,6 +10123,7 @@ retry_lookup:
         slot->references++;
         state->active_leases++;
         slot->used = ++state->clock; state->stats.hits++;
+        if (state->decode_phase) state->stats.hits_decode++;
         touch_lru_slot(state, slot);
         if (hot_is_pinned(policy, key.layer, key.expert) && !store->gpu)
             hot_pack_slot_locked(policy, state, record, slot);
@@ -10197,6 +10297,34 @@ void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer) {
 int (*coli_v4_expert_store_ram_first)(int layer, int expert);   /* exclusive RAM/VRAM: NULL unless a Vulkan tier sets it */
 void (*coli_v4_expert_store_ram_gave)(void);
 
+/* The decode-only popularity table's engine seam (S-store map §5b). The token
+ * path (v4_vk_token_issue -- decode and MTP/spec drafts) records every ROUTED
+ * selection it was handed, device-served and CPU-computed alike; the batch
+ * path (v4_vk_batch_issue, the prefill union) never records. One record per
+ * (token, rank), the fork's counting unit. Deliberately NOT inside note_routed
+ * or lookup_hot: those serve both phases and must keep the merged .coli_usage
+ * books exactly as they were. */
+void coli_v4_expert_store_mfu_record(ColiExpertStore *store, ColiExpertKey key) {
+    if (!store || !store->state) return;
+    V4HotPolicy *policy = hot_find(store);
+    if (!policy || !get_record(store->state, key) ||
+        key.layer >= MFU_NUM_LAYERS || key.expert >= MFU_EXPERTS_PER_LAYER)
+        return;
+    mfu_record(&policy->mfu, key.layer, key.expert);
+    policy->mfu_dirty = 1;
+}
+
+/* Which population a store lookup belongs to (hit_rate_d): the token path sets
+ * 1 before its lookups, the batch path 0. lookup_hot reads it under
+ * state->mutex, so the plain int write takes the same lock. */
+void coli_v4_expert_store_decode_phase(ColiExpertStore *store, int decode) {
+    if (!store || !store->state || !hot_find(store)) return;
+    V4ExpertStoreState *state = store->state;
+    pthread_mutex_lock(&state->mutex);
+    state->decode_phase = decode ? 1 : 0;
+    pthread_mutex_unlock(&state->mutex);
+}
+
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
 /* The Vulkan routed-expert tier's side of the store (deepseek_v4_internal.h). A
  * routing the device served never comes through lookup_hot, so it is counted here
@@ -10220,8 +10348,10 @@ void coli_v4_expert_store_note_routed(ColiExpertStore *store, ColiExpertKey key)
     }
     rt_count(key.layer, &key.expert, 1);
     uint64_t layer_requests = ++policy->layer_requests[key.layer];
-    if (policy->repin_interval && layer_requests % policy->repin_interval == 0)
+    if (policy->repin_interval && layer_requests % policy->repin_interval == 0) {
         hot_repin_locked(policy, state, key.layer);
+        hot_freeze_locked(policy, state, key.layer);
+    }
     pthread_mutex_unlock(&state->mutex);
 }
 
@@ -10288,6 +10418,18 @@ static void destroy_hot(ColiExpertStore *store) {
     pthread_mutex_unlock(&hot_policies_mutex);
     if (policy) {
         hot_usage_save(policy, store ? store->state : NULL);
+        /* The mfu table follows the fork's rule, not .coli_usage's: saved at
+         * destroy whenever a decode selection was recorded, regardless of any
+         * knob -- COLI_V4_FROZEN_PCT=0 and COLI_V4_PREWARM=0 still persist,
+         * because the file is the next run's seed and this counter's
+         * provenance, not a usage trace. A run that recorded nothing (cold,
+         * prefill-only, CPU-only without the token seam) leaves no file. */
+        if (policy->mfu_dirty && policy->mfu_path) {
+            if (mfu_save(&policy->mfu, policy->mfu_path))
+                fprintf(stderr, "v4_mfu warning=cannot-save-history path=%s\n",
+                        policy->mfu_path);
+            policy->mfu_dirty = 0;
+        }
         fprintf(stderr, "v4_rows16 packed_slots=%llu\n",
                 (unsigned long long)policy->packed_slots);
         fprintf(stderr,
@@ -10302,6 +10444,7 @@ static void destroy_hot(ColiExpertStore *store) {
                 (unsigned long long)__atomic_load_n(
                     &v4_direct_payload_bytes, __ATOMIC_RELAXED));
         free(policy->history_path);
+        free(policy->mfu_path);
         free(policy->packed); free(policy->pins);
         free(policy->layer_requests); free(policy->usage); free(policy);
     }
@@ -10331,9 +10474,9 @@ int coli_v4_expert_store_prewarm(ColiExpertStore *store) {
     int per_layer = state->slots_per_layer < experts
         ? state->slots_per_layer : experts;
     int every = per_layer >= experts;
-    if (!every && !policy->history_total) {
+    if (!every && !policy->history_total && !policy->mfu_seeded) {
         fprintf(stderr, "[v4] expert cache: %d of %d experts per layer fit and no "
-                "usage history says which, so it fills as experts are used\n",
+                "usage or decode history says which, so it fills as experts are used\n",
                 per_layer, experts);
         return 0;
     }
@@ -10341,14 +10484,39 @@ int coli_v4_expert_store_prewarm(ColiExpertStore *store) {
     int *order = every ? NULL : malloc((size_t)experts * sizeof(*order));
     if (!keys || (!every && !order)) { free(keys); free(order); return -1; }
     size_t count = 0;
+    int ranked_by_mfu = 0;   /* some layer ranked by the mfu table: re-stamp after */
     for (int layer = 0; layer < layers; layer++) {
         if (every) {
             for (int expert = 0; expert < experts; expert++)
                 keys[count++] = (ColiExpertKey){layer, expert};
             continue;
         }
-        /* the per_layer most selected, ties to the lower id; never selected ones stay out */
+        /* the per_layer most selected, ties to the lower id; never selected ones stay out.
+         * S-store map §5c-seed: a layer with decode-only mfu history ranks by it
+         * (the fork's .coli_mfu -- capacity plus a warm seed is the load-bearing
+         * half of its hit rate); a layer without keeps the merged usage history.
+         * One source per layer: the two tables count different populations and
+         * their raw counts must not be compared. */
         const uint64_t *use = policy->usage + (size_t)layer * experts;
+        uint64_t *mfu_seed = NULL;
+        if (layer < MFU_NUM_LAYERS) {
+            const uint32_t *ref =
+                policy->mfu.counts + (size_t)layer * MFU_EXPERTS_PER_LAYER;
+            int limit = experts < MFU_EXPERTS_PER_LAYER
+                ? experts : MFU_EXPERTS_PER_LAYER;
+            int any = 0;
+            for (int expert = 0; expert < limit; expert++)
+                if (ref[expert]) { any = 1; break; }
+            if (any) {
+                mfu_seed = malloc((size_t)experts * sizeof(*mfu_seed));
+                if (mfu_seed) {
+                    for (int expert = 0; expert < experts; expert++)
+                        mfu_seed[expert] = expert < limit ? ref[expert] : 0;
+                    use = mfu_seed;
+                    ranked_by_mfu = 1;
+                }
+            }
+        }
         for (int expert = 0; expert < experts; expert++) order[expert] = expert;
         for (int rank = 0; rank < per_layer; rank++) {
             int best = rank;
@@ -10358,6 +10526,7 @@ int coli_v4_expert_store_prewarm(ColiExpertStore *store) {
             if (!use[chosen]) break;
             keys[count++] = (ColiExpertKey){layer, chosen};
         }
+        free(mfu_seed);
     }
     free(order);
     if (!count) { free(keys); return 0; }
@@ -10403,14 +10572,29 @@ int coli_v4_expert_store_prewarm(ColiExpertStore *store) {
         }
     }
     policy->warming = 0;
-    free(keys);
 
     pthread_mutex_lock(&state->mutex);
     uint64_t resident = state->stats.resident_bytes;
     state->stats = before;
     state->stats.resident_bytes = resident;
     state->disk_sec = disk_before;
+    /* The mfu-ranked fill reads in rank order, so without this the hottest
+     * seeds are each partition's OLDEST entries and the first misses evict
+     * exactly them (the fork measured pool=0 disk=283 at layer 0 with a fully
+     * warm pool from this; fork deepseek_v4.c:15990-16000 re-stamps for the
+     * same reason). Re-stamp in reverse rank order so popularity order is
+     * recency order and the coldest seed is the first to go. A usage-ranked
+     * fill keeps today's ordering. */
+    if (!every && ranked_by_mfu)
+        for (size_t i = count; i > 0; i--) {
+            V4ExpertSlot *slot = indexed_expert_slot(state, keys[i - 1]);
+            if (slot && slot->slab && slot->expert == keys[i - 1].expert) {
+                slot->used = ++state->clock;
+                touch_lru_slot(state, slot);
+            }
+        }
     pthread_mutex_unlock(&state->mutex);
+    free(keys);
     double seconds = hot_now() - began;
     fprintf(stderr, "[v4] expert cache: %zu experts, %.1f GiB, read in %.1f s (%.2f GiB/s)\n",
             done, (double)resident / 1073741824.0, seconds,
@@ -10462,9 +10646,28 @@ int COLI_V4_ROWS16_STORE_OPEN(
     int pin_count = requested > (uint64_t)maximum_pins
         ? maximum_pins : (int)requested;
     if (pin_count < 0) pin_count = 0;
+    /* The frozen MFU section (S-store map §5a): COLI_V4_FROZEN_PCT percent of
+     * the layer's slots, a victim-exempt set ranked by the decode-only mfu
+     * table instead of the merged usage history. Its cap is the layer's own
+     * spare slots (slots_per_layer - minimum_slots), NOT the usage pins'
+     * COLI_V4_MAX_PIN_SLOTS_PER_LAYER: 100% must be able to lift past 16
+     * (48 slots -> 42 frozen, the 6-slot decode reserve and the pool borrow
+     * stay intact). Default 0 = today's exact policy. */
+    int spare_slots = state->slots_per_layer - minimum_slots;
+    int frozen_count = 0;
+    const char *frozen_env = getenv("COLI_V4_FROZEN_PCT");
+    if (frozen_env && *frozen_env) {
+        long pct = strtol(frozen_env, NULL, 10);
+        if (pct > 0) {
+            long want = (long)state->slots_per_layer * pct / 100;
+            if (want > (long)spare_slots) want = spare_slots;
+            frozen_count = want > 0 ? (int)want : 0;
+        }
+    }
+    int pin_stride = pin_count + frozen_count;
     V4HotPolicy *policy = calloc(1, sizeof(*policy));
     size_t records = (size_t)state->layers * state->experts_per_layer;
-    size_t pins = (size_t)state->layers * (pin_count ? pin_count : 1);
+    size_t pins = (size_t)state->layers * (pin_stride ? pin_stride : 1);
     size_t slots = (size_t)state->layers * state->slots_per_layer;
     if (policy) policy->usage = calloc(records, sizeof(*policy->usage));
     if (policy) policy->layer_requests = calloc(
@@ -10481,8 +10684,11 @@ int COLI_V4_ROWS16_STORE_OPEN(
     }
     for (size_t i = 0; i < pins; i++) policy->pins[i] = -1;
     policy->store = *output; policy->pin_count = pin_count;
+    policy->pin_stride = pin_stride; policy->frozen_count = frozen_count;
     policy->keep_free = options->keep_free_bytes;
     policy->history_path = hot_history_path(options->model_dir);
+    mfu_init(&policy->mfu);
+    policy->mfu_path = hot_mfu_path(options->model_dir);
     policy->repin_interval = options->repin_interval
         ? options->repin_interval : (uint64_t)minimum_slots;
     if (!policy->repin_interval) policy->repin_interval = 1;
@@ -10501,13 +10707,29 @@ int COLI_V4_ROWS16_STORE_OPEN(
             for (int layer = 0; layer < state->layers; layer++)
                 hot_repin_locked(policy, state, layer);
     }
+    /* The mfu table loads whatever the phase -- the seed (prewarm ranking) and
+     * the frozen section need it with COLI_V4_FROZEN_PCT=0 too. A missing or
+     * corrupt file is a cold start (mfu_load leaves the zeroed table). */
+    if (policy->mfu_path &&
+        mfu_load(&policy->mfu, policy->mfu_path) == 0) {
+        if (policy->mfu.total_accesses)
+            fprintf(stderr, "v4_mfu history=%s selections=%llu\n",
+                    policy->mfu_path,
+                    (unsigned long long)policy->mfu.total_accesses);
+        for (size_t i = 0; i < MFU_NUM_EXPERTS && !policy->mfu_seeded; i++)
+            if (policy->mfu.counts[i]) policy->mfu_seeded = 1;
+    }
+    if (policy->frozen_count > 0)
+        for (int layer = 0; layer < state->layers; layer++)
+            hot_freeze_locked(policy, state, layer);
     pthread_mutex_lock(&hot_policies_mutex);
     policy->next = hot_policies; hot_policies = policy;
     pthread_mutex_unlock(&hot_policies_mutex);
     (*output)->ops = &hot_operations;
     fprintf(stderr,
-            "v4_hot_policy pin_slots_per_layer=%d repin_interval=%llu "
-            "mode=resident-ram rows16=hot-pins\n", pin_count,
+            "v4_hot_policy pin_slots_per_layer=%d frozen_per_layer=%d "
+            "repin_interval=%llu "
+            "mode=resident-ram rows16=hot-pins\n", pin_count, frozen_count,
             (unsigned long long)policy->repin_interval);
     /* COLI_V4_PREWARM=1 fills the cache here, in any run; unset, a serve fills it
      * before READY (v4_serve_main) and a one-shot run leaves it to the misses. */
@@ -15134,11 +15356,22 @@ static ColiExpertStoreStats stats_subtract(ColiExpertStoreStats end,
     delta.misses -= begin.misses; delta.prefetched -= begin.prefetched;
     delta.prefetch_hits -= begin.prefetch_hits;
     delta.bytes_read -= begin.bytes_read;
+    delta.requests_decode -= begin.requests_decode;
+    delta.hits_decode -= begin.hits_decode;
     return delta;
 }
 
 static double stats_hit_rate(ColiExpertStoreStats stats) {
     return stats.requests ? 100.0 * stats.hits / stats.requests : 0.0;
+}
+
+/* hit_rate_d: the decode-only view (S-store map §5b) -- the number the store
+ * campaign's verdict is pre-registered on, comparable with an engine whose
+ * prefill never touches the store. Zero when the token seam never ran (a
+ * CPU-only or prefill-only build): it is a counter, not a behaviour. */
+static double stats_hit_rate_decode(ColiExpertStoreStats stats) {
+    return stats.requests_decode
+        ? 100.0 * stats.hits_decode / stats.requests_decode : 0.0;
 }
 
 #ifdef COLI_V4_EXPERIMENTAL_STATE_HASH
@@ -18743,12 +18976,14 @@ int main(int argc, char **argv) {
     experts->ops->stats(experts, &stats_end);
     fprintf(stderr, "v4_tokens prompt=%d generated=%d total=%d "
            "expert_requests=%llu hits=%llu misses=%llu hit_rate=%.3f "
+           "hit_rate_d=%.3f "
            "bytes=%llu target_only=%d\n",
            gen_stats.prompt_tokens, gen_stats.generated_tokens,
            gen_stats.prompt_tokens + gen_stats.generated_tokens,
            (unsigned long long)stats_end.requests,
            (unsigned long long)stats_end.hits,
            (unsigned long long)stats_end.misses, stats_hit_rate(stats_end),
+           stats_hit_rate_decode(stats_end),
            (unsigned long long)stats_end.bytes_read, target_only);
     /* One line, every engine, one format: `coli tune` sweeps scheduling knobs and
      * needs tokens-and-elapsed to compare candidates. Before this only colibri

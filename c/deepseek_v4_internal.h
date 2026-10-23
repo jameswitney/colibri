@@ -735,6 +735,19 @@ int coli_deepseek_v4_expert_store_open_base(
  * Alternative registered ExpertStore backends safely ignore the request. */
 void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer);
 
+/* The decode-only popularity table (mfu_table.h, the fork's .coli_mfu; S-store
+ * map §5b). Record one ROUTED selection of a decode/spec token -- the token
+ * path calls it for every selection it was handed, device-served and CPU
+ * alike; the batch (prefill) path never records. The merged .coli_usage books
+ * (rt_count, pin ranking, HITS heat) are untouched by this path.
+ *
+ * decode_phase marks which population a store lookup belongs to: the token
+ * path sets 1 around its lookups, the batch path 0, so stats.requests_decode /
+ * hits_decode (hit_rate_d) count decode-only store traffic. Both are no-ops on
+ * a registered non-hot ExpertStore backend. */
+void coli_v4_expert_store_mfu_record(ColiExpertStore *store, ColiExpertKey key);
+void coli_v4_expert_store_decode_phase(ColiExpertStore *store, int decode);
+
 /* Exclusive RAM/VRAM (vk_tier.h's vkt_ram_first): when set, a full RAM cache gives up
  * first a slot whose expert the device holds, and reports it through ram_gave. The
  * store's eviction reads them in every build; only a Vulkan one sets them. */

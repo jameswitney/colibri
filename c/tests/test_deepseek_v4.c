@@ -1,6 +1,7 @@
 /* Merged DeepSeek V4 unit tests (GLM-style single harness). */
 #include "../deepseek_v4_internal.h"
 #include "../compat.h"
+#include "../mfu_table.h"
 #include "../native_quant.h"
 #include "../native_quant_batch.h"
 #include "../native_quant_dual.h"
@@ -1527,6 +1528,236 @@ out:
     return 0;
 }
 #endif /* COLI_VULKAN || COLI_CUDA */
+
+/* S7, the engine-store MFU cache (S-store map §5a/§5b/§5c-seed): the
+ * decode-only mfu table beside the store. Four behaviours:
+ *   hit_rate_d      -- decode_phase(1) lookups count requests_decode/hits_decode,
+ *                      prefill-phase lookups do not;
+ *   persistence     -- the fork's rule: <model>/.coli_mfu is saved at destroy iff
+ *                      a decode selection was recorded, knob or no knob, and a
+ *                      run that recorded nothing leaves no file (default-off
+ *                      byte-identity for the file, alongside the suite's other
+ *                      default-path tests for the policy itself);
+ *   the seed        -- COLI_V4_PREWARM=1 ranks each layer by .coli_mfu when it
+ *                      has seen the layer (not by the merged .coli_usage), and
+ *                      re-stamps LRU age in reverse rank order so the first
+ *                      miss eats the coldest seed, not the hottest;
+ *   the freeze      -- COLI_V4_FROZEN_PCT rides the pin machinery: a recency
+ *                      storm cannot evict the frozen set, and the same storm
+ *                      without the knob evicts exactly those experts. */
+static int test_expert_store_mfu(void) {
+    enum { LAYERS = 2, EXPERTS = 16, SLOTS = 8, NARROW = 6 };
+    char directory[] = "colibri-v4-mfu-XXXXXX";
+    char path[256], mfu_path[300], usage_path[300], error[256];
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
+    unsetenv("COLI_V4_PREWARM");
+    unsetenv("COLI_V4_FROZEN_PCT");
+    if (!mkdtemp(directory)) { perror("mkdtemp mfu"); return 1; }
+    snprintf(path, sizeof(path), "%s/model.safetensors", directory);
+    snprintf(mfu_path, sizeof(mfu_path), "%s/.coli_mfu", directory);
+    snprintf(usage_path, sizeof(usage_path), "%s/.coli_usage", directory);
+    if (write_fixture_layers(path, LAYERS, EXPERTS)) {
+        perror("write mfu fixture");
+        rmdir(directory);
+        return 1;
+    }
+    int failed = 0;
+    ColiExpertStore *store = NULL;
+    ColiExpertStoreStats stats;
+    ColiDeepSeekV4ExpertStoreOptions options = {
+        directory, LAYERS, EXPERTS, (uint64_t)LAYERS * SLOTS * 51, -1, 0, 0, 0
+    };
+
+    /* -- hit_rate_d counts decode lookups only -- */
+    if (coli_deepseek_v4_expert_store_open(&options, &store, error, sizeof(error))) {
+        fprintf(stderr, "mfu store open failed: %s\n", error);
+        failed = 1;
+        goto out;
+    }
+    coli_v4_expert_store_decode_phase(store, 1);
+    for (int i = 0; i < 3 && !failed; i++)
+        failed = lookup_fixture_at(store, 0, i % 2, EXPERTS);   /* miss, hit, miss */
+    coli_v4_expert_store_decode_phase(store, 0);
+    for (int i = 0; i < 2 && !failed; i++)
+        failed = lookup_fixture_at(store, 0, 2, EXPERTS);       /* miss, hit */
+    store->ops->stats(store, &stats);
+    if (stats.requests != 5 || stats.hits != 2 ||
+        stats.requests_decode != 3 || stats.hits_decode != 1) {
+        fprintf(stderr, "decode-only counters: requests=%llu hits=%llu "
+                "requests_decode=%llu hits_decode=%llu (want 5/2/3/1)\n",
+                (unsigned long long)stats.requests,
+                (unsigned long long)stats.hits,
+                (unsigned long long)stats.requests_decode,
+                (unsigned long long)stats.hits_decode);
+        failed = 1;
+    }
+    store->ops->destroy(store);
+    store = NULL;
+    /* nothing was recorded: the fork's rule leaves no file behind */
+    FILE *leftover = fopen(mfu_path, "r");
+    if (leftover) fclose(leftover);
+    if (!failed && leftover) {
+        fprintf(stderr, "a run with no recorded selection wrote %s\n", mfu_path);
+        failed = 1;
+    }
+    if (failed) goto out;
+
+    /* -- a recorded run persists, knob or no knob, and reloads -- */
+    if (coli_deepseek_v4_expert_store_open(&options, &store, error, sizeof(error))) {
+        fprintf(stderr, "mfu record store open failed: %s\n", error);
+        failed = 1;
+        goto out;
+    }
+    for (int i = 0; i < 3; i++)
+        coli_v4_expert_store_mfu_record(store, (ColiExpertKey){0, 0});
+    for (int i = 0; i < 2; i++)
+        coli_v4_expert_store_mfu_record(store, (ColiExpertKey){0, 5});
+    coli_v4_expert_store_mfu_record(store, (ColiExpertKey){1, 7});
+    store->ops->destroy(store);
+    store = NULL;
+    MfuTable table;
+    mfu_init(&table);
+    int load_result = mfu_load(&table, mfu_path);
+    if (load_result != 0 || table.total_accesses != 6 ||
+        mfu_count(&table, 0, 0) != 3 || mfu_count(&table, 0, 5) != 2 ||
+        mfu_count(&table, 1, 7) != 1) {
+        fprintf(stderr, ".coli_mfu round-trip: load=%d total=%llu "
+                "(0,0)=%u (0,5)=%u (1,7)=%u\n",
+                load_result,
+                (unsigned long long)table.total_accesses,
+                mfu_count(&table, 0, 0), mfu_count(&table, 0, 5),
+                mfu_count(&table, 1, 7));
+        failed = 1;
+        goto out;
+    }
+
+    /* -- the prewarm seed ranks by .coli_mfu, not the merged usage -- */
+    unlink(mfu_path);
+    mfu_init(&table);
+    table.counts[0 * MFU_EXPERTS_PER_LAYER + 2] = 100;
+    table.counts[0 * MFU_EXPERTS_PER_LAYER + 5] = 80;
+    table.counts[0 * MFU_EXPERTS_PER_LAYER + 9] = 60;
+    table.counts[0 * MFU_EXPERTS_PER_LAYER + 12] = 40;
+    table.counts[0 * MFU_EXPERTS_PER_LAYER + 7] = 30;
+    table.counts[0 * MFU_EXPERTS_PER_LAYER + 1] = 20;
+    table.counts[1 * MFU_EXPERTS_PER_LAYER + 1] = 50;
+    table.counts[1 * MFU_EXPERTS_PER_LAYER + 4] = 45;
+    if (mfu_save(&table, mfu_path)) { perror("mfu_save seed"); failed = 1; goto out; }
+    FILE *usage = fopen(usage_path, "w");   /* a usage history that ranks elsewhere */
+    if (!usage) { perror("usage seed"); failed = 1; goto out; }
+    for (int expert = 0; expert < NARROW; expert++)
+        fprintf(usage, "0 %d %d\n1 %d %d\n", expert, 90 - 10 * expert,
+                expert, 90 - 10 * expert);
+    fclose(usage);
+    setenv("COLI_V4_AUTOPIN", "1", 1);
+    setenv("COLI_V4_PREWARM", "1", 1);
+    ColiDeepSeekV4ExpertStoreOptions narrow = {
+        directory, LAYERS, EXPERTS, (uint64_t)LAYERS * NARROW * 51, -1, 0, 0, 0
+    };
+    if (coli_deepseek_v4_expert_store_open(&narrow, &store, error, sizeof(error))) {
+        fprintf(stderr, "mfu seed store open failed: %s\n", error);
+        failed = 1;
+        goto out;
+    }
+    store->ops->stats(store, &stats);
+    if (stats.requests) {
+        fprintf(stderr, "the mfu-seeded prewarm counted a request\n");
+        failed = 1;
+    }
+    for (int layer = 0; layer < LAYERS && !failed; layer++)
+        for (int expert = 0; expert < EXPERTS && !failed; expert++) {
+            int want = layer == 0
+                ? (expert == 1 || expert == 2 || expert == 5 || expert == 7 ||
+                   expert == 9 || expert == 12)
+                : (expert == 1 || expert == 4);
+            int have = coli_v4_test_expert_slot_index(
+                store, (ColiExpertKey){layer, expert}) >= 0;
+            if (have != want) {
+                fprintf(stderr, "mfu-seeded prewarm: layer %d expert %d %s\n",
+                        layer, expert,
+                        have ? "read but not in the mfu top"
+                             : "in the mfu top but not read");
+                failed = 1;
+            }
+        }
+    /* the re-stamp: the first miss eats the coldest seed (1), never the
+     * hottest (2) -- without it the fill order leaves expert 2 the oldest */
+    if (!failed) failed = lookup_fixture_at(store, 0, 0, EXPERTS);
+    if (!failed &&
+        (coli_v4_test_expert_slot_index(store, (ColiExpertKey){0, 2}) < 0 ||
+         coli_v4_test_expert_slot_index(store, (ColiExpertKey){0, 1}) >= 0)) {
+        fprintf(stderr, "the seed re-stamp: expert 2 evicted or expert 1 resident "
+                "after one cold miss\n");
+        failed = 1;
+    }
+    store->ops->destroy(store);
+    store = NULL;
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    unsetenv("COLI_V4_PREWARM");
+    unlink(usage_path);
+    unlink(mfu_path);
+    if (failed) goto out;
+
+    /* -- the frozen section survives a recency storm; without the knob the
+     * same storm eats exactly those experts -- */
+    mfu_init(&table);
+    table.counts[0 * MFU_EXPERTS_PER_LAYER + 3] = 100;
+    table.counts[0 * MFU_EXPERTS_PER_LAYER + 5] = 50;
+    if (mfu_save(&table, mfu_path)) { perror("mfu_save frozen"); failed = 1; goto out; }
+    setenv("COLI_V4_FROZEN_PCT", "100", 1);   /* 8 slots -> min(8, 8-6) = 2 frozen */
+    if (coli_deepseek_v4_expert_store_open(&options, &store, error, sizeof(error))) {
+        fprintf(stderr, "frozen store open failed: %s\n", error);
+        failed = 1;
+        goto out;
+    }
+    /* load every expert once (the frozen ones included), then storm the rest */
+    for (int expert = 0; expert < EXPERTS && !failed; expert++)
+        failed = lookup_fixture_at(store, 0, expert, EXPERTS);
+    for (int pass = 0; pass < 2 && !failed; pass++)
+        for (int expert = 0; expert < EXPERTS && !failed; expert++)
+            if (expert != 3 && expert != 5)
+                failed = lookup_fixture_at(store, 0, expert, EXPERTS);
+    if (!failed &&
+        (coli_v4_test_expert_slot_index(store, (ColiExpertKey){0, 3}) < 0 ||
+         coli_v4_test_expert_slot_index(store, (ColiExpertKey){0, 5}) < 0)) {
+        fprintf(stderr, "the recency storm evicted a frozen expert\n");
+        failed = 1;
+    }
+    store->ops->destroy(store);
+    store = NULL;
+    unsetenv("COLI_V4_FROZEN_PCT");
+    if (coli_deepseek_v4_expert_store_open(&options, &store, error, sizeof(error))) {
+        fprintf(stderr, "unfrozen store open failed: %s\n", error);
+        failed = 1;
+        goto out;
+    }
+    for (int expert = 0; expert < EXPERTS && !failed; expert++)
+        failed = lookup_fixture_at(store, 0, expert, EXPERTS);
+    for (int pass = 0; pass < 2 && !failed; pass++)
+        for (int expert = 0; expert < EXPERTS && !failed; expert++)
+            if (expert != 3 && expert != 5)
+                failed = lookup_fixture_at(store, 0, expert, EXPERTS);
+    if (!failed &&
+        (coli_v4_test_expert_slot_index(store, (ColiExpertKey){0, 3}) >= 0 ||
+         coli_v4_test_expert_slot_index(store, (ColiExpertKey){0, 5}) >= 0)) {
+        fprintf(stderr, "without COLI_V4_FROZEN_PCT the storm kept the mfu-hot "
+                "experts: the default is not today's policy\n");
+        failed = 1;
+    }
+
+out:
+    if (store) store->ops->destroy(store);
+    unsetenv("COLI_V4_FROZEN_PCT");
+    unsetenv("COLI_V4_PREWARM");
+    unlink(mfu_path);
+    unlink(usage_path);
+    if (scratch_remove(directory, path)) return 1;
+    if (failed) return 1;
+    puts("DeepSeek-V4 ExpertStore mfu: ok");
+    return 0;
+}
 /* ==== end test_deepseek_v4_expert_store.c ==== */
 
 /* ==== begin test_deepseek_v4_kv_cache.c ==== */
@@ -2120,6 +2351,10 @@ int main(int argc, char **argv) {
     }
     if (test_expert_store_prewarm() != 0) {
         fprintf(stderr, "FAIL: test_expert_store_prewarm\n");
+        return 1;
+    }
+    if (test_expert_store_mfu() != 0) {
+        fprintf(stderr, "FAIL: test_expert_store_mfu\n");
         return 1;
     }
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)

@@ -7,6 +7,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `COLI_V4_FROZEN_PCT` + `.coli_mfu` + `hit_rate_d` (DeepSeek V4): the
+  engine-store MFU cache — the fork's cache approach on the port's store
+  (S-store map, `docs/research/S-store-mfu-map-2026-10-23.md`). The fork's
+  `mfu_table.{c,h}` is lifted as-is: a flat decode-only counter per expert,
+  one `mfu_record` per routed selection of a decode/spec token (the token
+  seam `v4_vk_token_issue` — the batch/prefill seam never counts), persisted
+  as `<model>/.coli_mfu` at store close whenever anything was recorded,
+  knob or no knob (the fork's rule: the file is the next run's seed; a run
+  that recorded nothing writes nothing — CPU-only and prefill-only runs
+  leave no file). On top of it: `COLI_V4_FROZEN_PCT` (default `0` = today's
+  exact policy) freezes that percent of each layer's slots, victim-exempt
+  and ranked by `.coli_mfu`, riding the existing pin machinery — a separate
+  `frozen_count` beside `pin_count` (capped at `slots_per_layer - 6`, not
+  the 16-slot pin cap, so 100% lifts to 42/48) in the same `pins[]` row, so
+  no new victim selector and the `.coli_usage` pins keep their exact
+  semantics; `COLI_V4_PREWARM` ranks a layer by `.coli_mfu` when the
+  decode-only history has seen it (the merged usage otherwise) and
+  re-stamps LRU age in reverse rank order after the fill — without it the
+  fill order leaves the hottest seeds the oldest and the first misses eat
+  exactly them (the fork measured this); and the store's stats gain
+  `requests_decode`/`hits_decode`, printed as `hit_rate_d=` on the
+  `v4_tokens` line always — the decode-only hit rate the campaign's verdict
+  is pre-registered on. The mfu table's own decay knob is the fork's
+  `COLI_DSV4_VK_MFU_DECAY_SHIFT` (default `0` = no load decay).
 - `COLI_VK_TIER_STREAM_BYPASS` (DeepSeek V4): the stream fills' cache-bypassing
   reads and the engine's parallel batch reader — the S1+S2 pair of the L1
   byte-economy map (`docs/research/R-l1-byte-economy-map-2026-10-23.md`). The

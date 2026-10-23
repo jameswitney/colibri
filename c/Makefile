@@ -2598,8 +2598,11 @@ SEGMENT_V4_UNITS = $(filter-out COLI_V4_UNIT_PROMPT \
 	COLI_V4_UNIT_GENERATE_STATS,$(V4_TARGET_UNITS)) $(V4_SEGMENT_UNIT)
 SEGMENT_V4_OBJS = $(addprefix $(SEGMENT_BUILD_DIR)/,$(addsuffix .o,$(SEGMENT_V4_UNITS)))
 SEGMENT_V4_REGISTRY_OBJ = $(SEGMENT_BUILD_DIR)/expert_store_registry.o
+# The hot-store unit's mfu table object (Makefile.deepseek-v4's mfu_table.o,
+# built here with the segment flags).
+SEGMENT_V4_MFU_OBJ = $(SEGMENT_BUILD_DIR)/mfu_table.o
 SEGMENT_ALL_OBJS = $(SEGMENT_ENGINE_OBJS) $(SEGMENT_V4_OBJS) \
-	$(SEGMENT_V4_REGISTRY_OBJ)
+	$(SEGMENT_V4_REGISTRY_OBJ) $(SEGMENT_V4_MFU_OBJ)
 SEGMENT_RUNTIME_OBJS = \
 	$(SEGMENT_BUILD_DIR)/segment_runtime.o \
 	$(SEGMENT_BUILD_DIR)/edge_runtime.o
@@ -2634,6 +2637,9 @@ $(SEGMENT_V4_OBJS): $(SEGMENT_BUILD_DIR)/%.o: deepseek_v4.c | $(SEGMENT_BUILD_DI
 
 $(SEGMENT_V4_REGISTRY_OBJ): expert_store_registry.c | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -c expert_store_registry.c -o $@
+
+$(SEGMENT_V4_MFU_OBJ): mfu_table.c mfu_table.h | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -c mfu_table.c -o $@
 
 $(SEGMENT_BUILD_DIR)/segment_runtime.o: segment_runtime.c | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -c segment_runtime.c -o $@
@@ -2737,6 +2743,7 @@ V4_TEST_LINK_OBJS = \
 	COLI_V4_UNIT_SPARSE_ATTENTION.o \
 	COLI_V4_UNIT_RESOURCE_PLAN.o \
 	COLI_V4_UNIT_PROMPT.o \
+	mfu_table.o \
 	$(filter-out COLI_V4_UNIT_EXPERT_STORE.o COLI_V4_UNIT_EXPERT.o,$(addsuffix .o,$(V4_TEST_UNITS))) \
 	$(V4_HOT_TEST_OBJ) \
 	$(V4_BATCH_TEST_OBJ) \
@@ -2760,7 +2767,7 @@ tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c sse41_kernels.h deepseek_
 		COLI_V4_UNIT_ROUTE_BF16.o \
 		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o \
 		COLI_V4_UNIT_NATIVE_QUANT_DUAL.o COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o \
-		COLI_V4_UNIT_EXPERT_ROWS16.o \
+		COLI_V4_UNIT_EXPERT_ROWS16.o mfu_table.o \
 		$(V4_HOT_TEST_OBJ) \
 		$(V4_BATCH_TEST_OBJ) \
 		$(V4_TEST_EXTRA_TARGETS)
