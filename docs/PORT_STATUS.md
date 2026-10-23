@@ -101,3 +101,10 @@ Landed on port/up-2276 (through 9739c812): mm8 tiled fp8 GEMM (reviewed; PR bran
 Falsified (see HANDOVER-2026-10-23.md §2): mm8-as-decode-fix, tier-side hot-set placement (L3 neutral, replicated), whole-layer dmoe (TTFT doubled), byte-economy-as-2.8x (counter mismatch; 1.24x real).
 
 PORT_PLAN below is the 2026-10-19/22 decision record; its F-number statuses are historical. The live queue is in HANDOVER-2026-10-23.md.
+
+## Session 2026-10-23 II (the parity campaign, manager-run — wave 2)
+
+- **Upstream 176-commit range merged** (b90a369e..7398a85f): merge `4740f41f`, report `docs/research/N2-up176-merge-report.md` (`707cf2e3`). All gates green at tip. The vk-strict-check intermittence is **pre-existing** (base `3064378e` fails 1/12 with the identical signature; the tier exit `frag N.NN` ratio is unmasked by `norm`) — a `frag` mask is queued as a PR candidate; 1 PASS in ≤3 runs is the accepted protocol.
+- **L7 (F8 decode projections) closed NO-GO at Step 0** on the pre-registered rule: the fmt-12 S=1 GEMV bucket is 57.3 ms/tok = **13.1 % of the 439 ms/tok decode device wait** (< 25 % bar); a perfect kernel buys ≤ 2.5 % of the decode wall. Decode attribution now: wall 1,770 ms/tok = device wait 439 (24.8 %) + host ≈ 1,331 (75 %); only 20.5 % of routed experts device-resident; buckets MLAW 71.1 > attn 63.8 > fmt-12 57.3 > mHC 36.1 ms/tok; new observation: ~200 ms/tok fence-vs-timestamp pipeline gap. Logs: `bench-colibri/up2276/gemv8-step0-prof-{8,24}.log` (manager's rig dir; copy into `bench/up2276/` at the next arm commit).
+- **L2 Stage B landed** (`5a165efc`): `vkc_moe_rows` takes fmt 7 through the mx pipelines (`KC.mod_mx/mx/mx_tried`, `mx_pipe()`, 36-B push constants, prewarm `ex_mx`); fmt-7 rows vs chain_moe 1.16e-9 / 3.78e-10 (gate 1e-4); kind-2 router oracle added (ids exact, weights 2.24e-7, ties bit-equal). Full gate set green; CUDA double-compile green.
+- Next: L2 Stage A (V4 wiring, `COLI_VK_DMOE_ROWS` opt-in, tiny-check-dmoe) then the serialized bench window with a fresh post-merge control baseline (C0/D1/D2 arms per the L2 spec §7).
