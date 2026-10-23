@@ -1115,7 +1115,8 @@ static int grow_rows(int need) {
  * of a step between issue and join, loads included). Below R the CPU keeps the expert:
  * its rows cost the CPU less than the upload. Until both are measured R = G.
  * COLI_VK_TIER_STREAM_ROWS=n fixes R at n (tests). A [VK] line per forward says what the
- * rule gave, and the run's line how much streamed. */
+ * rule gave, and the run's line how much streamed and the R it settled at (an arm that
+ * changes the load path moves bw_up, so R moves with it: compare arms at the same R). */
 static double vkt_now_ms(void);
 static int stream_min_rows(void) {
     if (T.st_rows_env > 0) return T.st_rows_env;
@@ -2993,10 +2994,10 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     if (T.st_ok && T.st_steps) {
         char hs[32];
         fprintf(stderr, " | stream: %llu steps, %llu cold experts (%s, %.2f GB/s) and %llu rows streamed in %llu sub-batches, "
-                "prefetched %llu (%llu used), %llu cold experts (%llu rows) kept on the CPU",
+                "prefetched %llu (%llu used), %llu cold experts (%llu rows) kept on the CPU, R=%d%s",
                 T.st_steps, T.st_experts, human((double)T.st_bytes, hs, sizeof hs),
                 T.st_up_ms > 0 ? (double)T.st_bytes / T.st_up_ms / 1e6 : 0.0, T.st_rows, T.st_subs, T.pf_n, T.pf_used,
-                T.st_kept, T.st_kept_rows);
+                T.st_kept, T.st_kept_rows, stream_min_rows(), T.st_rows_env > 0 ? " (fixed)" : "");
         if (T.st_sums) fprintf(stderr, ", %llu steps summed on the device", T.st_sums);
         if (T.pc_experts) {
             char hc[32];
