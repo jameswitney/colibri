@@ -7,6 +7,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `COLI_VK_CHAIN_DPROF` (the chain, the tier, the V4 CLI bench): G1's slice S0 — the
+  instrumented decode window that settles whether the ~200 ms/token fence-wait-versus-
+  device-time gap is real before any code slice spends on it. `1` (default unset,
+  changing nothing, the output byte for byte) arms three reports over one window:
+  DeepSeek V4's chain opens it on a forward of one row (`vkc_dwin`, a decode step —
+  the prompt's chunked forwards close it again) and stamps each frame at its submission
+  with the role the record site names (`vkc_role`: the dense A1, the shared-expert A2,
+  the dmoe path's frame when armed, the forward's closing tail), so the exit line
+  `chain decode: N fwd, S submits, W waits, X ms wait (A1 … / A2 … / dmoe … / tail …),
+  Y ms device (…), Z ms in vkQueueSubmit` attributes the host's fence waiting to the
+  frame it waited for and the device time (the same timestamps `COLI_VK_CHAIN_PROF`
+  reads; on without it the device split stays 0) to the same frames; the run's own
+  chain line gains the fence-wait count it always counted and never printed
+  (`VkcStats.waits`); the tier adds its decode steps' (`S <= VKT_UP_ROWS`, the share
+  `vkt_report` already splits) waited / device / CPU ms and the MiB `promote` queues
+  over PCIe — H1's traffic term; and the CLI bench prints `v4_dprof decode` with
+  wall / block / head / other per token, `block` the one-row forwards' own span, so
+  the unattributed pool behind the gap is a difference of printed numbers instead of
+  a subtraction PORT_STATUS had to guess at. Counters only, filled where the existing
+  ones already tick — no allocation in the frame, submit or join paths, cheap enough
+  to leave on in an arm; the chain's test gains the window's case (frames inside it
+  counted once each by role, their waits with them, frames outside it counted
+  nowhere).
+
 - `COLI_VK_TIER_POOL_LAYER` (the routed-expert tier): the L2 Stage C lever —
   `COLI_VK_DMOE`'s residency activator that is **not a device pin**. `=n`
   (default unset, changing nothing) plans layer n's experts into the host pool

@@ -2348,6 +2348,40 @@ static void test_frames(void) {
     vkc_free(x); vkc_free(y); free(a); free(acc); free(got);
 }
 
+/* COLI_VK_CHAIN_DPROF: the decode window (vkc_dwin) and the roles (vkc_role) as the
+ * engine stamps them -- frames submitted inside the window count once each by role,
+ * their fence waits with them, and the frames outside it count nowhere. The device
+ * split (d_dev_ms) needs COLI_VK_CHAIN_PROF's query pools, which this run does not
+ * arm: it only checks the counters that every leg reads regardless. */
+static void test_dprof(void) {
+    setenv("COLI_VK_CHAIN_DPROF", "1", 1);
+    int n = 256;
+    float *a = fvec(n, 1.f);
+    VkcBuf *x = vkc_buf((size_t)n * 4, VKC_DEV), *y = vkc_buf((size_t)n * 4, VKC_DEV);
+    VkcStats s0; vkc_stats(&s0);
+    int ok = vkc_dprof();
+    ok &= vkc_begin() && vkc_write(y, 0, a, (size_t)n * 4) && vkc_submit(1);   /* outside the window: counts nowhere */
+    vkc_dwin(1);                                    /* a decode forward opens the window */
+    vkc_role(VKC_R_A1);
+    ok &= vkc_begin() && vkc_write(y, 0, a, (size_t)n * 4) && vkc_submit(0) && vkc_finish();   /* A1, waited at the finish */
+    vkc_role(VKC_R_A2);
+    ok &= vkc_begin() && vkc_write(x, 0, a, (size_t)n * 4) && vkc_submit(1);                    /* A2, submit(1) waits it */
+    vkc_dwin(0);                                   /* the window closes: a prompt forward */
+    ok &= vkc_begin() && vkc_write(y, 0, a, (size_t)n * 4) && vkc_submit(1);   /* outside again */
+    VkcStats s1; vkc_stats(&s1);
+    CHECK(ok, "dprof: the frames ran");
+    CHECK(s1.d_fwd == s0.d_fwd + 1, "dprof: one window forward (%llu)", s1.d_fwd - s0.d_fwd);
+    CHECK(s1.d_frames == s0.d_frames + 2, "dprof: the window's two frames (%llu)", s1.d_frames - s0.d_frames);
+    CHECK(s1.d_wait_n >= s0.d_wait_n + 2, "dprof: the window's waits (%llu)", s1.d_wait_n - s0.d_wait_n);
+    CHECK(s1.d_wait_ms[VKC_R_A1] > s0.d_wait_ms[VKC_R_A1] && s1.d_wait_ms[VKC_R_A2] > s0.d_wait_ms[VKC_R_A2],
+          "dprof: both roles waited (A1 %.3f ms, A2 %.3f ms)",
+          s1.d_wait_ms[VKC_R_A1] - s0.d_wait_ms[VKC_R_A1], s1.d_wait_ms[VKC_R_A2] - s0.d_wait_ms[VKC_R_A2]);
+    CHECK(s1.d_wait_ms[VKC_R_OTHER] == s0.d_wait_ms[VKC_R_OTHER] && s1.d_wait_ms[VKC_R_DMOE] == s0.d_wait_ms[VKC_R_DMOE] &&
+          s1.d_wait_ms[VKC_R_TAIL] == s0.d_wait_ms[VKC_R_TAIL], "dprof: the unstamped roles stay empty");
+    CHECK(s1.d_submit_ms >= s0.d_submit_ms, "dprof: the submit time counts (%.3f ms)", s1.d_submit_ms - s0.d_submit_ms);
+    vkc_free(x); vkc_free(y); free(a);
+}
+
 /* ---- the KV cache split between the device and the host (chain_kvs, vk_kvsplit.h) --
  * A host cache of every position, a device holding `rows` of them (vkc_kv_plan under
  * COLI_VK_KV_DEVICE_ROWS), decode or prefill steps one after another as an engine runs
@@ -4381,6 +4415,7 @@ int main(int argc, char **argv) {
     test_qsa();
     test_ple();
     test_frames();
+    test_dprof();
     if (!vkc_mla_ready()) { fails++; printf("FAIL: the MLA shaders did not load\n"); }
     else {
         int hf[9] = {1, 2, 4, 5, 7, 10, 11, 12, 13};

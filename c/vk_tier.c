@@ -116,6 +116,9 @@ static struct {
     unsigned long long d_routed, d_served;     /* routed and served of those steps only, issue's and dev_count's books
                                                 * alike: the report's decode-only device share (the run's own line is
                                                 * dominated by a prompt's rows) */
+    double d_wait_ms, d_dev_ms, d_cpu_ms;      /* COLI_VK_CHAIN_DPROF: the join's wait, device and CPU ms of those
+                                                * steps (vkt_join), beside wait_ms/dev_ms/cpu_ms */
+    unsigned long long d_up_bytes;             /* and promote()'s queued upload bytes: H1's PCIe traffic term */
     size_t stage_room;                 /* left out of the budget for a prompt chunk's staging (VktConfig.stage) */
     /* the second device (COLI_VK_DEV2) */
     int d2;                            /* the tier holds experts there */
@@ -891,6 +894,11 @@ static void promote(int layer, int e) {
         free_victims();   /* nothing in flight: freed right away; else at the join */
     }
     v->up = 1; T.queued++; T.dque[0]++; T.upromos++;
+    {   /* DPROF: the bytes this promotion will move over PCIe (both callers are decode-class steps) */
+        ColiVkTensor *src[3];
+        coli_vk_xb_expert_tensors(v->hex, &src[0], &src[1], &src[2]);
+        T.d_up_bytes += coli_vk_tensor_bytes(src[0]) + coli_vk_tensor_bytes(src[1]) + coli_vk_tensor_bytes(src[2]);
+    }
     pthread_mutex_lock(&T.mx);
     T.q[(T.qh + T.qn) % VKT_QCAP] = (VQ){layer, e, 0, NULL, v->hex}; T.qn++;
     pthread_cond_signal(&T.cv);
@@ -2345,6 +2353,7 @@ int vkt_join(const float **rows) {
     double tw = vkt_now_ms() - t0;
     T.wait_ms += tw;
     T.dev_ms += dms + dms1; T.d2_ms += dms1;
+    if (T.S <= VKT_UP_ROWS) { T.d_wait_ms += tw; T.d_dev_ms += dms + dms1; T.d_cpu_ms += tc; }   /* DPROF: the decode class */
     if (dms1 > dms) dms = dms1;   /* the two ran side by side: the step waited for the slower */
     /* The balance moves only on steps where it had a choice. Waiting for more than
      * a tenth of the CPU's own time: give the CPU more. The device done well before
@@ -2990,6 +2999,10 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
 
 void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long long disk_loads) {
     if (!T.s) return;
+    /* cu_tier.c compiles this file again for a CUDA device, where the Vulkan chain's
+     * accessor is not linked: the env is read here too (the same grammar as vkc_dprof) */
+    static int dprof = -1;
+    if (dprof < 0) { const char *e = getenv("COLI_VK_CHAIN_DPROF"); dprof = e && *e && *e != '0' ? 1 : 0; }
     ColiVkPoolStats ps; coli_vk_pool_stats(1, &ps);
     unsigned long long r = T.routed - T.rep_routed, sv = T.served - T.rep_served;
     T.rep_routed = T.routed; T.rep_served = T.served;
@@ -3011,6 +3024,9 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     if (T.d_routed)   /* the headline's own share of the decode steps, which a prompt's rows dominate */
         fprintf(stderr, " | decode: %llu of %llu routed experts on the device (%.1f%%)",
                 T.d_served, T.d_routed, 100.0 * T.d_served / (double)T.d_routed);
+    if (dprof && T.d_routed)   /* COLI_VK_CHAIN_DPROF: the decode steps' wait/device/CPU split, promote's bytes */
+        fprintf(stderr, " | decode dprof: waited %.1f ms, device %.1f ms, CPU %.1f ms, promoted %.1f MiB",
+                T.d_wait_ms, T.d_dev_ms, T.d_cpu_ms, (double)T.d_up_bytes / 1048576.0);
     if (T.failed)
         fprintf(stderr, " | failed: %llu refused by the pool, %llu copies to the device, %llu not taken by the batch",
                 T.f_pool, T.f_copy, T.f_sets);

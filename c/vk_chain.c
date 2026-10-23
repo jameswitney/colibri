@@ -94,6 +94,7 @@ typedef struct {
     uint64_t wait_h, sig_g;           /* hybrid steps: the host's value this frame waits for, the value it signals */
     VkQueryPool qp; int nq; unsigned char kind[VKC_PROF_Q];   /* COLI_VK_CHAIN_PROF: a timestamp after each op */
     uint32_t shape[VKC_PROF_Q];   /* COLI_VK_CHAIN_PROF=2: a matmul's (fmt, O, I) slot in prof_sh, else 0 */
+    int dec; unsigned char role;   /* COLI_VK_CHAIN_DPROF: submitted inside the decode window, under vkc_role's role */
 } VkcFrame;
 
 typedef struct {
@@ -175,6 +176,7 @@ typedef struct {
     VkcStats st;
     int prof, kind; float ts_period; uint32_t ts_mask;
     double prof_ms[PK_N]; unsigned long long prof_n[PK_N];
+    int dwin, drole;                          /* COLI_VK_CHAIN_DPROF: the window is open, the role frames submit under */
     /* COLI_VK_CHAIN_PROF=2: the matmuls' time by (fmt, rows of x, O, I), the slots' keys */
     int prof_shapes; uint64_t prof_key[64]; double prof_sh_ms[64]; unsigned long long prof_sh_n[64];
 } VkcCtx;
@@ -735,7 +737,9 @@ static int frame_wait(VkcFrame *f) {
     for (long spin = chain_spin_us(); spin > 0 && r == VK_NOT_READY && (vkc_now_ms() - t0) * 1000.0 < spin; )
         r = vkGetFenceStatus(KC.dev, f->fence);
     if (r == VK_NOT_READY) r = vkWaitForFences(KC.dev, 1, &f->fence, VK_TRUE, KC.fence_ns);
-    KC.st.wait_ms += vkc_now_ms() - t0; KC.st.waits++;
+    double w = vkc_now_ms() - t0;
+    KC.st.wait_ms += w; KC.st.waits++;
+    if (f->dec) { KC.st.d_wait_ms[f->role] += w; KC.st.d_wait_n++; }   /* DPROF: the frame was submitted in the window */
     f->inflight = 0;
     if (r != VK_SUCCESS) { lose("fence wait", r); return 0; }
     if (KC.prof && f->qp && f->nq > 1) {
@@ -746,6 +750,7 @@ static int frame_wait(VkcFrame *f) {
                 uint64_t d = (ts[i] - ts[i - 1]) & (KC.ts_mask == 0xffffffffu ? ~0ull : (uint64_t)KC.ts_mask);
                 KC.prof_ms[f->kind[i]] += (double)d * KC.ts_period / 1e6; KC.prof_n[f->kind[i]]++;
                 if (f->shape[i]) { KC.prof_sh_ms[f->shape[i] - 1] += (double)d * KC.ts_period / 1e6; KC.prof_sh_n[f->shape[i] - 1]++; }
+                if (f->dec) KC.st.d_dev_ms[f->role] += (double)d * KC.ts_period / 1e6;
             }
         f->nq = 0;
     }
@@ -844,7 +849,14 @@ int vkc_submit(int wait) {
         if (f->sig_g) { tsi.signalSemaphoreValueCount = 1; tsi.pSignalSemaphoreValues = &f->sig_g;
                         si.signalSemaphoreCount = 1; si.pSignalSemaphores = &KC.tsem_g; }
     }
+    /* DPROF: the frame is stamped at its submission -- the engine sets the role around the
+     * record site that closes it (a begin's stamp would name the previous site: the tail's
+     * frame is opened after the last layer's MoE, a dmoe layer's after the one before) */
+    f->dec = KC.dwin != 0;
+    f->role = (unsigned char)(KC.drole >= 0 && KC.drole < VKC_R_N ? KC.drole : VKC_R_OTHER);
+    double t0 = f->dec ? vkc_now_ms() : 0.0;
     VkResult r = (VkResult)coli_vk_queue_submit_dev(g_kd, KC.queue, &si, f->fence);   /* the backend's lock, staged uploads */
+    if (f->dec) { KC.st.d_submit_ms += vkc_now_ms() - t0; KC.st.d_frames++; }
     if (r != VK_SUCCESS) { lose("queue submit", r); return 0; }
     f->inflight = 1;
     KC.st.frames++;
@@ -3101,6 +3113,20 @@ int vkc_enc_rel(VkcBuf *x, VkcBuf *pt, VkcBuf *y, const VkcEncRel *p) {
 }
 
 void vkc_stats(VkcStats *st) { *st = KC.st; }
+
+/* ---- COLI_VK_CHAIN_DPROF: the decode window's counters (vk_chain.h) ---------------- */
+int vkc_dprof(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_DPROF"); on = e && *e && *e != '0' ? 1 : 0; }
+    return on;
+}
+int vkc_dwin(int on) {
+    if (!vkc_dprof()) return 0;
+    if (on && !KC.dwin) KC.st.d_fwd++;   /* a decode forward opens the window (counted once) */
+    KC.dwin = on != 0;
+    return 1;
+}
+void vkc_role(int role) { KC.drole = role >= 0 && role < VKC_R_N ? role : VKC_R_OTHER; }
 
 /* ---- big prefill chunks ------------------------------------------------------------
  * The rows of a prompt chunk (vk_chain.h, vkc_chunk_rows). The free device memory is

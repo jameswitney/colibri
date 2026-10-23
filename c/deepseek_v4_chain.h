@@ -1284,6 +1284,7 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
     float *state = *state_ptr, *next = *next_ptr;
     int T0 = ch->Lm - 3, taps = coli_v4_full_dspark_wanted;   /* DSpark's targets: the model's last three layers
                                                                   * (those the chain runs; the CPU taps the rest) */
+    vkc_dwin(n == 1);   /* DPROF: a forward of one row is a decode step -- the window the counters keep */
     for (int c0 = 0; c0 < n; c0 += rows) {
         int nr = n - c0 < rows ? n - c0 : rows, pb = start + c0, last = c0 + nr == n;
         V4cFwd f = {start, n, pb, nr, 0, nr * rd, LR, 0};
@@ -1368,6 +1369,7 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
         }
         for (int i = lo; i < L && ok; i++) {
             V4cLayer *ly = &ch->ly[i];
+            vkc_role(VKC_R_A1);   /* DPROF: the dense frame this layer submits (the join below is its head) */
             if (pending) {                                  /* the FFN branch of the layer before */
                 ok = v4c_join(ch, nr, prev_dev);
                 if (ok && taps && i - 1 >= T0) ok = vkc_copy(ch->taps, (size_t)(i - 1 - T0) * nr * HD, ch->xs, 0, (size_t)nr * HD);
@@ -1376,6 +1378,7 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
             ok = ok && v4c_pre(ch, ly->fna, ly->o_hca, ch->hpa, ly->o_an, nr) && v4c_attention(ch, i, &f) &&
                  v4c_post(ch, ch->hpa, nr) && v4c_pre(ch, ly->fnf, ly->o_hcf, ch->hpf, ly->o_fn, nr);
             if (ok && dmoe && vkc_dmoe_on(&ch->dm, i)) {     /* COLI_VK_DMOE: this layer's experts in the frame */
+                vkc_role(VKC_R_DMOE);   /* DPROF: the frame the dmoe path submits, not an A1 */
                 float lim = c->swiglu_limit;
                 VkcRoute rp = {.kind = 2, .n_group = 1, .topk_group = 1, .has_bias = ch->gbias ? 1 : 0,
                                .norm = 1, .temp = 1.f, .scale = c->routed_scaling_factor};
@@ -1410,6 +1413,7 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
                     memcpy(v.compressed + (size_t)g0 * hd, vkc_ptr(ch->cdn), (size_t)np * hd * sizeof(float));
             }
             /* A2: the shared expert, while the host computes the routed experts */
+            vkc_role(VKC_R_A2);
             ok = vkc_begin() && v4c_shared(ch, ly, nr) && vkc_submit(0);
             if (!ok) break;
             double t1 = spec_now();
@@ -1430,6 +1434,7 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
             prev_dev = 0;
             pending = 1;
         }
+        vkc_role(VKC_R_TAIL);   /* DPROF: the closing frame: the last join, xd, the last chunk's pull copies */
         if (ok && pending) {
             ok = v4c_join(ch, nr, prev_dev);
             if (ok && taps && L - 1 >= T0) ok = vkc_copy(ch->taps, (size_t)(L - 1 - T0) * nr * HD, ch->xs, 0, (size_t)nr * HD);
@@ -1594,10 +1599,25 @@ static void v4c_report(void) {
         if (!ch || !ch->ok || !ch->forwards) continue;
         int was = vkc_device(d);
         VkcStats st; vkc_stats(&st);
+        char wn[48];   /* DPROF: the fence-wait count the report never printed (VkcStats.waits) */
+        if (vkc_dprof() && st.waits) snprintf(wn, sizeof wn, " over %llu fence waits", st.waits);
+        else wn[0] = 0;
         fprintf(stderr, "[VK] %s chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
-                        "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
-                v4c_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
+                        "%.1f ms waiting for the device%s, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
+                v4c_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, wn, ch->host_ms,
                 st.dev_bytes / 1048576.0);
+        if (st.d_fwd) {   /* DPROF: the decode window's split -- the wait/device gap G1 measures */
+            double wsum = 0, dsum = 0;
+            for (int r = 0; r < VKC_R_N; r++) { wsum += st.d_wait_ms[r]; dsum += st.d_dev_ms[r]; }
+            fprintf(stderr, "[VK] %s chain decode: %llu fwd, %llu submits, %llu waits, %.1f ms wait "
+                            "(A1 %.1f / A2 %.1f / dmoe %.1f / tail %.1f / other %.1f), %.1f ms device "
+                            "(A1 %.1f / A2 %.1f / dmoe %.1f / tail %.1f / other %.1f), %.1f ms in vkQueueSubmit\n",
+                    v4c_name(ch), st.d_fwd, st.d_frames, st.d_wait_n, wsum,
+                    st.d_wait_ms[VKC_R_A1], st.d_wait_ms[VKC_R_A2], st.d_wait_ms[VKC_R_DMOE], st.d_wait_ms[VKC_R_TAIL],
+                    st.d_wait_ms[VKC_R_OTHER], dsum,
+                    st.d_dev_ms[VKC_R_A1], st.d_dev_ms[VKC_R_A2], st.d_dev_ms[VKC_R_DMOE], st.d_dev_ms[VKC_R_TAIL],
+                    st.d_dev_ms[VKC_R_OTHER], st.d_submit_ms);
+        }
         vkc_kv_report(&ch->ks);
         {   /* COLI_VK_DMOE's own line: one line whenever the env named a layer, steps or none --
              * an armed run whose gate kept the host's step (the tier never held the layer's experts

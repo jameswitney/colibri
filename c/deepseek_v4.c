@@ -14697,6 +14697,11 @@ static float head_bf16_dot(const uint16_t *weight, const float *hidden,
  * reports per-turn deltas. Timing only: no numeric path changes. */
 static double g_v4_prof_block_s = 0.0, g_v4_prof_head_s = 0.0;
 static long long g_v4_prof_forwards = 0;
+/* COLI_VK_CHAIN_DPROF's window on the CLI side: the block time of the one-row forwards
+ * alone (target_token, the decode steps), so wall - block at the bench line is the
+ * head/sampling/generate-glue pool, not the prompt's forward */
+static double g_v4_prof_dblock_s = 0.0;
+static long long g_v4_prof_dfwd = 0;
 static double spec_now(void);   /* defined with the speculative-decode helpers below */
 
 static int head_argmax_impl(ColiV4Engine *engine, const float *hidden,
@@ -15359,8 +15364,11 @@ static int target_token(ColiV4Engine *engine, float **state_ptr, float **next_pt
     double t0 = spec_now();
     int result = target_token_impl(engine, state_ptr, next_ptr, attention, index, config,
                                    experts, token, position, error, error_size);
-    g_v4_prof_block_s += spec_now() - t0;
+    double dt = spec_now() - t0;
+    g_v4_prof_block_s += dt;
+    g_v4_prof_dblock_s += dt;   /* a one-row forward: a decode step (DPROF's window) */
     g_v4_prof_forwards += 1;
+    g_v4_prof_dfwd += 1;
     return result;
 }
 static int target_token_impl(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
@@ -19106,6 +19114,21 @@ int main(int argc, char **argv) {
     if (out_len) fwrite(out_text, 1, out_len, stderr);
     fprintf(stderr, "\ntiming time_to_first_token=%.3fs after_first=%.3fs\n",
            gen_stats.time_to_first_token_sec, gen_stats.decode_sec);
+#ifdef COLI_VULKAN
+    /* COLI_VK_CHAIN_DPROF (G1's slice S0): the decode window's spans, per token -- the
+     * wall from the timing line's after_first, the block the one-row forwards spent in
+     * target_token, the head head_argmax; other = wall - block - head is the sampling /
+     * generate-glue pool, and block - (the chain's decode wait + the host MoE) the forward
+     * glue (the chain's line splits that further, by role). */
+    if (vkc_dprof() && gen_stats.generated_tokens > 0) {
+        double tok = (double)gen_stats.generated_tokens;
+        double wall = gen_stats.decode_sec * 1e3 / tok, block = g_v4_prof_dblock_s * 1e3 / tok,
+               head = g_v4_prof_head_s * 1e3 / tok;
+        fprintf(stderr, "v4_dprof decode: %d tokens (%lld one-row forwards), wall %.1f ms/tok, "
+                        "block %.1f ms/tok, head %.1f ms/tok, other %.1f ms/tok (wall - block - head)\n",
+                gen_stats.generated_tokens, g_v4_prof_dfwd, wall, block, head, wall - block - head);
+    }
+#endif
 
     /* Alias session buffers for optional record-oracle path.
      * cleanup must destroy the session and must not free these aliases. */
