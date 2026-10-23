@@ -7,6 +7,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `vkc_moe_rows` takes fmt 7 (MXFP4): a prompt chunk's routed experts in the
+  tier's native format, through `qmatmul_grp_mx.comp` (the expert batch's
+  mode-4 GEMM, in floats — no matrix-unit variant exists for it) beside the
+  block formats' and our formats' pipelines, its 36-byte push constant beside
+  their 24-byte one. `vkc_moe_rows_ready(7, 7)` turns true and
+  `VkcPrewarm.ex_mx` prewarms the pair like `ex_ours`'s. No engine routes a
+  chunk through it yet — DeepSeek V4's `vk_dmoe` wiring is the next slice;
+  until one asks, every engine's bits are unchanged. The chain's test gains
+  the fmt-7 rows against `chain_moe`'s float form of the same experts (max
+  |diff| ~1e-9) and DeepSeek V4's kind-2 router (`route_bf16_impl`'s math,
+  ties included) against `chain_route.comp`.
 - `COLI_V4_FROZEN_PCT` + `.coli_mfu` + `hit_rate_d` (DeepSeek V4): the
   engine-store MFU cache — the fork's cache approach on the port's store
   (S-store map, `docs/research/S-store-mfu-map-2026-10-23.md`). The fork's

@@ -131,6 +131,7 @@ typedef struct {
     VkShaderModule mod_bdgc; VkPipeline bdgc[64]; uint8_t bdgc_tried[64];             /* qmatmul_gemm_bdc.comp: a GGUF's prompt GEMM on them */
     VkShaderModule mod_grpq[2]; VkPipeline grpq[2]; uint8_t grpq_tried[2];      /* our formats' (1, 2, 4) in floats: qmatmul_grp_q.comp */
     VkShaderModule mod_grpqc[2]; VkPipeline grpqc[2]; uint8_t grpqc_tried[2];   /* and on the matrix units: qmatmul_grp_qc.comp */
+    VkShaderModule mod_mx[2]; VkPipeline mx[2]; uint8_t mx_tried[2];             /* fmt 7's (both matrices, in floats): qmatmul_grp_mx.comp */
     int rows_tried;
     int discrete;                     /* a discrete card: vkc_prewarm's default */
     int gv2_all;                      /* chain_gemv2 for every int8 decode matrix it takes (COLI_VK_CHAIN_GEMV2=1, or not NVIDIA) */
@@ -2312,6 +2313,7 @@ static int moe_build(void) {
 static int rows_make(void);
 static VkPipeline grp_pipe(int v, int t, int coop);
 static VkPipeline grpq_pipe(int v, int coop);
+static VkPipeline mx_pipe(int v);
 int vkc_prewarm(const VkcPrewarm *pw) {
     const char *e = getenv("COLI_VK_CHAIN_PREWARM");   /* 1 on any device (tests), 0 never */
     if (!vkc_ready() || !pw || !(e && *e ? *e != '0' : KC.discrete)) return 0;
@@ -2387,7 +2389,7 @@ int vkc_prewarm(const VkcPrewarm *pw) {
      * once; the grouped GEMMs get an item of expert 0 with no rows and no input (I 0), whose
      * table entry has only the block table's address for the decoders' tables: nothing is
      * read past them, nothing written. */
-    if (ok && (pw->ex_gu || pw->ex_dn || pw->ex_ours) && rows_make()) {
+    if (ok && (pw->ex_gu || pw->ex_dn || pw->ex_ours || pw->ex_mx) && rows_make()) {
         struct { int mode, S, K, E, D, I, t_off, imax, i_off, i_row, w_off, w_row, y_off, y_row; uint32_t tab_lo, tab_hi; } rp =
             {0, 0, 1, 1, 64, 64, 0, 1, 0, 1, 0, 1, 0, 64, 0, 0};
         VkcBind rb[7] = {B(ids, 0), B(tab, 0), B(hid, 1), B(y, 1), B(w, 1), B(x, 1), B(rw, 1)};
@@ -2412,6 +2414,13 @@ int vkc_prewarm(const VkcPrewarm *pw) {
                 VkPipeline g = grpq_pipe(v, c);
                 if (g) { ok = record(g, gb, 5, &gp, sizeof gp, 1, 1, 1); n += ok; }
             }
+        }
+        /* and fmt 7's (qmatmul_grp_mx.comp, in floats): the same empty item — the
+         * shader reads no push-constant field past gp's (act/a/b unused), and I 0
+         * reads and writes nothing */
+        for (int v = 0; v < 2 && ok && pw->ex_mx; v++) {
+            VkPipeline g = mx_pipe(v);
+            if (g) { ok = record(g, gb, 5, &gp, sizeof gp, 1, 1, 1); n += ok; }
         }
     }
     /* a prompt chunk's attention on the matrix units (chain_attn_flash), launched on one row */
@@ -2595,10 +2604,23 @@ static VkPipeline grpq_pipe(int v, int coop) {
     }
     return KC.grpq[v];
 }
+/* fmt 7's grouped GEMM (the tier's native MXFP4 tensors, [0] down, [1] gate+up):
+ * qmatmul_grp_mx.comp, in floats only — the tier's expert-batch mode 4 runs it in
+ * production; no matrix-unit variant exists, the format stays off them */
+static VkPipeline mx_pipe(int v) {
+    static const char *file[2] = {"qmatmul_grp_mx.spv", "qmatmul_grp_gate_up_mx.spv"};
+    if (!KC.mx_tried[v]) {
+        KC.mx_tried[v] = 1;
+        if ((KC.mod_mx[v] = load_module(KC.core.spv_path, file[v]))) KC.mx[v] = make_pipe(KC.mod_mx[v], NULL);
+    }
+    return KC.mx[v];
+}
 static int our_fmt(int f) { return f == 1 || f == 2 || f == 4; }
+static int mx_fmt(int f) { return f == 7; }
 /* pass v's (1 gate+up, 0 down) pipeline for a matrix of format f: a GGUF's block type, or ours */
 static VkPipeline rows_pipe1(int v, int f, int coop) {
-    return f >= 100 ? grp_pipe(v, f - 100, coop) : our_fmt(f) ? grpq_pipe(v, coop) : VK_NULL_HANDLE;
+    return mx_fmt(f) ? (coop ? VK_NULL_HANDLE : mx_pipe(v)) :
+        f >= 100 ? grp_pipe(v, f - 100, coop) : our_fmt(f) ? grpq_pipe(v, coop) : VK_NULL_HANDLE;
 }
 /* coop asks for the matrix units, which a format or a device without them answers in floats;
  * without the floats' pipeline (too little shared memory for it), the matrix units' */
@@ -2663,9 +2685,11 @@ static int rows_make(void) {
     return KC.rows != VK_NULL_HANDLE;
 }
 int vkc_moe_rows_ready(int gfmt, int dfmt) {
-    /* a GGUF's block types (their decoders read the block table), or our formats (both matrices) */
-    int bd = gfmt >= 100 && dfmt >= 100 && coli_vk_block_table_addr(g_kd), q = our_fmt(gfmt) && our_fmt(dfmt);
-    return (bd || q) && rows_make() && rows_pipe(1, gfmt, 0) && rows_pipe(0, dfmt, 0);
+    /* a GGUF's block types (their decoders read the block table), our formats, or fmt 7
+     * (both matrices: the mx pipelines', in floats) */
+    int bd = gfmt >= 100 && dfmt >= 100 && coli_vk_block_table_addr(g_kd),
+        q = (our_fmt(gfmt) && our_fmt(dfmt)) || (mx_fmt(gfmt) && mx_fmt(dfmt)), mx = mx_fmt(gfmt) && mx_fmt(dfmt);
+    return (bd || q) && rows_make() && rows_pipe(1, gfmt, 0) && rows_pipe(0, dfmt, 0) && (!mx || (mx_pipe(0) && mx_pipe(1)));
 }
 void vkc_moe_rows_free(VkcMoeRows *r) {
     VkcBuf **b[7] = {&r->cnt, &r->amap, &r->items, &r->etab, &r->aux, &r->hid, &r->yk};
@@ -2695,19 +2719,25 @@ int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r
     int ok = vkc_zero(r->cnt, 0, (size_t)E) && record(KC.rows, sb, 7, &pc, sizeof pc, gp, 1, 1);
     pc.mode = 1; ok = ok && record(KC.rows, sb, 7, &pc, sizeof pc, 1, 1, 1);
     pc.mode = 2; ok = ok && record(KC.rows, sb, 7, &pc, sizeof pc, gp, 1, 1);
-    /* gate+up: the tokens' rows gathered by amap into the packed hidden rows */
+    /* gate+up: the tokens' rows gathered by amap into the packed hidden rows; fmt 7's mx
+     * pipeline takes a 36-byte push constant (its layout's act/a/b, act 0 here) */
     struct { int I, O; float limit; int ibase, kgat, rpw; } pg = {p->D, p->I, p->limit, 0, p->K, 0};
+    struct { int I, O; float limit; int ibase, kgat, rpw, act; float a, b; } pmg = {p->D, p->I, p->limit, 0, p->K, 0, 0, 0.f, 0.f};
+    int mg = mx_fmt(p->gfmt);
+    size_t pgb = mg ? sizeof pmg : sizeof pg;
     size_t eb0 = (size_t)16 * E * 4;   /* the down pass's table */
     VkcBind gb[5] = {B(x, 0), B(r->items, 0), {r->etab->buf, 0, eb0, 0}, B(r->hid, 1), B(r->amap, 0)};
     r->etab->last_frame = KC.serial;
     /* on the matrix units unless the caller keeps the floats (p->floats: the tier's host pool,
      * whose experts the GEMMs read over PCIe; there the floats' were faster) */
     VkPipeline pgu = rows_pipe(1, p->gfmt, !p->floats), pdn = rows_pipe(0, p->dfmt, !p->floats);
-    ok = ok && record_indirect(pgu, gb, 5, &pg, sizeof pg, r->aux, 0);
+    ok = ok && record_indirect(pgu, gb, 5, mg ? (const void *)&pmg : (const void *)&pg, pgb, r->aux, 0);
     /* down: the packed hidden rows into the pairs' rows (amap) */
     struct { int I, O; float limit; int ibase, kgat, rpw; } pd = {p->I, p->D, 0.f, (int)imax, p->K, 0};
+    struct { int I, O; float limit; int ibase, kgat, rpw, act; float a, b; } pmd = {p->I, p->D, 0.f, (int)imax, p->K, 0, 0, 0.f, 0.f};
     VkcBind db[5] = {B(r->hid, 0), B(r->items, 0), {r->etab->buf, eb0, eb0, 0}, B(r->yk, 1), B(r->amap, 0)};
-    ok = ok && record_indirect(pdn, db, 5, &pd, sizeof pd, r->aux, 16);
+    int md = mx_fmt(p->dfmt);
+    ok = ok && record_indirect(pdn, db, 5, md ? (const void *)&pmd : (const void *)&pd, md ? sizeof pmd : sizeof pd, r->aux, 16);
     if (ok) KC.st.grp_coop += rows_coop(1, p->gfmt, pgu) + rows_coop(0, p->dfmt, pdn);
     /* the rows' sums over their experts, in rank order */
     pc.mode = 3;
@@ -3379,6 +3409,8 @@ void vkc_shutdown(void) {
         if (KC.mod_grpq[v]) vkDestroyShaderModule(KC.dev, KC.mod_grpq[v], NULL);
         if (KC.grpqc[v]) vkDestroyPipeline(KC.dev, KC.grpqc[v], NULL);
         if (KC.mod_grpqc[v]) vkDestroyShaderModule(KC.dev, KC.mod_grpqc[v], NULL);
+        if (KC.mx[v]) vkDestroyPipeline(KC.dev, KC.mx[v], NULL);
+        if (KC.mod_mx[v]) vkDestroyShaderModule(KC.dev, KC.mod_mx[v], NULL);
     }
     if (KC.mod_moe) vkDestroyShaderModule(KC.dev, KC.mod_moe, NULL);
     for (int f = 0; f < 3; f++) for (int b = 0; b < 10; b++) if (KC.moe_gv[f][b]) vkDestroyPipeline(KC.dev, KC.moe_gv[f][b], NULL);

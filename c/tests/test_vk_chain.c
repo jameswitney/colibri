@@ -3362,12 +3362,13 @@ done:
     free(t); free(ex); free(tab); free(wg); free(wu); free(wd);
 }
 /* The same for our own formats (qmatmul_grp_q.comp): int8 rows (fmt 1), int4 rows (2), int4
- * with a scale per gs inputs (4), against chain_moe's float form of the same experts */
+ * with a scale per gs inputs (4), and MXFP4 (7, qmatmul_grp_mx.comp: e2m1 nibbles, a float
+ * scale a gs-input group), against chain_moe's float form of the same experts */
 static void test_moe_rows_q(int fmt, int gs, int S, int K, int E, int D, int I) {
     if (!vkc_moe_rows_ready(fmt, fmt)) { printf("moe rows fmt %d: not on this device\n", fmt); return; }
     if (!coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU, 0, 0, 0)) { CHECK(0, "moe rows fmt %d: the expert batch did not start", fmt); return; }
     size_t rg = fmt == 1 ? (size_t)D : (size_t)D / 2, rd = fmt == 1 ? (size_t)I : (size_t)I / 2;
-    size_t ng = fmt == 4 ? (size_t)D / gs : 1, nd = fmt == 4 ? (size_t)I / gs : 1;
+    size_t ng = (fmt == 4 || fmt == 7) ? (size_t)D / gs : 1, nd = (fmt == 4 || fmt == 7) ? (size_t)I / gs : 1;
     uint8_t *wg = malloc(rg * I), *wu = malloc(rg * I), *wd = malloc(rd * D);
     float *sg = malloc((size_t)I * ng * 4), *su = malloc((size_t)I * ng * 4), *sd = malloc((size_t)D * nd * 4);
     ColiVkTensor **t = calloc((size_t)3 * E, sizeof *t);
@@ -3379,7 +3380,7 @@ static void test_moe_rows_q(int fmt, int gs, int S, int K, int E, int D, int I) 
         for (size_t i = 0; i < rd * D; i++) wd[i] = (uint8_t)rnd();
         for (size_t i = 0; i < (size_t)I * ng; i++) { sg[i] = 0.002f + 0.002f * (rnd() & 255) / 255.f; su[i] = 0.002f + 0.002f * (rnd() & 255) / 255.f; }
         for (size_t i = 0; i < (size_t)D * nd; i++) sd[i] = 0.002f + 0.002f * (rnd() & 255) / 255.f;
-        int g = fmt == 4 ? gs : 0;
+        int g = (fmt == 4 || fmt == 7) ? gs : 0;
         ok = coli_vk_tensor_ensure(&t[3 * e], wg, sg, fmt, D, I, g) && coli_vk_tensor_ensure(&t[3 * e + 1], wu, su, fmt, D, I, g) &&
              coli_vk_tensor_ensure(&t[3 * e + 2], wd, sd, fmt, I, D, g) && (ex[e] = coli_vk_xb_expert(t[3 * e], t[3 * e + 1], t[3 * e + 2])) &&
              coli_vk_xb_expert_entry(ex[e], tab + (size_t)e * COLI_VK_XB_ENTRY);
@@ -3421,6 +3422,55 @@ done:
         else for (int k = 0; k < 3; k++) if (t[3 * e + k]) coli_vk_tensor_free(t[3 * e + k]);
     }
     free(t); free(ex); free(tab); free(wg); free(wu); free(wd); free(sg); free(su); free(sd);
+}
+/* DeepSeek V4's router (deepseek_v4.c's route_bf16_impl) against chain_route.comp's kind 2:
+ * score = sqrt(softplus(logit)), the bias added for the pick only, the K best picks with
+ * the lower expert on a tie, w = score / total * routed_scaling_factor. The ids exactly
+ * (ties included), the weights to 1e-6 rel: the shader's softplus rounds log(1 + exp(v)),
+ * the host's log1p(exp(-|v|)) — the same value's last bits */
+static void route_bf16_ref(const float *lg, const float *bias, int E, int K, float scale, int *ids, float *w) {
+    float sc[1024], sel[1024];
+    unsigned char taken[1024]; memset(taken, 0, (size_t)E);
+    for (int e = 0; e < E; e++) {
+        float v = lg[e];
+        sc[e] = sqrtf(fmaxf(v, 0.f) + log1pf(expf(-fabsf(v))));
+        sel[e] = sc[e] + bias[e];
+    }
+    for (int k = 0; k < K; k++) {
+        int best = -1;
+        for (int e = 0; e < E; e++)
+            if (!taken[e] && (best < 0 || sel[e] > sel[best])) best = e;
+        ids[k] = best; taken[best] = 1;
+    }
+    float total = 0.f;
+    for (int k = 0; k < K; k++) total += sc[ids[k]];
+    for (int k = 0; k < K; k++) w[k] = sc[ids[k]] / total * scale;
+}
+static void test_route_bf16(int S, int E, int K, float scale, int ties) {
+    int lrow = E + 3, irow = K + 2, wrow = K + 1;
+    float *lg = fvec((size_t)S * lrow, 4.f), *bias = fvec((size_t)E + 5, 0.3f);
+    if (ties) for (size_t i = 0; i < (size_t)S * lrow; i++) lg[i] = 0.5f;
+    if (ties) for (int e = 0; e < E; e++) bias[e] = 0.25f;   /* equal picks: the tie order */
+    int *rid = malloc((size_t)S * K * sizeof(int)); float *rw = malloc((size_t)S * K * sizeof(float));
+    for (int s = 0; s < S; s++)
+        route_bf16_ref(lg + (size_t)s * lrow + 1, bias + 2, E, K, scale, rid + (size_t)s * K, rw + (size_t)s * K);
+    VkcBuf *lb = up(lg, (size_t)S * lrow), *bb = up(bias, (size_t)E + 5);
+    VkcBuf *ib = vkc_buf((size_t)(S * irow + 4) * 4, VKC_DEV), *wb = vkc_buf((size_t)(S * wrow + 4) * 4, VKC_DEV);
+    VkcRoute rp = {S, E, K, 2, 1, lrow, 2, 1, 3, irow, 1, wrow, 1, 1, 1, 1.f, scale, 0.f};
+    int ok = vkc_begin() && vkc_route(lb, bb, ib, wb, &rp) && vkc_submit(1);
+    float *gi = down(ib, 3, (size_t)S * irow), *gw = down(wb, 1, (size_t)S * wrow);
+    int same = 1; double worst = 0;
+    for (int s = 0; s < S; s++) for (int k = 0; k < K; k++) {
+        int id; memcpy(&id, &gi[(size_t)s * irow + k], 4);
+        same &= id == rid[(size_t)s * K + k];
+        double r = rw[(size_t)s * K + k], g = gw[(size_t)s * wrow + k], d = fabs(g - r) / fabs(r);
+        if (d > worst) worst = d;
+    }
+    CHECK(ok && same && worst < 1e-6, "route bf16%s (S %d E %d K %d): ok %d, ids %s, weights off by %.2e",
+          ties ? " ties" : "", S, E, K, ok, same ? "the CPU's" : "DIFFER", worst);
+    if (getenv("VKC_TEST_VERBOSE")) printf("route bf16%s: weights %.2e\n", ties ? " ties" : "", worst);
+    vkc_free(lb); vkc_free(bb); vkc_free(ib); vkc_free(wb);
+    free(lg); free(bias); free(rid); free(rw); free(gi); free(gw);
 }
 /* A GGUF's experts in the CPU's integer form (chain_moe_i8: vkc_moe_set_idot(1)) against
  * the CPU's own: each input row quantized as gq_quant_act_ref does it, each expert row
@@ -4408,6 +4458,9 @@ int main(int argc, char **argv) {
         test_route("kimi sigmoid top-16 of 896", 3, 896, 16, 1, 1, 1, 1, 1, 1.f, 2.827f, 0.f, 0);
         test_route("deepseek sqrt(softplus)", 5, 256, 6, 2, 1, 1, 1, 2, 1.3f, 1.5f, 1e-20f, 0);
         test_route("deepseek K = 1 (no norm)", 2, 256, 1, 2, 1, 1, 1, 2, 1.f, 1.5f, 1e-20f, 0);
+        /* V4's own form of it (route_bf16_impl): norm 1, no eps, the routed scaling factor */
+        test_route_bf16(7, 256, 6, 2.5f, 0);
+        test_route_bf16(2, 64, 4, 1.f, 1);
         test_route("1024 experts, top-32", 2, 1024, 32, 0, 0, 1, 1, 1, 1.f, 1.f, 0.f, 0);
         test_route("896 experts, top-32, bias", 3, 896, 32, 1, 1, 1, 1, 1, 1.f, 2.5f, 0.f, 0);
         test_route("fewer kept experts than K", 2, 64, 32, 0, 0, 8, 2, 1, 1.f, 1.f, 0.f, 0);
@@ -4467,6 +4520,9 @@ int main(int argc, char **argv) {
         test_moe_rows_q(2, 0, 40, 4, 12, 512, 256);
         test_moe_rows_q(4, 64, 40, 4, 12, 512, 256);
         test_moe_rows_q(4, 32, 7, 2, 6, 256, 256);
+        /* and MXFP4 (fmt 7, gs 32): the mx pipelines' rows against chain_moe's float form */
+        test_moe_rows_q(7, 32, 40, 4, 12, 512, 256);
+        test_moe_rows_q(7, 32, 7, 2, 6, 256, 256);
         /* the integer form, every type it decodes, against the CPU's */
         test_moe_i8(GQ_IQ2_S, GQ_Q2_0, 3, 4, 12, 512, 256);
         test_moe_i8(GQ_Q4_K, GQ_Q6_K, 2, 4, 12, 512, 256);

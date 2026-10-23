@@ -449,10 +449,11 @@ typedef struct {
 int vkc_moe_ready(void);
 /* A prompt chunk's routed experts, every row on the device (chain_moe_rows.comp): the
  * pairs counted and planned by expert there, gate+up and down as the block formats'
- * grouped GEMMs (qmatmul_grp_gate_up_bd.comp, qmatmul_grp_bd.comp) over the tiles of each
+ * grouped GEMMs (qmatmul_grp_gate_up_bd.comp, qmatmul_grp_bd.comp) — or, gfmt and dfmt
+ * both 7, fmt 7's (qmatmul_grp_mx.comp, in floats) — over the tiles of each
  * expert's rows, dispatched with the counts the device wrote, then each row's sum over its
  * experts in rank order. p as vkc_moe's with x_off 0, act 0, E, gfmt and dfmt (the layer's
- * experts' block formats), D and I multiples of 64; y as vkc_moe's. The tables and the
+ * experts' formats), D and I multiples of 64; y as vkc_moe's. The tables and the
  * rows' hidden and down outputs live in *r between calls (vkc_moe_rows_free). 0 when the
  * device lacks the pipelines (vkc_moe_rows_ready) or a parameter is out of range. */
 typedef struct { VkcBuf *cnt, *amap, *items, *etab, *aux, *hid, *yk; } VkcMoeRows;
@@ -463,14 +464,15 @@ void vkc_moe_rows_free(VkcMoeRows *r);
  * has room: the block formats' GEMV and tiled GEMM for the ggml types in `types` (bit t for
  * format 100 + t), chain_moe's pipeline (moe 1: colibri's formats, 2: the block formats'),
  * DeltaNet's recurrence for key dimension dn_kd (0: none), and a prompt chunk's grouped
- * GEMMs (vkc_moe_rows) for the experts' gate/up types ex_gu and down types ex_dn, or for our
- * own formats (ex_ours), and the attention on the matrix units (attn_hd, attn_gq). An engine
- * calls it once its dense chain is placed, before its expert tier fills the device. A
+ * GEMMs (vkc_moe_rows) for the experts' gate/up types ex_gu and down types ex_dn, for our
+ * own formats (ex_ours), or for fmt 7 (ex_mx: qmatmul_grp_mx.comp), and the attention on
+ * the matrix units (attn_hd, attn_gq). An engine calls it once its dense chain is placed, before its expert tier fills the device. A
  * discrete card's default (COLI_VK_CHAIN_PREWARM=1 on any device, 0 never); the pipelines
  * made. */
 typedef struct {
     uint64_t types; int moe, dn_kd; uint64_t ex_gu, ex_dn;
     int ex_ours;                /* the experts are our own formats (1, 2, 4): their grouped GEMMs (qmatmul_grp_q.comp) */
+    int ex_mx;                  /* the experts are fmt 7 (MXFP4, both matrices): theirs (qmatmul_grp_mx.comp) */
     int gemv_i[16], n_gemv_i;   /* the GEMV's widths of x (a matrix's I) the types meet: its staging sizes */
     int moe_d, moe_i;           /* the experts' D and I: chain_moe's staging size (0: the device's largest) */
     int attn_hd, attn_gq;       /* the attention's head dim and query heads per kv head: chain_attn_flash's (0: none) */
