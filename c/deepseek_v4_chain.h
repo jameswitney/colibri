@@ -667,11 +667,25 @@ static void v4c_dmoe_drop(V4Chain *ch) {
  * round does not absorb it -- the greedy/oracle check is the gate, not bit equality. A
  * hash layer (vkc_route cannot express its token table), a layer outside this chain and
  * the second device keep the host's step. 0, the default, changes nothing. */
+/* COLI_VK_DMOE_ROWS: the opt-in that lets the armed layer take a prompt chunk's rows too
+ * (more than VKC_DMOE_ROWS of them) through vkc_moe_rows' grouped GEMMs -- the fmt-7
+ * (MXFP4) pipelines of L2 Stage B. Off (the default) the arm keeps the per-pair decode
+ * path only, and a step of more than VKC_DMOE_ROWS rows takes the host's step as before.
+ * A prompt row's routed experts are then chain_moe_rows.comp's rank-order sums over the
+ * chunk's packed rows, so its bits can depend on how the prompt is chunked -- the same
+ * invariant break COLI_VK_CHAIN_GEMM_ROWS documents above (its row too), and the reason
+ * this stays opt-in. */
+static int v4c_dmoe_rows_wanted(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_DMOE_ROWS"); on = e && *e && atoi(e) != 0; }
+    return on;
+}
 static int v4c_dmoe_arm(V4Chain *ch, int rows) {
     const ColiDeepSeekV4Config *c = &ch->engine->config;
     int n = vkc_dmoe_layer_env();
     static int told = 0;
-    if (!n || ch->d || n < ch->lo || n >= ch->L || rows > VKC_DMOE_ROWS) return 0;
+    int big = v4c_dmoe_rows_wanted();   /* a prompt chunk's rows through the grouped GEMMs */
+    if (!n || ch->d || n < ch->lo || n >= ch->L || (!big && rows > VKC_DMOE_ROWS)) return 0;
     if (ch->engine->dense_resident.layers[n].plan.uses_hash_router) {
         if (!told) fprintf(stderr, "[VK] %s chain: COLI_VK_DMOE=%d is a hash layer (vkc_route cannot give its token "
                                    "table); the host's step keeps it\n", v4c_name(ch), n);
@@ -688,6 +702,7 @@ static int v4c_dmoe_arm(V4Chain *ch, int rows) {
     if (!ch->gate_bias) ch->gate_bias = v4c_val(w, "ffn.gate.bias");
     if ((ch->gate_bias && !vkc_reserve(&ch->gbias, (size_t)c->n_routed_experts * sizeof(float), VKC_DEV)) ||
         !vkc_reserve(&ch->lg, (size_t)rows * c->n_routed_experts * sizeof(float), VKC_DEV)) return 0;
+    ch->dm.big = big;   /* vk_dmoe.h's gate: a step of more than VKC_DMOE_ROWS rows */
     if (!vkc_dmoe_prepare(&ch->dm, n, 1, c->n_routed_experts, c->num_experts_per_tok, ch->D, ch->I, rows)) {
         if (!told && !ch->dm.off && vkt_ready())
             fprintf(stderr, "[VK] %s chain: COLI_VK_DMOE=%d: the tier does not hold all %d of layer %d's experts yet; "
