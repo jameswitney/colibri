@@ -192,9 +192,11 @@ static struct {
     /* the hot set (COLI_VK_TIER_HOT, hot_pin): hot its share of the resident places in %,
      * hot_scope 1 the per-layer rule, hot_update a re-pin at every forward, hot_hash the
      * first main layers a hash router serves (no meaningful heat: never pinned), pin_layer
-     * COLI_VK_TIER_PIN_LAYER's layer, npin the pins standing, hot_order/n_hot_order the
-     * ranking it keeps them in */
-    int hot, hot_scope, hot_update, hot_hash, pin_layer, npin, n_hot_order, *hot_order;
+     * COLI_VK_TIER_PIN_LAYER's layer, pool_layer COLI_VK_TIER_POOL_LAYER's (its experts go
+     * to the host pool, not the device) and pool_said its one line, npin the pins standing,
+     * hot_order/n_hot_order the ranking it keeps them in */
+    int hot, hot_scope, hot_update, hot_hash, pin_layer, pool_layer, npin, n_hot_order, *hot_order;
+    uint8_t pool_said;
     double dev_ms, cpu_ms, wait_ms;
     unsigned long long rep_routed, rep_served;
     /* streaming (big prefill steps; see "streaming" below) */
@@ -857,6 +859,7 @@ int vkt_wants(int layer, int eid) {
 static void promote(int layer, int e) {
     VSlot *v = slot(layer, e);
     if (!T.promote_rate || v->state != VS_RESIDENT || !v->host || v->up || kind_of(layer) || T.upromos >= T.promote_rate) return;
+    if (T.pool_layer == layer) return;   /* COLI_VK_TIER_POOL_LAYER: that layer's residency is the pool, pinned there (hot_pin) -- moving it up would take the device places the lever promises not to touch */
     if (!v->hex) {
         if (!T.dmax[2]) return;   /* no pool behind it: nothing to copy up from */
         v->hex = v->ex;           /* a partial pool's own copy: the landing keeps it beside the device's */
@@ -915,6 +918,31 @@ int vkt_plan(int *layers, int *eids, int max) {
     T.plan_hist = 0;
     if (!T.on) return 0;
     int L = T.main_layers, E = T.c.experts, n = 0, k = 0;   /* the main layers' */
+    /* COLI_VK_TIER_POOL_LAYER (the COLI_VK_DMOE arm's residency lever that is not a
+     * device pin, the L2 spec's Stage C): layer n's experts go to the HOST POOL, place 2
+     * -- the device's budget, its stream slots and its prefetch untouched, and
+     * vkt_dev_table counts them anyway (place 2 keeps dev 0), so the dmoe gate's
+     * all-or-nothing test passes without ~3.75 GiB of device room. All or nothing, like
+     * that gate: unless the pool holds every one of the layer's E experts, none is placed
+     * and one line says so. hot_pin pins them and promote leaves them where they are.
+     * Ahead of the pin block, so a layer both knobs name stays in the pool. */
+    if (T.pool_layer >= 0 && T.pool_layer < L && !T.pool_said) {
+        int room = T.dmax[2] - T.dres[2] - T.dque[2];
+        if (room >= E && k + E <= max) {
+            for (int e = 0; e < E; e++) {
+                VSlot *v = slot(T.pool_layer, e);
+                v->state = VS_QUEUED; set_place(v, 2); T.queued++; T.dque[2]++;
+                layers[k] = T.pool_layer; eids[k] = e; k++;
+            }
+            fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_POOL_LAYER=%d: layer %d's %d experts placed in the host pool and "
+                            "pinned there, no device place taken (vkt_dev_table counts them: the dmoe gate opens)\n",
+                    T.engine, T.pool_layer, T.pool_layer, E);
+        } else
+            fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_POOL_LAYER=%d: the host pool has %d places free of the %d layer %d "
+                            "needs; nothing placed, all or nothing like the dmoe gate (COLI_VK_TIER_HOST_GB raises the pool)\n",
+                    T.engine, T.pool_layer, room < 0 ? 0 : room, E, T.pool_layer);
+        T.pool_said = 1;
+    }
     /* COLI_VK_TIER_PIN_LAYER (the COLI_VK_DMOE arm's scaffolding): layer n's
      * experts ahead of the history, so the one layer the arm wires is fully resident
      * from the warm start whatever the heat says -- hot_pin has pinned them too, so no
@@ -994,9 +1022,14 @@ static void hot_pin(void) {
     for (size_t i = 0; i < n; i++) T.s[i].pin = 0;
     const int E = T.c.experts;
     int pinned = 0;
-    if (T.pin_layer >= 0 && T.pin_layer < T.main_layers) {   /* the explicit pin wins over the ranking */
-        for (int e = 0; e < E; e++) slot(T.pin_layer, e)->pin = 1;
+    if (T.pool_layer >= 0 && T.pool_layer < T.main_layers) {   /* the pool-placed layer: its residency is the pool */
+        for (int e = 0; e < E; e++) slot(T.pool_layer, e)->pin = 1;
         pinned = E;
+    }
+    if (T.pin_layer >= 0 && T.pin_layer < T.main_layers) {   /* the explicit pin wins over the ranking */
+        int fresh = 0;
+        for (int e = 0; e < E; e++) { VSlot *v = slot(T.pin_layer, e); if (!v->pin) { v->pin = 1; fresh++; } }
+        pinned += fresh;
     }
     if (!T.hot || !g_heat_hist) { T.npin = pinned; return; }   /* no share, or nothing to rank */
     long long K = (long long)T.hot * (T.dmax[0] + T.dmax[2]) / 100;   /* the resident places: the device and the host pool */
@@ -2814,6 +2847,8 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         if (T.hot_hash < 0) T.hot_hash = 0;
         const char *pl = getenv("COLI_VK_TIER_PIN_LAYER");
         T.pin_layer = pl && *pl ? atoi(pl) : -1;
+        const char *po = getenv("COLI_VK_TIER_POOL_LAYER");
+        T.pool_layer = po && *po ? atoi(po) : -1;
     }
     {
         ColiVkXbStats xs; coli_vk_xb_stats(&xs);

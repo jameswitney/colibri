@@ -14235,6 +14235,11 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
     }
     const char *bypass = getenv("COLI_VK_TIER_STREAM_BYPASS");   /* 1: the stream's fills read past the cache (v4_vkt_load_batch) */
     v4_vkt_bypass = bypass && *bypass && atoi(bypass) != 0;
+    /* .stage stays unset on purpose (R-l1's OPEN-4): the staging carve it would enable is
+     * doubly gated on block formats -- the tier's `blocks` scan and vkc_stage_sizes,
+     * which returns 0 for fmt 7 -- and this model's experts are all MXFP4 (fmt 7), so it
+     * would be a no-op that still carved device budget for staging nothing. A V4 whose
+     * experts are block formats (a GGUF conversion) is the shape that wants it. */
     VktConfig vc = {.engine = "deepseek_v4", .layers = c->num_hidden_layers,
                     .experts = c->n_routed_experts, .hidden = c->hidden_size,
                     .inter = c->moe_intermediate_size, .topk = c->num_experts_per_tok,

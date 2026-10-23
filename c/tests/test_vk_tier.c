@@ -13,6 +13,11 @@
  *            promotions and still serves, COLI_VK_TIER_PIN_LAYER's layer pins whole and
  *            holds, and the ranking is global on the RAW counts (HOT_SCOPE=layer and
  *            HOT_HASH the variants; the scaled 1..31 heat would make it a per-layer film);
+ *   pool     COLI_VK_TIER_POOL_LAYER (the dmoe arm's Stage C lever): the named layer's
+ *            experts planned into the host pool ahead of the history, resident there and
+ *            counted by vkt_dev_table whole (the dmoe gate) with no device place taken,
+ *            staying put through the books' promotions, and a pool one place short of them
+ *            placing none (all or nothing, like the gate);
  *   adapt    a budget of a third of the experts and a hot set that moves halfway:
  *            experts are evicted, the new hot set becomes resident and its steps
  *            go to the device;
@@ -1551,6 +1556,93 @@ static unsigned dev_mask(int l) {
     for (int e = 0; e < E; e++) if (vkt_resident(l, e) && !host[e]) m |= 1u << e;
     return m;
 }
+/* COLI_VK_TIER_POOL_LAYER (the dmoe arm's Stage C lever, the residency activator that is
+ * not a device pin): the named layer's E experts planned into the HOST POOL ahead of the
+ * history, resident there -- place 2, vkt_dev_host's marks on them, the device's mask
+ * empty -- and counted by vkt_dev_table whole, so vk_dmoe.h's all-or-nothing gate opens
+ * with no device place taken. Promotions leave them there (hot_pin's pin, promote's skip)
+ * while the device keeps its own residents, and a pool one place short of E places none of
+ * them: all or nothing, like the gate it serves. */
+static void pool_layer(void) {
+    VktFmt f = {VKT_SRC_I4U_PAIRS_GS, 64};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    const double eb = (double)vkt_expert_bytes(H, F, f, f) / 1073741824.0;
+    char gb[64];
+    uint32_t hist[L][E], *rows[L];           /* layer 0 the hot one: the lever must override it */
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = l ? 1u : 1000u; }
+    setenv("COLI_VK_TIER_HOST", "1", 1);
+    setenv("COLI_VK_TIER_POOL_LAYER", "1", 1);
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    setenv("COLI_VK_TIER_PROMOTE", "8", 1);  /* on: the placed layer must stay in the pool anyway */
+    uint32_t *tab = malloc((size_t)E * COLI_VK_XB_ENTRY * sizeof(uint32_t));
+    for (int c = 0; c < 2; c++) {   /* the pool holds the layer whole, then one place short of it */
+        set_budget(4, f, f);                   /* the device holds four, layer 0's */
+        snprintf(gb, sizeof gb, "%.12f", (c ? E - 0.5 : E + 0.5) * eb);
+        setenv("COLI_VK_TIER_HOST_GB", gb, 1);
+        VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+        CHECK(vkt_init(&vc, rows), "pool layer: the tier did not start");
+        /* the placement decision's own line, once, whichever way it went */
+        FILE *t = tmpfile(); fflush(stderr);
+        int saved = t ? dup(2) : -1;
+        if (saved >= 0) dup2(fileno(t), 2);
+        int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+        char buf[4096], line[4096] = "";
+        int said = 0;
+        if (saved >= 0) {
+            fflush(stderr); dup2(saved, 2); close(saved); rewind(t);
+            while (fgets(buf, sizeof buf, t)) { fputs(buf, stderr); if (strstr(buf, "COLI_VK_TIER_POOL_LAYER=1")) { said++; snprintf(line, sizeof line, "%s", buf); } }
+            fclose(t);
+        }
+        int per[L] = {0}, first = 1;
+        for (int i = 0; i < n; i++) { per[pl[i]]++; if (i < E) first &= pl[i] == 1; }
+        CHECK(said == 1 && strstr(line, c ? "nothing placed" : "placed in the host pool"),
+              "pool layer: the placement decision said %d lines, not the one %s", said, c ? "declining" : "placing");
+        for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+        vkt_put_done();
+        if (c) {   /* declined: nothing placed, the plan exactly the lever-free tier's, the gate shut */
+            int held = tab ? vkt_dev_table(1, tab) : -1;
+            CHECK(held >= 0 && held < E, "pool layer: a pool one short still holds layer 1 whole for the gate (%d of %d)", held, E);
+            vkt_shutdown();
+            unsetenv("COLI_VK_TIER_POOL_LAYER");
+            CHECK(vkt_init(&vc, rows), "pool layer: the tier did not start again");
+            int ql[L * E], qe[L * E], m = vkt_plan(ql, qe, L * E);
+            int same = n == m;
+            for (int i = 0; same && i < n; i++) same = pl[i] == ql[i] && pe[i] == qe[i];
+            CHECK(same && !first, "pool layer: the declined lever moved the plan (%d experts, layer 1's %d of %d, first %d)",
+                  m, per[1], E, first);
+            printf("  pool layer, the pool one place short: the plan the lever-free tier's %d experts exactly, layer 1's %d of %d "
+                   "in it by the fill, the table %d of %d -- nothing placed\n", m, per[1], E, held, E);
+        } else {
+            uint8_t host[E];
+            int nh = vkt_dev_host(1, host), in_pool = 1, res = 0;
+            for (int e = 0; e < E; e++) { in_pool &= host[e]; res += vkt_resident(1, e); }
+            CHECK(n == E + 4 && per[1] == E && per[0] == 4 && first,
+                  "pool layer: planned %d experts (layers %d/%d), not layer 1's %d in the pool ahead of layer 0's four",
+                  n, per[0], per[1], E);
+            CHECK(res == E && nh == E && in_pool && dev_mask(1) == 0u,
+                  "pool layer: %d of %d resident, %d of them in the table's host places, the device's mask %#x",
+                  res, E, nh, dev_mask(1));
+            CHECK(tab && vkt_dev_table(1, tab) == E, "pool layer: the tier does not count all %d of layer 1 for the dmoe gate", E);
+            /* the layer routed, its rows read from the pool, and the books' promotions on:
+             * it stays in the pool and the device keeps its own four */
+            Books bk = {0, 0}; double worst = 0; int idx[8 * K]; float w[8 * K];
+            for (int t2 = 0; t2 < 40; t2++) { route(4, 0, E, idx, w); double r = step(1, 4, idx, w, &bk); if (r > worst) worst = r; vkt_settle(); }
+            for (int t2 = 0; t2 < 8; t2++) { route(8, 0, E, idx, w); vkt_dev_count(1, 8, K, idx); vkt_settle(); }
+            CHECK(dev_mask(1) == 0u && dev_mask(0) != 0u && vkt_dev_table(1, tab) == E,
+                  "pool layer: the promotions moved the placed layer (its device mask %#x, layer 0's %#x, the table %d of %d)",
+                  dev_mask(1), dev_mask(0), vkt_dev_table(1, tab), E);
+            CHECK(worst < 2e-3, "pool layer: the pool's rows off the reference (%.3g)", worst);
+            printf("  pool layer: layer 1's %d experts in the host pool (the device's mask %#x, layer 0's %#x), the table whole "
+                   "through %llu routed rows and the books' promotions, worst %.2e\n", nh, dev_mask(1), dev_mask(0), bk.routed, worst);
+        }
+        vkt_shutdown();
+    }
+    free(tab);
+    unsetenv("COLI_VK_TIER_HOST_GB"); unsetenv("COLI_VK_TIER_SYNC"); unsetenv("COLI_VK_TIER_PROMOTE");
+    unsetenv("COLI_VK_TIER_POOL_LAYER");
+    setenv("COLI_VK_TIER_HOST", "0", 1);
+    model_free();
+}
 /* A pool short of every expert, promotions on (COLI_VK_TIER_PROMOTE): a routed pooled
  * expert moves up to the device, the coldest resident gives way -- with no pool copy of
  * its own, its device copy is freed and the slot empties -- and every row stays the
@@ -2249,6 +2341,7 @@ int main(int argc, char **argv) {
     printf("fill:\n"); fill();   /* after extra: its exact pool capacities assume no tier came before with more experts */
     printf("hot set:\n"); hotset();
     printf("pin layer:\n"); pin_layer();
+    printf("pool layer:\n"); pool_layer();
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
     printf("stream batch:\n"); stream_batch();

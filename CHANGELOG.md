@@ -7,6 +7,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `COLI_VK_TIER_POOL_LAYER` (the routed-expert tier): the L2 Stage C lever —
+  `COLI_VK_DMOE`'s residency activator that is **not a device pin**. `=n`
+  (default unset, changing nothing) plans layer n's experts into the host pool
+  at the warm start, ahead of the heat history: no device place, no staging
+  slot, no prefetch entry is spent, and `vkt_dev_table` counts them anyway (a
+  pool resident keeps `dev` 0), so `vk_dmoe.h`'s all-or-nothing gate opens for
+  a layer the device tier could never hold whole — the measured reason Stages
+  A+B stayed inert at model scale (T-l2-arms-2026-10-24: every D-run declined,
+  zero layer steps through the dmoe path, all timing deltas noise). All or
+  nothing like the gate it serves: a pool that cannot hold all E of the layer
+  places none of them and says so once. `hot_pin` pins the placed layer and
+  `promote` skips it, so the tier's own promotions cannot move it up to the
+  device and churn the residents there — the exact mechanism that made the
+  device-pinned variant a measured negative (`98fcee51`: prefetch 12,644->1,890,
+  TTFT x2 on 16 GiB). The pool must be on and hold the layer
+  (`COLI_VK_TIER_HOST_GB`; ~3.75 GiB of system RAM for DeepSeek V4's 256 MXFP4
+  experts), which is the trade: the layer's visits are PCIe-bound instead of
+  device-resident. DeepSeek V4's `VktConfig.stage` stays unset on purpose (the
+  staging carve is block-format-gated at two layers and fmt 7 never stages; the
+  reasoning now sits beside the config for a future block-format V4). The
+  tier's test gains the lever's case: exactly E of the layer planned into the
+  pool ahead of the history, resident there with the device's mask empty, the
+  table whole for the gate, still in the pool after the books' promotions with
+  the device keeping its own residents, and a pool one place short placing
+  nothing — the plan then identical, entry for entry, to the lever-free tier's.
 - `COLI_VK_DMOE` + `COLI_VK_DMOE_ROWS` (DeepSeek V4's chain): the L2 Stage A
   wiring — DeepSeek V4 joins `vk_dmoe.h`, the shape upstream's own MoE engines
   (olmoe, qwen36, qwen38) already have. `COLI_VK_DMOE=n` (default `0`, changing
