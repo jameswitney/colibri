@@ -146,6 +146,7 @@ typedef struct {
     VkPipeline gemv4x;                /* chain_gemv.comp with x read from its buffer (a row past the staging) */
     VkPipeline gemv4n, gemv4xn;       /* the same taking up to 4 rows of x a workgroup (a verify's), NR 4 */
     VkShaderModule mod_adec; VkPipeline adec; int adec_tried; VkcBuf *adec_x;   /* chain_attn_dec.comp and its scratch */
+    VkcBuf *fa16;                    /* chain_dsv4_fa's f16 mirror scratch (COLI_VK_CHAIN_ATTN_FA) */
     VkShaderModule mod_mdec; VkPipeline mdec; int mdec_tried;   /* chain_mla_dec.comp (the same scratch) */
     /* chain_gemm.comp: int8/int4 prompt GEMMs, x rounded to f16 once (COLI_VK_CHAIN_GEMM) */
     VkShaderModule mod_tg; VkPipeline tg;
@@ -465,6 +466,7 @@ static int coop_on(const char *env) {
 }
 
 static void dsv4_init(void);       /* chain_dsv4.comp (DeepSeek V4.1 / V4), below */
+static void dsv4_fa_shutdown(void);  /* chain_dsv4_fa.comp (COLI_VK_CHAIN_ATTN_FA), below */
 static void dsv4_shutdown(void);
 static void kvs_shutdown(void);    /* chain_kvs.comp (the split KV cache), below */
 /* The compute shared memory a workgroup may declare: the device's
@@ -1751,25 +1753,27 @@ static VkPipeline adec_pipe(void) {
     if ((KC.mod_adec = load_module(KC.core.spv_path, "chain_attn_dec.spv"))) KC.adec = make_pipe(KC.mod_adec, NULL);
     return KC.adec;
 }
-/* the blocks' scratch, at least `bytes`: a smaller one goes with the open frame (freed when
+/* a grown scratch, at least `bytes`: a smaller one goes with the open frame (freed when
  * the frame comes back), so a call never waits on the frames before it */
-static VkcBuf *adec_scratch(size_t bytes) {
-    if (KC.adec_x && KC.adec_x->bytes >= bytes) return KC.adec_x;
+static VkcBuf *scratch_grow(VkcBuf **slot, size_t bytes) {
+    if (*slot && (*slot)->bytes >= bytes) return *slot;
     VkcFrame *f = open_frame();
     if (!f) return NULL;
     VkcBuf *nb = vkc_buf(bytes + bytes / 2, VKC_DEV);
     if (!nb) return NULL;
-    if (KC.adec_x) {
+    if (*slot) {
         if (f->ntmp == f->ctmp) {
             int c = f->ctmp ? 2 * f->ctmp : 8;
             VkcBuf **t = realloc(f->tmp, (size_t)c * sizeof *t);
             if (!t) { buf_release(nb); return NULL; }
             f->tmp = t; f->ctmp = c;
         }
-        f->tmp[f->ntmp++] = KC.adec_x;
+        f->tmp[f->ntmp++] = *slot;
     }
-    return KC.adec_x = nb;
+    return *slot = nb;
 }
+static VkcBuf *adec_scratch(size_t bytes) { return scratch_grow(&KC.adec_x, bytes); }
+static VkcBuf *fa16_scratch(size_t bytes);   /* the f16 mirror's, below at the FA family */
 static int attn_dec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *snk, const VkcAttnW *w) {
     int S = w->a.S, last = w->a.pos_base + S;   /* the last row's positions */
     int n = w->win > 0 && w->win < last ? w->win : last;
@@ -3403,6 +3407,7 @@ void vkc_shutdown(void) {
     KC.tsem_g = KC.tsem_h = VK_NULL_HANDLE;
     if (KC.dummy) buf_release(KC.dummy);
     if (KC.adec_x) buf_release(KC.adec_x);
+    if (KC.fa16) buf_release(KC.fa16);
     for (int k = 0; k < 3; k++) {
         VkaPool *P = &KC.pool[k].p;
         for (int b = 0; b < P->nb; b++) {
@@ -3494,6 +3499,7 @@ void vkc_shutdown(void) {
     if (KC.pl) vkDestroyPipelineLayout(KC.dev, KC.pl, NULL);
     if (KC.dsl) vkDestroyDescriptorSetLayout(KC.dev, KC.dsl, NULL);
     dsv4_shutdown();
+    dsv4_fa_shutdown();
     kvs_shutdown();
     memset(&KC, 0, sizeof KC);
     KC.cur = -1; KC.gemm_rows = -1;
@@ -3523,33 +3529,115 @@ int vkc_dsv4_ready(void) { return vkc_ready() && D4.pipe; }
 
 /* the shader reads one block of 32 words: the mode, then the op's fields */
 typedef struct { int mode; int w[31]; } Dsv4PC;
-static int dsv4_rec(int kind, int mode, const void *b, size_t bytes, VkcBind *bd, int nb, uint32_t gx, uint32_t gy) {
-    if (!D4.pipe || !open_frame() || KC.lost || bytes > sizeof(int) * 31) return 0;
+static int dsv4_rec(int kind, VkPipeline pipe, int mode, const void *b, size_t bytes, VkcBind *bd, int nb, uint32_t gx, uint32_t gy) {
+    if (!pipe || !open_frame() || KC.lost || bytes > sizeof(int) * 31) return 0;
     Dsv4PC pc; memset(&pc, 0, sizeof pc);
     pc.mode = mode; memcpy(pc.w, b, bytes);
     KC.kind = kind;
-    return record(D4.pipe, bd, nb, &pc, sizeof pc, gx, gy, 1);
+    return record(pipe, bd, nb, &pc, sizeof pc, gx, gy, 1);
+}
+/* ---- the flash-attention tile (chain_dsv4_fa.comp, COLI_VK_CHAIN_ATTN_FA) ------------
+ * The fork's sparse_attn_fa family (d11fba5b, itself llama.cpp's flash_attn.comp) on
+ * this chain's mode-0 contract: same bindings and push constants, so vkc_dsv4_attn
+ * dispatches either. One workgroup covers Br query heads of one token and streams the
+ * token's rows in Bc tiles, the K/V rows staged once in LDS (K == V, one latent row
+ * both passes) instead of mode 0's every-head re-read from VRAM (the census' ~16x row
+ * amplification), an online softmax, a subgroup-tree score dot and llama's sink end
+ * block. Four builds from the one source, the fork's four: Br 8 (prefill) and the Br 2
+ * decode twin at tokens == 1 (a head's accumulation order unchanged, only heads/2
+ * workgroups instead of heads/8), each with a KV_F16 twin reading the f16 mirror
+ * chain_dsv4_fa_gather.comp writes a dispatch ahead -- the fork's storage-only fp16
+ * (its COLI_DSV4_VK_KV_F16, retired ON in the fork's standing arm) as a read-side
+ * mirror over this port's fp32 stores: half the KV read bytes, the same numerics
+ * class (fp16 holds the bf16/fp8-rounded rows exactly in its normal range), nothing
+ * permanent. Numerics: thresholded against the scalar path, never bit-identical (the
+ * fork held 2e-3): the dot is a subgroup tree, the softmax rescales in tile order and
+ * the tile max carries llama's KQ_MAX_OFFSET, which also moves the bf16 probability
+ * rounding's scale (flags 1). COLI_VK_CHAIN_ATTN_FA: unset/0 keeps mode 0 (today's
+ * bits, read per call so a test can arm it case by case); 1 the fork's standing class
+ * (the tile + the f16 mirror); 2 the tile over the fp32 rows (the fork's KV_F16=0
+ * arm). A shape the tile cannot take (hd != 512, heads % 8, or a q/o/w/c offset or
+ * stride not a multiple of 4 floats) or a pipeline that did not load falls back to
+ * mode 0 -- never a misread. */
+enum { FA_BR8, FA_BR8_F16, FA_BR2, FA_BR2_F16, FA_GATHER, FA_N };
+static struct { VkShaderModule mod[FA_N]; VkPipeline pipe[FA_N]; int tried; } g_fa4[2];
+#define FA4 (g_fa4[g_kd])
+static const char *const fa4_file[FA_N] = {"chain_dsv4_fa.spv", "chain_dsv4_fa_f16.spv", "chain_dsv4_fa_dec.spv",
+                                           "chain_dsv4_fa_dec_f16.spv", "chain_dsv4_fa_gather.spv"};
+static void dsv4_fa_shutdown(void) {
+    for (int i = 0; i < FA_N; i++) {
+        if (FA4.pipe[i]) vkDestroyPipeline(KC.dev, FA4.pipe[i], NULL);
+        if (FA4.mod[i]) vkDestroyShaderModule(KC.dev, FA4.mod[i], NULL);
+    }
+    memset(&FA4, 0, sizeof FA4);
+}
+static VkPipeline fa4_pipe(int i) {   /* lazy: only an armed attention loads the family */
+    if (FA4.pipe[i] || FA4.tried || !vkc_ready()) return FA4.pipe[i];
+    FA4.tried = 1;
+    for (int k = 0; k < FA_N; k++)
+        if ((FA4.mod[k] = load_module(KC.core.spv_path, fa4_file[k]))) FA4.pipe[k] = make_pipe(FA4.mod[k], NULL);
+    return FA4.pipe[i];
+}
+static VkcBuf *fa16_scratch(size_t bytes) { return scratch_grow(&KC.fa16, bytes); }
+static int attn_fa_wanted(void) {   /* COLI_VK_CHAIN_ATTN_FA: 1 f16 mirror, 2 fp32 rows, else mode 0 */
+    const char *e = getenv("COLI_VK_CHAIN_ATTN_FA");
+    int v = e && *e ? atoi(e) : 0;
+    return v == 1 || v == 2 ? v : 0;
 }
 int vkc_dsv4_attn(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *prm, VkcBuf *out, const VkcDsAttn *p) {
     if (p->S < 1 || p->S > 65535 || p->H < 1 || p->H > 65535 || p->hd < 1 || p->hd > 1024 || p->cnt < 0 || p->cnt > 3072)
         return 0;
     if (p->cnt == 0) return 0;
+    if (attn_fa_wanted() && p->hd == 512 && !(p->H % 8) &&
+        !((p->q_off | p->q_row | p->o_off | p->o_row | p->w_off | p->c_off) & 3)) {
+        int dec = p->S == 1, br = dec ? 2 : 8;   /* the decode twin keeps a head's order */
+        VkPipeline fp = VK_NULL_HANDLE;
+        VkcBuf *kv = NULL;
+        if (attn_fa_wanted() == 1) {   /* the f16 mirror: every ring and pool row, one dispatch */
+            size_t pool = ((cmp ? cmp->bytes : win->bytes) - (size_t)(cmp ? p->c_off : p->w_off) * 4) /
+                          ((size_t)p->hd * 4);
+            VkcBuf *mir = fa16_scratch((size_t)(p->nwin + pool) * p->hd * 2);
+            VkPipeline gth = fa4_pipe(FA_GATHER);
+            if (mir && gth) {
+                Dsv4PC gpc; memset(&gpc, 0, sizeof gpc);
+                gpc.mode = 1; memcpy(gpc.w, p, sizeof *p); gpc.w[16] = p->nwin + (int)pool;
+                uint32_t gx, gy;
+                grid(((uint64_t)(p->nwin + pool) * (p->hd / 4) + 255) / 256, &gx, &gy);
+                VkcBind gb[8] = {B(NULL, 0), B(win, 0), B(cmp ? cmp : win, 0), B(NULL, 0), B(NULL, 0), B(mir, 1),
+                                 B(NULL, 0), B(NULL, 0)};
+                KC.kind = PK_ATTN;
+                if (record(gth, gb, 8, &gpc, sizeof gpc, gx, gy, 1)) {
+                    fp = fa4_pipe(dec ? FA_BR2_F16 : FA_BR8_F16);
+                    kv = mir;
+                }
+            }
+        }
+        if (!fp) fp = fa4_pipe(dec ? FA_BR2 : FA_BR8);
+        if (fp) {
+            VkcBind fbd[6] = {B(q, 0), B(kv ? kv : win, 0), B(kv ? kv : (cmp ? cmp : win), 0), B(list, 0), B(prm, 0),
+                              B(out, 1)};
+            if (dsv4_rec(PK_ATTN, fp, 0, p, sizeof *p, fbd, 6, (uint32_t)p->S, (uint32_t)(p->H / br))) {
+                KC.st.attn_fa++;
+                return 1;
+            }
+        }
+    }
     VkcBind bd[6] = {B(q, 0), B(win, 0), B(cmp ? cmp : win, 0), B(list, 0), B(prm, 0), B(out, 1)};
-    return dsv4_rec(PK_ATTN, 0, p, sizeof *p, bd, 6, (uint32_t)p->H, (uint32_t)p->S);
+    return dsv4_rec(PK_ATTN, D4.pipe, 0, p, sizeof *p, bd, 6, (uint32_t)p->H, (uint32_t)p->S);
 }
 int vkc_dsv4_rope(VkcBuf *x, VkcBuf *cs, const VkcDsRope *p) {
     if (p->nseg < 0 || p->per_row < 1 || p->rd < 2 || (p->rd & 1)) return 0;
     if (p->nseg == 0) return open_frame() && !KC.lost;
     VkcBind bd[6] = {B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(cs, 0), B(x, 1)};
     uint32_t gx, gy; grid(((uint64_t)p->nseg * (p->rd / 2) + 255) / 256, &gx, &gy);
-    return dsv4_rec(PK_ROPE, 1, p, sizeof *p, bd, 6, gx, gy);
+    return dsv4_rec(PK_ROPE, D4.pipe, 1, p, sizeof *p, bd, 6, gx, gy);
 }
 int vkc_dsv4_compress(VkcBuf *kv, VkcBuf *sc, VkcBuf *ring, VkcBuf *prm, VkcBuf *out, const VkcDsComp *p) {
     if (p->S < 0 || p->ratio < 1 || p->P < 1 || p->D < 1 || p->D > p->P || (p->overlap && p->P < 2 * p->D)) return 0;
     if (p->S == 0) return open_frame() && !KC.lost;
     VkcBind bd[8] = {B(kv, 0), B(sc, 0), B(NULL, 0), B(NULL, 0), B(p->ape_off >= 0 ? prm : NULL, 0), B(out, 1), B(NULL, 0),
                      B(ring, 1)};
-    return dsv4_rec(PK_DSA, 2, p, sizeof *p, bd, 8, 1, 1);
+    return dsv4_rec(PK_DSA, D4.pipe, 2, p, sizeof *p, bd, 8, 1, 1);
 }
 int vkc_dsv4_score(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *mask, VkcBuf *sc, const VkcDsScore *p) {
     /* queries above 4096 floats: mode 9, the same sums with the queries read from memory */
@@ -3561,26 +3649,26 @@ int vkc_dsv4_score(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *mask, VkcBuf *s
     /* many columns: on a grid of 256 / IH columns a workgroup (mode 10, the same bits) */
     if (dsa_grid_on() && p->IH <= 256 && p->width >= VKC_DSA_GRID) {
         int P = 256 / p->IH;
-        return dsv4_rec(PK_DSA, 10, p, sizeof *p, bd, 6, (uint32_t)((p->width + P - 1) / P), (uint32_t)p->S);
+        return dsv4_rec(PK_DSA, D4.pipe, 10, p, sizeof *p, bd, 6, (uint32_t)((p->width + P - 1) / P), (uint32_t)p->S);
     }
-    return dsv4_rec(PK_DSA, wide ? 9 : 3, p, sizeof *p, bd, 6, (uint32_t)p->S, 1);
+    return dsv4_rec(PK_DSA, D4.pipe, wide ? 9 : 3, p, sizeof *p, bd, 6, (uint32_t)p->S, 1);
 }
 int vkc_dsv4_cand(VkcBuf *sc, VkcBuf *mask, const VkcDsCand *p) {
     if (p->S < 1 || p->S > 65535 || p->block < 1 || p->ratio < 1 || p->width < 0 ||
         (p->width + p->block - 1) / p->block > 4096 || p->mask_row < p->width) return 0;
     VkcBind bd[7] = {B(sc, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(mask, 1)};
-    return dsv4_rec(PK_DSA, 4, p, sizeof *p, bd, 7, (uint32_t)p->S, 1);
+    return dsv4_rec(PK_DSA, D4.pipe, 4, p, sizeof *p, bd, 7, (uint32_t)p->S, 1);
 }
 int vkc_dsv4_topk(VkcBuf *sc, VkcBuf *list, const VkcDsTopk *p) {
     if (p->S < 1 || p->S > 65535 || p->topk < 0 || p->width < 0 || (p->order && p->topk > 4096)) return 0;
     if (p->topk == 0) return open_frame() && !KC.lost;
     VkcBind bd[7] = {B(sc, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(list, 1)};
-    return dsv4_rec(PK_DSA, 5, p, sizeof *p, bd, 7, (uint32_t)p->S, 1);
+    return dsv4_rec(PK_DSA, D4.pipe, 5, p, sizeof *p, bd, 7, (uint32_t)p->S, 1);
 }
 int vkc_dsv4_engram(VkcBuf *kv, VkcBuf *prm, VkcBuf *x, const VkcDsEngram *p) {
     if (p->S < 1 || p->S > 65535 || p->H < 1 || p->D < 1) return 0;
     VkcBind bd[6] = {B(kv, 0), B(prm, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(x, 1)};
-    return dsv4_rec(PK_EW, 6, p, sizeof *p, bd, 6, (uint32_t)p->H, (uint32_t)p->S);
+    return dsv4_rec(PK_EW, D4.pipe, 6, p, sizeof *p, bd, 6, (uint32_t)p->H, (uint32_t)p->S);
 }
 int vkc_dsv4_round(VkcBuf *x, VkcBuf *y, const VkcDsRound *p) {
     if (!x || !y || p->kind < VKC_DS_BF16 || p->kind > VKC_DS_HADAMARD || p->nseg < 0 || p->per_row < 1 || p->len < 1)
@@ -3598,14 +3686,14 @@ int vkc_dsv4_round(VkcBuf *x, VkcBuf *y, const VkcDsRound *p) {
                     : (uint64_t)p->nseg * ((p->len + p->block - 1) / p->block);
     uint32_t gx, gy; grid(groups, &gx, &gy);
     VkcBind bd[6] = {B(x == y ? NULL : x, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(y, 1)};
-    return dsv4_rec(PK_EW, 7, w, sizeof w, bd, 6, gx, gy);
+    return dsv4_rec(PK_EW, D4.pipe, 7, w, sizeof w, bd, 6, gx, gy);
 }
 int vkc_dsv4_swiglu(VkcBuf *a, VkcBuf *b, VkcBuf *y, const VkcDsSwiglu *p) {
     if (!a || !b || !y || p->n < 0) return 0;
     if (p->n == 0) return open_frame() && !KC.lost;
     uint32_t gx, gy; grid(((uint64_t)p->n + 255) / 256, &gx, &gy);
     VkcBind bd[6] = {B(a, 0), B(b, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(y, 1)};
-    return dsv4_rec(PK_EW, 8, p, sizeof *p, bd, 6, gx, gy);
+    return dsv4_rec(PK_EW, D4.pipe, 8, p, sizeof *p, bd, 6, gx, gy);
 }
 
 /* ---- a KV cache split between the device and the host (chain_kvs.comp) ------------

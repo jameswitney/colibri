@@ -7,6 +7,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `COLI_VK_CHAIN_ATTN_FA` (DeepSeek V4/V4.1's chain): the fork's `sparse_attn_fa` tile
+  ported onto `vkc_dsv4_attn`'s contract (`chain_dsv4_fa.comp` — same bindings and push
+  constants as `chain_dsv4.comp` mode 0, so the one call dispatches either): a workgroup
+  Br query heads of one token streams the row list in Bc tiles with the K/V rows staged
+  once in LDS (K == V), an online softmax and llama's sink end block, against mode 0's a
+  workgroup a (head, row) re-reading every row twice per head (the shader census' ~32x
+  the KV bytes). Four builds from the one source, the fork's four: Br 8 prefill, the
+  Br 2 decode twin at tokens == 1 (a head's numerics unchanged, heads/2 workgroups),
+  each with a KV_F16 twin reading the f16 mirror `chain_dsv4_fa_gather.comp` writes a
+  dispatch ahead — the fork's storage-only fp16 (its standing arm) as a read-side mirror
+  over this port's fp32 stores: half the KV read bytes, the same numerics class, nothing
+  permanent, no writer touched. `1` = tile + mirror (the fork's standing class), `2` =
+  tile over fp32 (its KV_F16=0 arm); unset/0 = mode 0, byte-identical, the FA modules
+  not even loaded; every refusal (head dim != 512, heads % 8, unaligned q/o/w/c offsets
+  or strides, a missing pipeline) falls back to mode 0 — never a misread — and the
+  KV-split path (`chain_kvs.comp`) is untouched. Thresholded class where it engages
+  (the unit oracle: 4.1e-3 f16 / 6.5e-3 worst against the 8e-3 mode-0 bar, the fork's
+  own gate 2e-3; token-exact at tiny holds — the tile cannot engage at the tiny
+  fixture's head dim 32). RX 6900 XT, the model's decode geometry: 1920 -> 228 us a
+  layer-dispatch (8.4x, ~= the fork's ~10 ms/tok over 43 layers vs the 63.8 ms/tok
+  bucket), a 256-row chunk 304 -> 6.0 ms (51x). `VkcStats.attn_fa` counts engagements;
+  the grown-scratch pattern (`adec_scratch`) refactored to a second user.
+  Report: `docs/research/AG-pw-c2-fa-flash-attention-2026-10-25.md`.
 - `COLI_VK_CHAIN_ORDER=layer` (DeepSeek V4's chain) + `COLI_VK_DMOE=all` (the dmoe arm's
   multi-layer form): the prompt loop reordered layer-outer — the fork's own prefill
   order ("A true prefill is layer-major: every prompt position crosses this layer before
