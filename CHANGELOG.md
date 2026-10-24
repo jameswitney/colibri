@@ -7,6 +7,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **fmt 15 — the tier's MXFP4 experts with packed ue8m0 scales** (the parity wave's PW-D
+  slice): `VKT_SRC_MXFP4_E8M0` experts (DeepSeek V4/V4.1, Kimi K3, MiMo) now keep their
+  group scales on the device **as the ue8m0 bytes the store holds them in** — 1 byte a
+  32-input group, 4 to a word — instead of expanding each to f32 at upload. The round
+  trip is the identity (the byte's value is the float's exponent field: 2^(e−127),
+  exactly what the old expansion wrote), so the packing changes bytes, never values:
+  a DeepSeek V4 expert's device payload drops **15.0 → 12.75 MiB (−17.6 %)** — the fork's
+  own slab class — and every stream, promote and upload byte for MXFP4 experts drops
+  with it; at the same budget the tier holds 1.1765× the experts (both residents and
+  stream slots shrink; 277→~374 residents beside 256 slots at the census rig's 7.85 GiB).
+  A new device format number rather than a redefinition: fmt 7 (f32 scales) stays for
+  `VKT_SRC_MXFP4_F32` sources and the generic dense matmul APIs (which take `float*`
+  scales and refuse the packed form); every resident-expert consumer reads the bytes
+  with one extract branch — `qmatmul_grp_mx`(+gate_up), `chain_moe_gv`, `chain_moe`,
+  `qmatmul`, `qmatmul_gate_up`, `qmatmul_gemm`, `qmatmul_coop`, `qmatmul_grp_gemv` — and
+  the CPU host-rows path decodes them the same way. Proof: the packed form's device rows
+  are **bit-identical** to the f32 form's over the same codes and scales (the new
+  `run_xbatch_mx_pack` case), the ue8m0⇄f32 identity is unit-checked over all 256 bytes,
+  and the tiny oracle is token-exact with the tier on fmt 15 (decode, prefill, dmoe,
+  bank and the composed legs). The CUDA tier keeps fmt 7 (its ops table has no packed
+  form yet); no env, no gate. Report: `docs/research/AE-pw-d-ue8m0-u8-scale-packing-2026-10-25.md`.
 - `COLI_VK_CHAIN_ORDER=layer` (DeepSeek V4's chain) + `COLI_VK_DMOE=all` (the dmoe arm's
   multi-layer form): the prompt loop reordered layer-outer — the fork's own prefill
   order ("A true prefill is layer-major: every prompt position crosses this layer before

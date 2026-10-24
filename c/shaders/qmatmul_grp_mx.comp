@@ -1,8 +1,9 @@
 #version 450
-// The expert batch's grouped GEMM for MXFP4 (fmt 7) experts (backend_vulkan.c,
-// xb_grp_record mode 4): one dispatch covers every expert of a batch, qmatmul_grp.comp's
-// items and expert table, the weights the tier's native tensors (uint words of 8 e2m1
-// nibbles, a float scale a 32-input group) read by address; float arithmetic, no matrix
+// The expert batch's grouped GEMM for MXFP4 (fmt 7, and its packed-scales twin 15)
+// experts (backend_vulkan.c, xb_grp_record mode 4): one dispatch covers every expert of a
+// batch, qmatmul_grp.comp's items and expert table, the weights the tier's native tensors
+// (uint words of 8 e2m1 nibbles, a float scale a 32-input group — fmt 15: a ue8m0 byte,
+// read by the expert's table entry) read by address; float arithmetic, no matrix
 // units, any subgroup size — the shape of qmatmul_grp_bd.comp (the GGUF blocks') with the
 // decode of qmatmul_grp_gemv.comp (its MXFP4 path), for the native checkpoints the GEMV
 // only served a row at a time.
@@ -16,7 +17,7 @@
 // then each thread accumulates one output against 4 rows (GATE_UP, for both matrices) or 8
 // from vec4 reads, rows 68 floats apart (the 8 lanes of a phase on 8 bank groups).
 // Host gates: I % 64 == 0, D % 64 == 0, gs % 32 == 0, rowWords % 4 == 0 and every expert
-// of the batch in fmt 7 (one layer's).
+// of the batch in fmt 7 or fmt 15, one format (one layer's).
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
 #extension GL_EXT_control_flow_attributes : require
@@ -25,6 +26,7 @@ layout(local_size_x = 256) in;
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WRef4 { uvec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer SRef { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer BRef { uint v[]; };   // fmt 15's packed scale words
 layout(std430, binding = 0) readonly buffer X  { vec4 x4[]; };     // packed rows of all experts
 layout(std430, binding = 1) readonly buffer IT { uvec4 items[]; };  // (expert, first row, output block, -)
 layout(std430, binding = 2) readonly buffer ET { uint etab[]; };    // 16 uints per expert (qmatmul_grp.comp's)
@@ -53,6 +55,16 @@ float e2(uint n) {
     float v = float((0xC8643210u >> ((n & 7u) * 4u)) & 15u) * 0.5;
     return (n & 8u) != 0u ? -v : v;
 }
+// fmt 15: the scales are ue8m0 bytes, 4 to a word (the table's fmt entry says which); a
+// byte's float is its exponent into the float's exponent field -- 2^(e-127) exactly, the
+// same bits the f32-scale form (fmt 7) holds after the host's ue8m0 -> f32 expansion
+float msc(uint fmt, SRef sf, BRef sb, uint b) {
+    if (fmt == 15u) {
+        uint w = sb.v[b >> 2u];
+        return uintBitsToFloat(uint(bitfieldExtract(w, int((b & 3u) * 8u), 8)) << 23);
+    }
+    return sf.v[b];
+}
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -60,19 +72,23 @@ void main() {
     uint eb = it.x * 16u;
     uint S = etab[eb + 8u], xoff = etab[eb + 9u], rowWords = etab[eb + 11u],
          gs = max(etab[eb + 12u], 32u);
+    uint ef = etab[eb + 10u];   /* the expert's format: 7 f32 scales, 15 packed ue8m0 bytes */
     uint I = uint(p.I), ng = I / gs, rw4 = rowWords / 4u;
     uint s0 = it.y, o0 = it.z * BO, O = uint(p.O);
 #ifdef GATE_UP
     WRef4 gw = WRef4(uvec2(etab[eb + 0u], etab[eb + 1u]));
     SRef  gs_ = SRef(uvec2(etab[eb + 2u], etab[eb + 3u]));
+    BRef  gb_ = BRef(uvec2(etab[eb + 2u], etab[eb + 3u]));
     WRef4 uw = WRef4(uvec2(etab[eb + 4u], etab[eb + 5u]));
     SRef  us_ = SRef(uvec2(etab[eb + 6u], etab[eb + 7u]));
+    BRef  ub_ = BRef(uvec2(etab[eb + 6u], etab[eb + 7u]));
     uint ty = tid / 8u, tx = tid % 8u;    // output o0 + ty, rows s0 + tx + 8j
     vec4 ag[4], au[4];
     [[unroll]] for (int j = 0; j < 4; j++) { ag[j] = vec4(0.0); au[j] = vec4(0.0); }
 #else
     WRef4 dw = WRef4(uvec2(etab[eb + 0u], etab[eb + 1u]));
     SRef  ds_ = SRef(uvec2(etab[eb + 2u], etab[eb + 3u]));
+    BRef  db_ = BRef(uvec2(etab[eb + 2u], etab[eb + 3u]));
     uint ty = tid / 4u, tx = tid % 4u;    // output o0 + ty, rows s0 + tx + 4j
     vec4 ac[8];
     [[unroll]] for (int j = 0; j < 8; j++) ac[j] = vec4(0.0);
@@ -85,16 +101,18 @@ void main() {
             uint r = (tid >> 1) & 31u, h = tid & 1u;
             WRef4 w = m != 0u ? uw : gw;
             SRef sc = m != 0u ? us_ : gs_;
+            BRef sb = m != 0u ? ub_ : gb_;
 #else
             uint r = tid >> 1, h = tid & 1u;
             WRef4 w = dw;
             SRef sc = ds_;
+            BRef sb = db_;
 #endif
             uint o = min(o0 + r, O - 1u);
             /* one half's 32 inputs: one uvec4 of weights, one scale (gs % 32 == 0 keeps a
              * half inside a group; the group index is the element's, both multiples of 32) */
             uvec4 wv = w.v[o * rw4 + k0 / 32u + h];
-            float s = sc.v[o * ng + (k0 + h * 32u) / gs];
+            float s = msc(ef, sc, sb, o * ng + (k0 + h * 32u) / gs);
             vec4 d[8];
             [[unroll]] for (uint j = 0u; j < 4u; j++) {
                 uint wd = wv[j];
