@@ -230,6 +230,7 @@ void coli_vk_tier_pool_limit_dev(int dev, size_t bytes);   /* dev 1: COLI_VK_DEV
  * through its mapping, never staged. 1 when the device can: a discrete card with
  * bufferDeviceAddress and a host-visible type in system RAM. */
 int  coli_vk_tier_host_pool(void);
+size_t coli_vk_tier_host_heap_room(void);   /* what the driver leaves in that pool's system-RAM heap (0: unknown) */
 /* The tier's extra layers (an MTP head's experts, another size than the main ones'):
  * a pool of their own on the primary device (pool 4), its budget, and a tensor in it
  * (as coli_vk_tier_tensor). */
@@ -469,6 +470,9 @@ const char *coli_vk_device_name(void);
  * coli_vk_init_env_tier(engine, 0). */
 int coli_vk_init_env(const char *engine);
 int coli_vk_init_env_tier(const char *engine, int tier_on);
+/* "[VK] <engine>: COLI_VULKAN is not set: the Vulkan device stays unused", once a process
+ * (coli_vk_init_env_tier says it; an engine that skips the call says it itself) */
+void coli_vk_say_unused(const char *engine);
 /* Where an engine's dense (resident, non-expert) matrices run, the one rule every
  * engine follows. COLI_VK_DENSE set and non-empty: 0 keeps them on the CPU, any other
  * number puts them on the device. Unset: the engine's default `def`, except that with
@@ -536,7 +540,7 @@ typedef struct {
 } ColiVkCore;
 int  coli_vk_core(ColiVkCore *out);
 /* A resident tensor's buffers (VkBuffer as void *) and layout; 0 for a COLI_VK_DEV2 one. */
-typedef struct { void *wbuf, *sbuf; int fmt, I, O, rowWords, gs; } ColiVkTensorInfo;
+typedef struct { void *wbuf, *sbuf; int fmt, I, O, rowWords, gs; int wide; } ColiVkTensorInfo;   /* wide: off the f16 cooperative-matrix GEMMs */
 int  coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *out);
 /* The strict capability gate (COLI_VK_STRICT=1, docs/vulkan.md). Every point that
  * would silently leave the GPU off — a shader absent from the deployment, a fence

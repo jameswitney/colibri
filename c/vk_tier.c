@@ -2544,7 +2544,7 @@ static void d2_init(long long fit0, long long all, int act) {
     double room = heap_free - env_gb("COLI_VK_RESERVE2_GB", 0.5) * GiB, want = room;
     if (di.shares_ram) {
         double avail = (double)mem_available();
-        double ram_room = avail > 0 ? avail - (double)T.c.ram_reserve - (double)T.c.dense_bytes - 2.0 * GiB : room;
+        double ram_room = avail > 0 ? avail - (double)T.c.ram_reserve - (double)T.c.dense_bytes - (double)T.c.ram_later - 2.0 * GiB : room;
         if (ram_room / 4 < want) want = ram_room / 4;
     }
     if (want < 0) want = 0;
@@ -2616,11 +2616,12 @@ static void host_init(long long all) {
     size_t avail = mem_available();
     char hs[32], hb[32];
     /* the engine's RAM plan sizes the pool when it keeps one (VktConfig.ram_planned:
-     * vkt_host_room's arithmetic); without one, what is available less 4 GiB, the
-     * engine's cache floor or its growth still to come coming out below */
+     * vkt_host_room's arithmetic); without one, what is available less 4 GiB, the state the
+     * engine allocates once it serves (ram_later) and its cache growth still to come coming
+     * out below */
     double want = T.c.ram_planned
         ? (double)vkt_host_room(avail, T.c.ram_budget, T.c.ram_spare, 1, 0)
-        : (double)avail - 4.0 * GiB;
+        : (double)avail - 4.0 * GiB - (double)T.c.ram_later;
     if (g && *g) {   /* the operator's explicit size: it wins over the plan, never over the RAM there is */
         double gb = atof(g) * GiB;
         if (gb <= 0) {
@@ -2636,14 +2637,39 @@ static void host_init(long long all) {
         if (gb < 0) gb = 0;
         want = gb;
     }
+    /* The driver's heap for the system RAM the device reads (coli_vk_tier_host_heap_room) is
+     * not all the RAM: about half of it on Windows, three quarters with NVIDIA's on Linux.
+     * Past its room the pool's blocks are refused, and the experts planned there were in
+     * neither the pool nor the engine's cache, which had given them up (ram_given): they came
+     * from disk. #2314: Kimi K3 and GLM-5.3 on 256 GB under Windows held 170 and 147 GB
+     * against 214 and 223, read 1.5 to 3 times as much and decoded at 0.3 and 0.4 tok/s
+     * against 0.4 and 0.6. The pool takes at most the heap's room less 2 GiB (the uploads'
+     * staging lives there too); the RAM it does not take (cut) stays the engine's cache's. */
+    size_t heap = coli_vk_tier_host_heap_room();
+    double cut = 0;
+    char hh[32] = "";
+    if (heap && want > (double)heap - 2.0 * GiB) {
+        cut = want - ((double)heap - 2.0 * GiB);
+        want -= cut;
+        human((double)heap, hh, sizeof hh);
+    }
+    /* what it leaves for the state the engine allocates once it serves (ram_later) */
+    char hl[96] = "";
+    if (T.c.ram_later && !(g && *g)) {
+        char x[32];
+        snprintf(hl, sizeof hl, "; %s of RAM left for the KV and state the engine allocates later",
+                 human((double)T.c.ram_later, x, sizeof x));
+    }
     size_t blk = coli_vk_block_bytes((size_t)256 << 20);
     if (blk < T.exp_bytes) return;
     if (want < (double)T.exp_bytes) {   /* no room for one expert: say so, unless the operator sized it */
         if (!(g && *g)) {
-            if (T.c.ram_planned)
+            if (hh[0]) fprintf(stderr, VKT_TAG " tier %s: host pool off: the driver leaves %s of system RAM for the device\n", T.engine, hh);
+            else if (T.c.ram_planned)
                 fprintf(stderr, "[VK] tier %s: host pool off: the RAM plan leaves %s beside the expert cache (budget %s; "
                                 "COLI_VK_TIER_HOST_GB overrides, COLI_VK_TIER_HOST=0 silences)\n",
                         T.engine, human(want, hs, sizeof hs), human((double)T.c.ram_budget, hb, sizeof hb));
+            else if (hl[0]) fprintf(stderr, VKT_TAG " tier %s: host pool off: no room past the RAM it leaves (%s)\n", T.engine, hl + 2);
             else
                 fprintf(stderr, "[VK] tier %s: host pool off: MemAvailable less the engine's cache growth and 4 GiB leaves %s "
                                 "(COLI_VK_TIER_HOST_GB sets it)\n", T.engine, human(want, hs, sizeof hs));
@@ -2666,7 +2692,10 @@ static void host_init(long long all) {
      * them keeps ram_reserve, and the pool takes what is left. */
     size_t given = 0;
     if (fit < left && !(g && *g) && !T.c.ram_planned) {
-        want -= T.c.ram_given ? (double)T.c.ram_floor : (double)T.c.ram_reserve;
+        /* the caches' least out of the RAM's share (want + cut): what the heap cut off is RAM
+         * beside the pool already */
+        double least = T.c.ram_given ? (double)T.c.ram_floor : (double)T.c.ram_reserve;
+        want -= least > cut ? least - cut : 0;
         if (want < (double)T.exp_bytes) return;
         full = (size_t)want / blk; rest = (size_t)want - full * blk;
         fit = (long long)full * (long long)(blk / T.exp_bytes) + (long long)(rest / T.exp_bytes);
@@ -2683,27 +2712,29 @@ static void host_init(long long all) {
     T.dmax[2] = (int)fit; T.max_resident += (int)fit; T.h_budget = lim;
     T.promote_rate = rate > 0 && (T.full || T.dmax[2] > 0) ? rate : 0;   /* a partial pool: COLI_VK_TIER_PROMOTE turns it on */
     if (given) T.c.ram_given(T.c.ram_ctx, lim);
-    char hl[32];
+    char hm[32];
     if (T.full) {
         fprintf(stderr, VKT_TAG " tier %s: host pool on, %lld experts in %s of system RAM the device reads over PCIe (every expert "
                         "of the model: the %lld its memory leaves and a copy of its own, from which the routed ones move up, up "
-                        "to %d a forward; COLI_VK_TIER_PROMOTE sets it, COLI_VK_TIER_HOST=0 off)\n",
-                T.engine, held, human((double)lim, hl, sizeof hl), left, T.promote_rate);
+                        "to %d a forward; COLI_VK_TIER_PROMOTE sets it, COLI_VK_TIER_HOST=0 off%s)\n",
+                T.engine, held, human((double)lim, hm, sizeof hm), left, T.promote_rate, hl);
         if (T.c.ram_planned)   /* the plan bounded the room this pool was sized from */
             fprintf(stderr, VKT_TAG " tier %s: the RAM plan leaves %s of the %s budget\n",
                     T.engine, human((double)T.c.ram_spare, hs, sizeof hs), human((double)T.c.ram_budget, hb, sizeof hb));
     } else if (T.c.ram_planned)
         fprintf(stderr, VKT_TAG " tier %s: host pool on, %d experts in %s of system RAM the device reads over PCIe "
                         "(the RAM plan leaves %s of the %s budget; %lld the devices leave%s; "
-                        "COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB overrides%s)\n",
-                T.engine, T.dmax[2], human((double)lim, hl, sizeof hl), human((double)T.c.ram_spare, hs, sizeof hs),
+                        "COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB overrides%s%s%s)\n",
+                T.engine, T.dmax[2], human((double)lim, hm, sizeof hm), human((double)T.c.ram_spare, hs, sizeof hs),
                 human((double)T.c.ram_budget, hb, sizeof hb), left, fit < left ? ", not all of them" : "",
-                T.promote_rate ? "; the routed ones move up from it, up to so many a forward (COLI_VK_TIER_PROMOTE)" : "");
+                T.promote_rate ? "; the routed ones move up from it, up to so many a forward (COLI_VK_TIER_PROMOTE)" : "",
+                hh[0] ? "; the driver's heap for it leaves " : "", hh);
     else
         fprintf(stderr, VKT_TAG " tier %s: host pool on, %d experts in %s of system RAM the device reads over PCIe "
-                        "(the %lld its memory leaves%s; COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB sets it%s)\n",
-                T.engine, T.dmax[2], human((double)lim, hl, sizeof hl), left, fit < left ? ", not all of them" : "",
-                T.promote_rate ? "; the routed ones move up from it, up to so many a forward (COLI_VK_TIER_PROMOTE)" : "");
+                        "(the %lld its memory leaves%s%s%s%s%s; COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB sets it)\n",
+                T.engine, T.dmax[2], human((double)lim, hm, sizeof hm), left, fit < left ? ", not all of them" : "",
+                T.promote_rate ? "; the routed ones move up from it, up to so many a forward (COLI_VK_TIER_PROMOTE)" : "",
+                hh[0] ? "; the driver's heap for it leaves " : "", hh, hl);
 }
 
 int vkt_host_pool_on(void) { return T.on && T.dmax[2] > 0; }
@@ -2770,7 +2801,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (cap && *cap) want = atof(cap) * GiB;
     else if (T.uma) {
         double avail = (double)mem_available();
-        double ram_room = avail > 0 ? avail - (double)T.c.ram_reserve - (double)T.c.dense_bytes - 2.0 * GiB : room;
+        double ram_room = avail > 0 ? avail - (double)T.c.ram_reserve - (double)T.c.dense_bytes - (double)T.c.ram_later - 2.0 * GiB : room;
         want = ram_room / 4;
     } else want = room;
     if (want > room) want = room;
