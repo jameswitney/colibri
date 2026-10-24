@@ -5,6 +5,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Notes
+
+- The parity wave's first kernel slice (PW-C1, "move the LM head matmul to the
+  device") closed **premise-falsified, no code change**: the head matmul already
+  runs on the Vulkan device at the standing config — the prompt tail and every
+  decode token, through the per-matrix hook landed in `9f4eb917` (2026-10-02) —
+  in the fork's own placement (GPU bf16 matvec + score readback + host argmax,
+  identical tie-break). The audits' "port keeps the head (and the router matvec)
+  on the host" read the DHO host-RAM-copy placement line and the chain header's
+  in-frame-ownership comments as compute placement. The measured 72.9–88.1
+  ms/tok DPROF/CLI head term is the per-op wall of the device call (submit,
+  fence wait over queued chain/tier work, the 1.06 GB bf16 GEMV, readback), not
+  host compute; the pre-registered −60…−70 ms/tok does not exist as a placement
+  win. Evidence and the audit-series corrections: `docs/research/AF-pw-c1-head-2026-10-25.md`
+  (gdb call census at tiny, exact GPU-matmul count decompositions at two chunkings,
+  the 1010.0 MiB + 86.0 MiB close-line arithmetic).
+
 ### Added
 
 - `COLI_VK_CHAIN_ORDER=layer` (DeepSeek V4's chain) + `COLI_VK_DMOE=all` (the dmoe arm's
