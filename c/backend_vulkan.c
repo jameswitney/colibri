@@ -836,12 +836,15 @@ static int rowwords(int fmt, int I) {
     return (int)((cpu_row_bytes(fmt, I) + 3) / 4);           // padded to uint32 (24|4: exact)
 }
 /* Scale floats per tensor: per-row formats carry O, int3-g64 carries O*ceil(I/64)
- * (one f32 per 64-input group). upload_tensor and tensor_free must agree on this. */
+ * (one f32 per 64-input group). upload_tensor and tensor_free must agree on this.
+ * fmt 15 (MXFP4 with packed ue8m0 scale bytes, 4 to a word: the pool's unit) counts the
+ * WORDS its O*ceil(I/gs) bytes take, so every *sizeof(float) below is its byte size. */
 static size_t scale_floats(int fmt, int I, int O, int gs) {
     if (fmt == 10 || fmt == 11 || fmt == 14 || bd_fmt(fmt)) return 1;    // unused by the shader; bound anyway
     if (fmt == 5) return (size_t)O * (((size_t)I + 63) / 64);
     if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13)
         return (size_t)O * (((size_t)I + gs - 1) / gs);   // per-group [O,ng]
+    if (fmt == 15) return ((size_t)O * (((size_t)I + gs - 1) / gs) + 3) / 4;
     return (size_t)O;
 }
 
@@ -2140,7 +2143,7 @@ static ColiVkTensor *tensor_alloc_pad(VkWPool *P, int fmt, int I, int O, int gs,
     ColiVkTensor *t = calloc(1, sizeof(*t));
     if (!t) return NULL;
     t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I);
-    t->gs = (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) ? gs : 0;
+    t->gs = (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 || fmt == 15) ? gs : 0;
     t->dev = P->dev; t->pool = P;
     t->wbytes = (size_t)t->rowWords * 4 * (size_t)O;
     size_t sbytes = scale_floats(fmt, I, O, gs) * sizeof(float);
@@ -2178,7 +2181,7 @@ static ColiVkTensor *tensor_alloc(VkWPool *P, int fmt, int I, int O, int gs, voi
 }
 static int fmt_uploadable(int fmt, int gs) {
     return fmt == 1 || fmt == 2 || fmt == 5 || fmt == 10 || fmt == 11 || fmt == 14 || bd_fmt(fmt) ||   /* fmt=4/7: word-aligned groups only */
-           ((fmt == 4 || fmt == 7) && gs >= 8 && gs % 8 == 0) ||
+           ((fmt == 4 || fmt == 7 || fmt == 15) && gs >= 8 && gs % 8 == 0) ||
            ((fmt == 12 || fmt == 13) && gs >= 4 && gs % 4 == 0);           /* fp8 / int8: 4 per word */
 }
 
@@ -2197,6 +2200,9 @@ static void tensor_release(ColiVkTensor *t);
 static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weights, const float *scales,
                               int fmt, int I, int O, int gs) {
     if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
+    /* fmt 15 (MXFP4 with packed ue8m0 scales) is the tier's form: its scales are bytes,
+     * uploaded by vk_tier.c's convert from the engine's ue8m0 store, not floats */
+    if (fmt == 15) return 0;
     if (!fmt_uploadable(fmt, gs)) return 0;
     if (pool_staged(P)) {   /* staged: the rows and the scales through the uploader */
         ColiVkTensor *t = tensor_alloc(P, fmt, I, O, gs, NULL, NULL);
@@ -2503,7 +2509,7 @@ static void vk_prof_paths(void) {
 static int coop_fmt(const ColiVkTensor *t) {
     int gs = t->fmt == 5 ? 64 : t->gs;
     return !t->wide && (t->fmt == 1 || t->fmt == 2 ||
-           ((t->fmt == 4 || t->fmt == 5 || t->fmt == 7 || t->fmt == 12) && gs % G.coop_t[0].bk == 0));
+           ((t->fmt == 4 || t->fmt == 5 || t->fmt == 7 || t->fmt == 12 || t->fmt == 15) && gs % G.coop_t[0].bk == 0));
 }
 /* Its x upload: the rows, then their powers of two rs[s] = 2^(15-e) with
  * max|x[s,:]| < 2^e, so a scaled row stays under 2^15 (fp16 max 65504) and its hi/lo
@@ -4302,10 +4308,10 @@ typedef struct XbCtx {
     unsigned long long grp_batches, gv_batches;
     /* chain_moe_gv.comp, the dense chain's decode experts, for the experts of a batch below
      * gemm_rows rows the grouped routes leave (xb_cgv_init, xb_cgv_record): a pipeline per
-     * format (1, 2, 4, 7) and pass (0 gate and up, 1 down), made on first use; per batch
+     * format (1, 2, 4, 7, 15) and pass (0 gate and up, 1 down), made on first use; per batch
      * that can be in flight a set, its rows' table indices and its experts' entries */
     VkShaderModule sh_cgv; VkDescriptorSetLayout dsl_cgv; VkPipelineLayout pl_cgv; VkDescriptorPool cgv_pool;
-    VkDescriptorSet cgv_set[3]; VkPipeline p_cgv[4][2]; int cgv_n[4][2];   /* the row width each was made for */
+    VkDescriptorSet cgv_set[3]; VkPipeline p_cgv[5][2]; int cgv_n[5][2];   /* the row width each was made for */
     XbBuf cgv_ids[3], cgv_tab[3];
     int cgv;
     unsigned long long cgv_batches;
@@ -4521,7 +4527,7 @@ static void xb_coop_init(XbCtx *X) {
 static int xb_coop_slot(XbCtx *X, const ColiVkTensor *t, int rows, int gemm) {
     int k = t->fmt == 1 || t->fmt == 2 || t->fmt == 4 || t->fmt == 5 ? 0 : coop_slot(rows);
     if (!X->coop_rows || rows < X->coop_rows || !X->p_coop[k] || !coop_fmt(t)) return -1;
-    if (t->fmt == 7 || t->fmt == 12) {
+    if (t->fmt == 7 || t->fmt == 12 || t->fmt == 15) {
         int cbn = G.coop_t[k].bn, fbn = X->gemm_t[gemm].bn;
         if ((rows + cbn - 1) / cbn * cbn > (rows + fbn - 1) / fbn * fbn) return -1;
     }
@@ -4793,7 +4799,7 @@ static VkPipeline xb_grp_mx_pipe(XbCtx *X, int v) {
  * a GEMV of 8 outputs a workgroup each. COLI_VK_XB_GEMV=0 keeps those. */
 static void xb_barrier(VkCommandBuffer c);
 struct PCCGV { int mode, S, K, D, I, act; float limit, a, b; int t_off, x_off, x_row, i_off, i_row, lpr, tiles, y_off, y_row; };
-static int cgv_fi(int fmt) { return fmt == 1 ? 1 : fmt == 2 ? 2 : fmt == 4 ? 3 : fmt == 7 ? 4 : 0; }
+static int cgv_fi(int fmt) { return fmt == 1 ? 1 : fmt == 2 ? 2 : fmt == 4 ? 3 : fmt == 7 ? 4 : fmt == 15 ? 5 : 0; }
 static void xb_cgv_init(XbCtx *X) {
     const char *e = getenv("COLI_VK_XB_GEMV");
     if (X->d || !G.has_bda || (e && *e == '0')) return;
@@ -4840,7 +4846,7 @@ static int xb_cgv_takes(XbCtx *X, const ColiVkExpert *e, int rows, int v4) {
     const ColiVkTensor *t[3] = {e->g, e->u, e->d};
     for (int k = 0; k < 3; k++) {
         int f = t[k]->fmt;
-        if (!cgv_fi(f) || t[k]->rowWords % 4 || (f == 4 && (t[k]->gs < 8 || t[k]->gs % 8)) || (f == 7 && t[k]->gs % 32)) return 0;
+        if (!cgv_fi(f) || t[k]->rowWords % 4 || (f == 4 && (t[k]->gs < 8 || t[k]->gs % 8)) || ((f == 7 || f == 15) && t[k]->gs % 32)) return 0;
     }
     if (e->u->fmt != e->g->fmt || e->u->gs != e->g->gs || e->u->rowWords != e->g->rowWords) return 0;
     uint32_t ent[COLI_VK_XB_ENTRY];
@@ -5287,17 +5293,20 @@ static int xb_grp_ok(const XbCtx *X, ColiVkExpert *const *ex, const int *rows, i
         }
         if (ok && xb_grp_bd_pipe((XbCtx *)X, 1, tg - 100) && xb_grp_bd_pipe((XbCtx *)X, 0, td - 100)) return 3;
     }
-    /* mode 4: the tier's native MXFP4 experts (fmt 7), one layer's types, a big step
-     * (total >= grp_rows): the GEMV (mode 2) keeps the small ones below the threshold,
-     * the per-expert ops had these. One group a 32-input half: gs % 32 == 0. */
+    /* mode 4: the tier's native MXFP4 experts (fmt 7, its packed-scales twin 15), one
+     * layer's types, a big step (total >= grp_rows): the GEMV (mode 2) keeps the small
+     * ones below the threshold, the per-expert ops had these. One group a 32-input half:
+     * gs % 32 == 0; the whole batch one format (the shader reads its scales by the
+     * expert table's fmt entry). */
     if (X->grp_mx && total >= X->grp_rows && X->act == COLI_VK_ACT_SWIGLU && dr % X->align == 0 && ir % X->align == 0 &&
-        D % 64 == 0 && I % 64 == 0 && count > 0 && ex[0]->g->fmt == 7 && ex[0]->d->fmt == 7 &&
+        D % 64 == 0 && I % 64 == 0 && count > 0 &&
+        (ex[0]->g->fmt == 7 || ex[0]->g->fmt == 15) && ex[0]->d->fmt == ex[0]->g->fmt &&
         ex[0]->g->gs >= 32 && ex[0]->g->gs % 32 == 0 && ex[0]->d->gs >= 32 && ex[0]->d->gs % 32 == 0) {
         int ok = 1;
         for (int c = 0; c < count && ok; c++) {
             const ColiVkTensor *t[3] = {ex[c]->g, ex[c]->u, ex[c]->d};
             for (int k = 0; k < 3; k++)
-                ok = ok && !t[k]->dev && t[k]->pool && t[k]->fmt == 7 && t[k]->rowWords % 4 == 0 &&
+                ok = ok && !t[k]->dev && t[k]->pool && t[k]->fmt == ex[0]->g->fmt && t[k]->rowWords % 4 == 0 &&
                      t[k]->gs == (k < 2 ? ex[0]->g->gs : ex[0]->d->gs);
         }
         if (ok && xb_grp_mx_pipe((XbCtx *)X, 1) && xb_grp_mx_pipe((XbCtx *)X, 0)) return 4;
@@ -5312,9 +5321,9 @@ static int xb_grp_ok(const XbCtx *X, ColiVkExpert *const *ex, const int *rows, i
     for (int c = 0; c < count; c++) {
         const ColiVkTensor *t[3] = {ex[c]->g, ex[c]->u, ex[c]->d};
         for (int k = 0; k < 3; k++) {
-            int f = t[k]->fmt;   /* MXFP4 (7) in the GEMV only */
-            if (t[k]->dev || !t[k]->pool || !(f == 1 || f == 2 || f == 4 || (f == 7 && mode == 2)) || t[k]->rowWords % 4 ||
-                ((f == 4 || f == 7) && (t[k]->gs < 8 || t[k]->gs % (mode == 2 ? 32 : 8)))) return 0;
+            int f = t[k]->fmt;   /* MXFP4 (7, and 15 packed) in the GEMV only */
+            if (t[k]->dev || !t[k]->pool || !(f == 1 || f == 2 || f == 4 || ((f == 7 || f == 15) && mode == 2)) || t[k]->rowWords % 4 ||
+                ((f == 4 || f == 7 || f == 15) && (t[k]->gs < 8 || t[k]->gs % (mode == 2 ? 32 : 8)))) return 0;
         }
         if (ex[c]->u->fmt != ex[c]->g->fmt || ex[c]->u->gs != ex[c]->g->gs) return 0;
     }
@@ -5997,7 +6006,7 @@ static void xb_shutdown(XbCtx *X) {
         if (X->p_gv[v]) vkDestroyPipeline(X->dev, X->p_gv[v], NULL);
         if (X->sh_gv[v]) vkDestroyShaderModule(X->dev, X->sh_gv[v], NULL);
     }
-    for (int f = 0; f < 4; f++) for (int v = 0; v < 2; v++) if (X->p_cgv[f][v]) vkDestroyPipeline(X->dev, X->p_cgv[f][v], NULL);
+    for (int f = 0; f < 5; f++) for (int v = 0; v < 2; v++) if (X->p_cgv[f][v]) vkDestroyPipeline(X->dev, X->p_cgv[f][v], NULL);
     for (int k = 0; k < X->cbd_np; k++) if (X->cbd_p[k].p) vkDestroyPipeline(X->dev, X->cbd_p[k].p, NULL);
     if (X->sh_cbd) vkDestroyShaderModule(X->dev, X->sh_cbd, NULL);
     if (X->pl_cbd) vkDestroyPipelineLayout(X->dev, X->pl_cbd, NULL);
@@ -6068,7 +6077,7 @@ int coli_vk_tier_tensor_dev(int dev, ColiVkTensor **t, int fmt, int I, int O, in
     return coli_vk_tier_tensor_pad(dev, t, fmt, I, O, gs, 0, 0, rows, stride, scales);
 }
 size_t coli_vk_tensor_alloc_bytes(int fmt, int I, int O, int gs, size_t *scale_bytes) {
-    if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) { if (gs < 1) return 0; } else gs = 0;
+    if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 || fmt == 15) { if (gs < 1) return 0; } else gs = 0;
     if (scale_bytes) *scale_bytes = scale_floats(fmt, I, O, gs) * sizeof(float);
     return (size_t)rowwords(fmt, I) * 4 * (size_t)O;
 }
@@ -6239,7 +6248,7 @@ int coli_vk_tensor_refill(ColiVkTensor *t, uint8_t **rows, size_t *stride, float
 int coli_vk_tensor_refill_as(ColiVkTensor *t, int fmt, int I, int O, int gs,
                              uint8_t **rows, size_t *stride, float **scales) {
     if (!G.ready || !t || t->pool != &g_tpool) return 0;
-    if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) { if (gs < 1) return 0; } else gs = 0;
+    if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 || fmt == 15) { if (gs < 1) return 0; } else gs = 0;
     if (t->fmt != fmt || t->I != I || t->O != O || t->gs != gs) {
         if (!fmt_uploadable(fmt, gs) || bd_fmt(fmt) != bd_fmt(t->fmt)) return 0;   /* its sets name the table or its scales */
         size_t wb = (size_t)rowwords(fmt, I) * 4 * (size_t)O, sb = scale_floats(fmt, I, O, gs) * sizeof(float);
@@ -6275,7 +6284,7 @@ int coli_vk_set_vq2_books(const int8_t *a, const int8_t *b) {
     return built && !same ? -1 : 0;
 }
 size_t coli_vk_tensor_payload(int fmt, int I, int O, int gs) {
-    if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) { if (gs < 1) return 0; } else gs = 0;
+    if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 || fmt == 15) { if (gs < 1) return 0; } else gs = 0;
     return (size_t)rowwords(fmt, I) * 4 * (size_t)O + scale_floats(fmt, I, O, gs) * sizeof(float);
 }
 size_t coli_vk_buffer_alignment(void) { return G.buf_align ? G.buf_align : 256; }
@@ -6553,10 +6562,11 @@ static size_t ref_rowbytes(int fmt, int I) {
     return fmt == 1 || fmt == 12 || fmt == 13 ? (size_t)I : fmt == 5 ? (size_t)((I + 63) / 64) * 24
          : fmt == 10 ? (size_t)I * 4 : fmt == 11 || fmt == 14 ? (size_t)I * 2 : (size_t)(I + 1) / 2;
 }
-static size_t ref_scales(int fmt, int I, int O) {   // scale COUNT (per-group for fmt 4/5)
+static size_t ref_scales(int fmt, int I, int O) {   // scale COUNT (per-group for fmt 4/5; fmt 15: ue8m0 BYTES)
     if (fmt == 10 || fmt == 11 || fmt == 14) return 1;
     if (fmt == 5) return (size_t)O * (size_t)((I + 63) / 64);
     if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) return (size_t)O * (size_t)((I + g_ref_gs - 1) / g_ref_gs);
+    if (fmt == 15) return (size_t)O * (size_t)((I + g_ref_gs - 1) / g_ref_gs);
     return (size_t)O;
 }
 static float deq(const uint8_t *row, int fmt, int i) {
@@ -6577,22 +6587,26 @@ static float deq(const uint8_t *row, int fmt, int i) {
         unsigned u = ((lo[j >> 2] >> ((j & 3) * 2)) & 3u) | (((hi[j >> 3] >> (j & 7)) & 1u) << 2);
         return (float)((int)u - 4); }
     uint8_t v = row[i >> 1]; int nib = (i & 1) ? (v >> 4) : (v & 15);
-    if (fmt == 7) { static const float e2m1[8] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};   /* MXFP4 */
+    if (fmt == 7 || fmt == 15) { static const float e2m1[8] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};   /* MXFP4 */
                     return (nib & 8) ? -e2m1[nib & 7] : e2m1[nib & 7]; }
     return (float)(nib - 8);
 }
 
+static float ref_scale(const float *sc, size_t at, int fmt) {   /* fmt 15: a ue8m0 byte, its float the exponent */
+    if (fmt == 15) { uint32_t u = (uint32_t)((const uint8_t *)sc)[at] << 23; float f; memcpy(&f, &u, 4); return f; }
+    return sc[at];
+}
 static void cpu_ref(float *y, const float *x, const uint8_t *w, const float *sc,
                     int fmt, int S, int I, int O) {
     size_t rb = ref_rowbytes(fmt, I);
-    int gw2 = (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) ? g_ref_gs : 64, ng = (I + gw2 - 1) / gw2;
+    int gw2 = (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 || fmt == 15) ? g_ref_gs : 64, ng = (I + gw2 - 1) / gw2;
     for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
         double sum = 0; const uint8_t *row = w + (size_t)o * rb;
-        if (fmt == 5 || fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) {   // per-group scales fold inside the sum
+        if (fmt == 5 || fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 || fmt == 15) {   // per-group scales fold inside the sum
             for (int g = 0; g < ng; g++) {
                 double a = 0; int end = (g + 1) * gw2 < I ? (g + 1) * gw2 : I;
                 for (int i = g * gw2; i < end; i++) a += x[s * I + i] * deq(row, fmt, i);
-                sum += a * sc[(size_t)o * ng + g];
+                sum += a * ref_scale(sc, (size_t)o * ng + g, fmt);
             }
             y[s * O + o] = (float)sum;
         } else {
@@ -6651,6 +6665,8 @@ static void case_fill(int fmt, int S, int I, int O, float **x, uint8_t **w, floa
             memcpy(*w + i * 2, &h, 2);
         }
     for (size_t o = 0; o < nsc; o++) (*sc)[o] = 0.01f + (rand() % 100) / 10000.0f;
+    if (fmt == 15)      /* ue8m0 exponents, the band real MXFP4 data quantises to */
+        for (size_t o = 0; o < nsc; o++) ((uint8_t *)*sc)[o] = (uint8_t)(118 + rand() % 4);
 }
 
 static int run_case(int fmt, int S, int I, int O, int iters) {
@@ -7273,7 +7289,7 @@ static double xref_dot(const float *x, const uint8_t *row, const float *sc, int 
     for (int k = 0; k < ng; k++) {
         double a = 0; int end = (k + 1) * g < I ? (k + 1) * g : I;
         for (int i = k * g; i < end; i++) a += x[i] * deq(row, fmt, i);
-        sum += a * sc[(size_t)o * ng + k];
+        sum += a * ref_scale(sc, (size_t)o * ng + k, fmt);
     }
     return sum;
 }
@@ -7296,7 +7312,12 @@ static int xmat_make(XMat *m, int fmt, int I, int O, int gs) {
     if (!coli_vk_tier_tensor(&m->t, fmt, I, O, gs, &rows, &stride, &scales)) return 0;
     size_t rb = coli_vk_tensor_row_bytes(fmt, I), ns = coli_vk_tensor_scale_count(fmt, I, O, gs);
     for (int o = 0; o < O; o++) memcpy(rows + (size_t)o * stride, m->w + (size_t)o * rb, rb);
-    if (fmt == 10 || fmt == 11) scales[0] = 1.0f; else memcpy(scales, m->s, ns * sizeof(float));
+    if (fmt == 10 || fmt == 11) scales[0] = 1.0f;
+    else if (fmt == 15) {   /* ue8m0 bytes, padded to the words the pool counts */
+        size_t nb = (size_t)O * (((size_t)I + gs - 1) / gs);
+        memcpy(scales, m->s, nb);
+        memset((uint8_t *)scales + nb, 0, ns * 4 - nb);
+    } else memcpy(scales, m->s, ns * sizeof(float));
     return coli_vk_tensor_commit(&m->t, 1);
 }
 static void xmat_drop(XMat *m) { free(m->w); free(m->s); m->w = NULL; m->s = NULL; }
@@ -7386,8 +7407,8 @@ static int run_xbatch(int fmt, int dfmt, int gs, int D, int I, int act, float li
     /* the small experts on the chain's decode kernel (xb_cgv_record) where no grouped route
      * takes the batches: the first one's beside the GEMMs, the two after it whole */
     unsigned long long cgv = g_xb[0].cgv_batches - cgv_before;
-    int cf = (fmt == 1 || fmt == 2 || (fmt == 4 && gs % 8 == 0) || (fmt == 7 && gs % 32 == 0)) &&
-             (dfmt == 1 || dfmt == 2 || (dfmt == 4 && gs % 8 == 0) || (dfmt == 7 && gs % 32 == 0)) && D % 32 == 0 && I % 32 == 0;
+    int cf = (fmt == 1 || fmt == 2 || (fmt == 4 && gs % 8 == 0) || ((fmt == 7 || fmt == 15) && gs % 32 == 0)) &&
+             (dfmt == 1 || dfmt == 2 || (dfmt == 4 && gs % 8 == 0) || ((dfmt == 7 || dfmt == 15) && gs % 32 == 0)) && D % 32 == 0 && I % 32 == 0;
     int cgv_want = g_xb[0].cgv && !g_xb[0].grp_rows && cf && (act == COLI_VK_ACT_SWIGLU || act == COLI_VK_ACT_SITU);
     printf("xbatch fmt=%d/%d gs=%d D=%d I=%d %s, rows %d/%d/%d/%d/%d (GEMM from %d, %llu cooperative matmuls, %llu on chain_moe_gv) | maxrel=%.3g | row bits independent of the batch: %s | device %.3f ms\n",
            fmt, dfmt, gs, D, I, an, rows[0], rows[1], rows[2], rows[3], rows[4], g_xb[0].gemm_rows,
@@ -7396,6 +7417,105 @@ static int run_xbatch(int fmt, int dfmt, int gs, int D, int I, int act, float li
     if (maxrel > 3e-3 || !same) bad = 1;
     for (int c = 0; c < K; c++) { coli_vk_xb_expert_free(ex[c]); xmat_drop(&mg[c]); xmat_drop(&mu[c]); xmat_drop(&md[c]); }
     free(x); free(ref); free(hid); free(xr); free(yr); free(y1);
+    return bad;
+}
+
+/* fmt 15 (MXFP4, packed ue8m0 scale bytes) against fmt 7 (the same codes, the scales
+ * expanded to floats): the tier's packed resident form computes the SAME BITS as the
+ * f32-scale form -- the round trip ue8m0 -> f32 (the byte's exponent into the float's
+ * exponent field) -> the shader's decode is the identity, so every consumer that reads
+ * the packed bytes must land on the floats' values exactly. One set of codes and scale
+ * bytes drives both forms (different data would make any comparison meaningless), the
+ * rows below and above the GEMM threshold, and the double reference checks the values
+ * themselves. */
+static int run_xbatch_mx_pack(void) {
+    enum { K = 4 };
+    const int D = 320, I = 160, gs = 32, rows[K] = {1, 3, 2, 20};
+    if (!coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU, 0.f, 0.f, 0.f)) { printf("mx pack: no batch\n"); return 1; }
+    int total = 0; for (int c = 0; c < K; c++) total += rows[c];
+    float *x = malloc((size_t)total * D * 4);
+    const float **xr = malloc((size_t)total * sizeof(*xr)), **yr = malloc((size_t)total * sizeof(*yr));
+    for (int i = 0; i < total * D; i++) x[i] = (float)((rand() % 200 - 100) / 100.0);
+    for (int j = 0; j < total; j++) xr[j] = x + (size_t)j * D;
+    /* the shared data: codes and ue8m0 bytes per expert, and their float expansion */
+    uint8_t *cw[K][3], *e8[K][3]; float *f32[K][3];
+    int Iin[3] = {D, D, I}, O[3] = {I, I, D};
+    for (int c = 0; c < K; c++)
+        for (int k = 0; k < 3; k++) {
+            float *xs, *e8f; uint8_t *w;
+            int keep = g_ref_gs; g_ref_gs = gs;
+            case_fill(15, 1, Iin[k], O[k], &xs, &w, &e8f);
+            g_ref_gs = keep;
+            free(xs);
+            size_t nb = (size_t)O[k] * (((size_t)Iin[k] + gs - 1) / gs);
+            cw[c][k] = w; e8[c][k] = (uint8_t *)e8f;
+            f32[c][k] = malloc(nb * 4);
+            for (size_t j = 0; j < nb; j++) f32[c][k][j] = ref_scale((const float *)e8[c][k], j, 15);
+        }
+    int bad = 0;
+    float *y0 = malloc((size_t)total * D * 4), *ref = malloc((size_t)total * D * 4), *hid = malloc((size_t)I * 4);
+    size_t grb = (size_t)(D + 1) / 2, drb = (size_t)(I + 1) / 2;
+    for (int j = 0, c = 0, r = 0; j < total; j++, r++) {
+        if (r == rows[c]) { c++; r = 0; }
+        const float *xs = x + (size_t)j * D;
+        for (int o = 0; o < I; o++) {
+            float g = (float)xref_dot(xs, cw[c][0] + (size_t)o * grb, (const float *)e8[c][0], o, 15, D, gs);
+            float u = (float)xref_dot(xs, cw[c][1] + (size_t)o * grb, (const float *)e8[c][1], o, 15, D, gs);
+            hid[o] = xref_act(g, u, COLI_VK_ACT_SWIGLU, 0.f, 4.f, 25.f);
+        }
+        for (int d = 0; d < D; d++) ref[(size_t)j * D + d] = (float)xref_dot(hid, cw[c][2] + (size_t)d * drb, (const float *)e8[c][2], d, 15, I, gs);
+    }
+    for (int form = 0; form < 2 && !bad; form++) {
+        int fmt = form ? 15 : 7;
+        ColiVkExpert *ex[K]; int n = 0;
+        for (int c = 0; c < K; c++) {
+            ColiVkTensor *t[3] = {NULL, NULL, NULL};
+            for (int k = 0; k < 3; k++) {
+                size_t nb = (size_t)O[k] * (((size_t)Iin[k] + gs - 1) / gs);
+                size_t ns = coli_vk_tensor_scale_count(fmt, Iin[k], O[k], gs);
+                uint8_t *rws; size_t stride; float *scl;
+                size_t rb = (size_t)(Iin[k] + 1) / 2;
+                int ok = coli_vk_tier_tensor(&t[k], fmt, Iin[k], O[k], gs, &rws, &stride, &scl) == 1;
+                for (int o = 0; ok && o < O[k]; o++) memcpy(rws + (size_t)o * stride, cw[c][k] + (size_t)o * rb, rb);
+                if (ok) {
+                    if (fmt == 7) { memcpy(scl, f32[c][k], ns * 4); }
+                    else { memcpy(scl, e8[c][k], nb); memset((uint8_t *)scl + nb, 0, ns * 4 - nb); }
+                    ok = coli_vk_tensor_commit(&t[k], 1) == 1;
+                }
+                if (!ok) { printf("mx pack: tensor %d of expert %d failed (fmt %d)\n", k, c, fmt); bad = 1; break; }
+            }
+            if (bad) { for (int j = 0; j < 3; j++) if (t[j]) coli_vk_tensor_free(t[j]); break; }
+            if (!(ex[c] = coli_vk_xb_expert(t[0], t[1], t[2]))) { printf("mx pack: no sets\n"); bad = 1; break; }
+            n = c + 1;
+        }
+        if (!bad && (!coli_vk_xb_issue(ex, rows, n, xr) || !coli_vk_xb_join(yr, NULL))) { printf("mx pack: issue/join failed (fmt %d)\n", fmt); bad = 1; }
+        for (int j = 0; !bad && j < total; j++) digest(yr[j], (size_t)D * 4);
+        if (!bad && form == 0)
+            for (int j = 0; j < total; j++) memcpy(y0 + (size_t)j * D, yr[j], (size_t)D * 4);
+        if (!bad && form == 1)
+            for (int j = 0; j < total; j++)
+                if (memcmp(y0 + (size_t)j * D, yr[j], (size_t)D * 4)) { printf("mx pack: row %d's bits differ between fmt 7 and fmt 15\n", j); bad = 1; break; }
+        for (int c = 0; c < n; c++) coli_vk_xb_expert_free(ex[c]);
+    }
+    /* the reference against the packed form's own rows (yr still holds the last join's) */
+    double maxrel = 0;
+    for (int jj = 0; jj < total; jj++) {
+        double scale = 0;
+        for (int d = 0; d < D; d++) if (fabs(ref[(size_t)jj * D + d]) > scale) scale = fabs(ref[(size_t)jj * D + d]);
+        for (int d = 0; d < D; d++) {
+            double r = ref[(size_t)jj * D + d], e = fabs(yr[jj][d] - r);
+            if (!isfinite(yr[jj][d])) { bad = 1; break; }
+            if (scale == 0) { if (yr[jj][d] != 0) bad = 1; continue; }
+            double rel = e / (fabs(r) > 1e-2 * scale ? fabs(r) : 1e-2 * scale);
+            if (rel > maxrel) maxrel = rel;
+        }
+    }
+    printf("xbatch mx pack: fmt 15's %d rows (routes as fmt 7's) %s fmt 7's bits, worst relative error %.2e against the double reference\n",
+           total, bad ? "DIFFER from" : "identical to", maxrel);
+    if (maxrel > 3e-3) bad = 1;
+    for (int c = 0; c < K; c++) for (int k = 0; k < 3; k++) { free(cw[c][k]); free(e8[c][k]); free(f32[c][k]); }
+    free(x); free(xr); free(yr); free(y0); free(ref); free(hid);
+    xb_shutdown(&g_xb[0]);
     return bad;
 }
 
@@ -7624,6 +7744,9 @@ static int run_xbatch_all(void) {
     bad |= run_xbatch(10, 1, 64, 320, 160, COLI_VK_ACT_SWIGLU, 0.f);     /* fp32 gate/up, cooperative down */
     bad |= run_xbatch(4, 4, 64, 320, 160, COLI_VK_ACT_SWIGLU, 0.7f);     /* the clamped SwiGLU */
     bad |= run_xbatch(7, 7, 32, 320, 160, COLI_VK_ACT_SITU, 0.f);        /* SiTU-GLU on MXFP4 */
+    bad |= run_xbatch(15, 15, 32, 320, 160, COLI_VK_ACT_SWIGLU, 0.f);    /* its packed-scales twin */
+    bad |= run_xbatch(15, 15, 32, 320, 160, COLI_VK_ACT_SITU, 0.f);
+    bad |= run_xbatch_mx_pack();   /* fmt 15's rows bit for bit fmt 7's, the same codes and scales */
     xb_shutdown(&g_xb[0]);
     /* odd widths: D, I not multiples of the groups, offsets past odd row sizes */
     if (!coli_vk_xb_init(200, 72, COLI_VK_ACT_SWIGLU, 0.f, 0.f, 0.f)) return 1;

@@ -2650,7 +2650,7 @@ static VkPipeline mx_pipe(int v) {
     return KC.mx[v];
 }
 static int our_fmt(int f) { return f == 1 || f == 2 || f == 4; }
-static int mx_fmt(int f) { return f == 7; }
+static int mx_fmt(int f) { return f == 7 || f == 15; }   /* MXFP4, f32 scales and its packed ue8m0 twin */
 /* pass v's (1 gate+up, 0 down) pipeline for a matrix of format f: a GGUF's block type, or ours */
 static VkPipeline rows_pipe1(int v, int f, int coop) {
     return mx_fmt(f) ? (coop ? VK_NULL_HANDLE : mx_pipe(v)) :

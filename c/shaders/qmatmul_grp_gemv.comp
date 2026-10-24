@@ -88,6 +88,14 @@ float situ_tanh(float x) { return abs(x) < 0.000244140625 ? x : tanh(x); }   // 
 float group_scale(SRef sc, uint o, uint ng, uint j, uint gs, bool ok, bool pair_scale) {
     return ok ? sc.v[o * ng + (j * 32u) / gs] : 0.0;
 }
+// fmt 15: the scale a ue8m0 byte, 4 to a word; its float is the exponent into the
+// float's exponent field — the same bits the f32-scale form (7) holds expanded
+float group_scale8(SRef sc, uint o, uint ng, uint j, uint gs, bool ok) {
+    if (!ok) return 0.0;
+    uint b = o * ng + (j * 32u) / gs;
+    uint w = floatBitsToUint(sc.v[b >> 2u]);
+    return uintBitsToFloat(uint(bitfieldExtract(w, int((b & 3u) * 8u), 8)) << 23);
+}
 
 // One matrix, one RPS block of output rows. The word-major inner loop shares each
 // input pair across the RPS rows.
@@ -111,6 +119,7 @@ void matrix_block(WRef4 w, SRef sc, int fmt, uint rowWords, uint gs, uint ng,
             bool ok = t * rg < remaining && q < RW && o < uint(p.O);
             s[t] = 1.0;
             if (fmt == 4 || fmt == 7) s[t] = group_scale(sc, o, ng, j, gs, ok, pair_scale);
+            else if (fmt == 15) s[t] = group_scale8(sc, o, ng, j, gs, ok);
         }
         [[unroll]] for (uint k = 0u; k < MAXNR; k++) if (k < nr) {
             float d[RPS];
@@ -124,7 +133,7 @@ void matrix_block(WRef4 w, SRef sc, int fmt, uint rowWords, uint gs, uint ng,
                         d[t] = h == 0u ? z : d[t] + z;
                     }
                 }
-            } else if (fmt == 7) {
+            } else if (fmt == 7 || fmt == 15) {
                 uint x0 = k * I4 + j * 8u;
                 [[unroll]] for (uint h = 0u; h < 4u; h++) {
                     vec4 a = xsh[x0 + h * 2u], b = xsh[x0 + h * 2u + 1u];

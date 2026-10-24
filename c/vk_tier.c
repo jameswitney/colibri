@@ -293,7 +293,11 @@ static size_t src_scale_bytes(VktFmt f, int I, int O) {
     if (f.kind == VKT_SRC_FP8_BLOCK) return (((size_t)O + f.gs - 1) / f.gs) * ng * 4;
     return (size_t)O * ng * 4;
 }
-/* The backend format a source kind lands in; 0 when the combination is not one. */
+/* The backend format a source kind lands in; 0 when the combination is not one.
+ * VKT_SRC_MXFP4_E8M0's scales are ue8m0 bytes already: the Vulkan backend keeps them
+ * packed (fmt 15, 12.75 MiB a DeepSeek V4 expert against fmt 7's 15.0 -- the expansion
+ * to f32 is exact, so the packing changes bytes, never values). The CUDA tier's ops
+ * table (cu_xb.cu) has no fmt 15 yet: it keeps the f32-scale form. */
 static int dev_fmt(VktFmt f, int *fmt, int *gs) {
     int g = f.gs;
     if (f.kind >= VKT_SRC_GGML) { *fmt = 100 + (int)(f.kind - VKT_SRC_GGML); *gs = 0; return coli_vk_block_elems(*fmt) > 0; }
@@ -305,7 +309,14 @@ static int dev_fmt(VktFmt f, int *fmt, int *gs) {
     case VKT_SRC_I8_AS_I4_GS: case VKT_SRC_I4S_PAIRS_GS: case VKT_SRC_I4U_PAIRS_GS: *fmt = 4; *gs = g; return g >= 8 && g % 8 == 0;
     case VKT_SRC_I4U_PLANAR64: *fmt = 4; *gs = 64; return 1;
     case VKT_SRC_I3_G64: *fmt = 5; *gs = 0; return 1;
-    case VKT_SRC_MXFP4_F32: case VKT_SRC_MXFP4_E8M0: *fmt = 7; *gs = g; return g >= 8 && g % 8 == 0;
+    case VKT_SRC_MXFP4_E8M0:
+#ifdef COLI_CUDA
+        *fmt = 7;
+#else
+        *fmt = 15;
+#endif
+        *gs = g; return g >= 8 && g % 8 == 0;
+    case VKT_SRC_MXFP4_F32: *fmt = 7; *gs = g; return g >= 8 && g % 8 == 0;
     case VKT_SRC_FP8_GS: case VKT_SRC_FP8_BLOCK: *fmt = 12; *gs = g; return g >= 4 && g % 4 == 0;
     case VKT_SRC_BF16: *fmt = 11; *gs = 0; return 1;
     case VKT_SRC_F32: *fmt = 10; *gs = 0; return 1;
@@ -383,11 +394,20 @@ static void convert_par(VktFmt f, int I, int O, const uint8_t *codes, const void
         break;
     }
     if (f.kind == VKT_SRC_BF16 || f.kind == VKT_SRC_F32 || f.kind >= VKT_SRC_GGML) { sc[0] = 1.0f; return; }
-    if (f.kind == VKT_SRC_MXFP4_E8M0) {        /* ue8m0 -> f32 2^(s-127), quant.h's mx4_scale */
+    if (f.kind == VKT_SRC_MXFP4_E8M0) {
         size_t n = (size_t)O * (((size_t)I + f.gs - 1) / f.gs);
         const uint8_t *e = scales;
+#ifdef COLI_CUDA
+        /* the CUDA tier keeps fmt 7: ue8m0 -> f32 2^(s-127), quant.h's mx4_scale */
         for (size_t i = 0; i < n; i++) { uint32_t u = (uint32_t)e[i] << 23; memcpy(&sc[i], &u, 4); }
         return;
+#else
+        /* fmt 15: the bytes as they are, the word pad zeroed (never read, copied whole) */
+        size_t words = ((n + 3) / 4) * 4;
+        memcpy(sc, e, n);
+        memset((uint8_t *)sc + n, 0, words - n);
+        return;
+#endif
     }
     if (f.kind == VKT_SRC_FP8_BLOCK) {         /* [O/bs][I/bs] blocks -> one row each */
         size_t nb = ((size_t)I + f.gs - 1) / f.gs;
@@ -999,7 +1019,8 @@ int vkt_plan(int *layers, int *eids, int max) {
     /* COLI_VK_TIER_PIN_LAYER (the COLI_VK_DMOE arm's scaffolding): layer n's
      * experts ahead of the history, so the one layer the arm wires is fully resident
      * from the warm start whatever the heat says -- hot_pin has pinned them too, so no
-     * promotion can take them back. Their E experts (256 of 15.0 MiB for DeepSeek V4)
+     * promotion can take them back. Their E experts (256 of 12.75 MiB for DeepSeek V4,
+     * fmt 15's packed scales)
      * need a COLI_VK_TIER_GB the operator raises to hold them. */
     if (T.pin_layer >= 0 && T.pin_layer < L)
         for (int e = 0; e < E && k < max && room_dev(0) >= 0; e++) {
@@ -1962,11 +1983,11 @@ static int host_fmt_ok(const ColiVkTensorInfo *ti) {
     if (ti->I % 32) return 0;
     if (ti->fmt == 1 || ti->fmt == 2) return 1;
     if (ti->fmt == 5) return ti->I % 64 == 0;
-    return (ti->fmt == 4 || ti->fmt == 13 || ti->fmt == 7 || ti->fmt == 12) && ti->gs >= 32 && ti->gs % 32 == 0;
+    return (ti->fmt == 4 || ti->fmt == 13 || ti->fmt == 7 || ti->fmt == 12 || ti->fmt == 15) && ti->gs >= 32 && ti->gs % 32 == 0;
 }
 static int host_type(const ColiVkTensorInfo *ti) { return ti->fmt >= 100 ? ti->fmt - 100 : -ti->fmt; }
 static int host_gs(const ColiVkTensorInfo *ti) {
-    return ti->fmt == 5 ? 64 : ti->fmt == 4 || ti->fmt == 13 || ti->fmt == 7 || ti->fmt == 12 ? ti->gs : 0;
+    return ti->fmt == 5 ? 64 : ti->fmt == 4 || ti->fmt == 13 || ti->fmt == 7 || ti->fmt == 12 || ti->fmt == 15 ? ti->gs : 0;
 }
 /* A resident expert of the host pool the CPU computes in place in a hybrid step: outside the
  * device's share (by a hash of (layer, expert): the same split at every step and every read
@@ -2001,7 +2022,8 @@ static int hy_threads(void) {   /* the CPU's team: COLI_VK_HYBRID_THREADS, else 
     return 1;
 #endif
 }
-/* colibri's int8 (fmt 1, 13), int4 (fmt 2, 4), int3-g64 (fmt 5), MXFP4 (fmt 7) and FP8 (fmt 12)
+/* colibri's int8 (fmt 1, 13), int4 (fmt 2, 4), int3-g64 (fmt 5), MXFP4 (fmt 7, and its
+ * packed-scales twin 15) and FP8 (fmt 12)
  * rows. dev_codes: an int4 row's codes in element order (the pairs' low nibble first), 0..15
  * (the value + 8), into u (I bytes). */
 static void dev_codes(uint8_t *u, const uint8_t *row, int I) {
@@ -2076,8 +2098,12 @@ static float dev_dot(const int8_t *w8, const uint8_t *u4, int zero, const float 
     return gs ? r : r * rs[0];
 }
 /* the float reference: the row dequantized (its codes times their scale) */
+static float dev_ue8m0(uint8_t e) {   /* fmt 15's scale: the exponent into the float's field */
+    uint32_t u = (uint32_t)e << 23; float f; memcpy(&f, &u, 4); return f;
+}
 static void dev_dequant(float *o, const uint8_t *row, int fmt, const float *rs, int gs, int I) {
     static const float e2m1[8] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};
+    const uint8_t *rs8 = (const uint8_t *)rs;   /* fmt 15: its scales are ue8m0 bytes */
     for (int i = 0; i < I; i++) {
         float w;
         if (fmt == 1 || fmt == 13) w = (float)((const int8_t *)row)[i];
@@ -2087,9 +2113,9 @@ static void dev_dequant(float *o, const uint8_t *row, int fmt, const float *rs, 
             w = (float)((int)(((lo[j >> 2] >> ((j & 3) * 2)) & 3u) | (((hi[j >> 3] >> (j & 7)) & 1u) << 2)) - 4);
         } else {
             const int nib = (i & 1) ? row[i >> 1] >> 4 : row[i >> 1] & 15;
-            w = fmt == 7 ? ((nib & 8) ? -e2m1[nib & 7] : e2m1[nib & 7]) : (float)(nib - 8);
+            w = (fmt == 7 || fmt == 15) ? ((nib & 8) ? -e2m1[nib & 7] : e2m1[nib & 7]) : (float)(nib - 8);
         }
-        o[i] = w * (gs ? rs[i / gs] : rs[0]);
+        o[i] = w * (gs ? (fmt == 15 ? dev_ue8m0(rs8[i / gs]) : rs[i / gs]) : rs[0]);
     }
 }
 /* a row of type t (I inputs; rs its scales, gs their group for colibri's formats) against
@@ -2098,7 +2124,7 @@ static void dev_dequant(float *o, const uint8_t *row, int fmt, const float *rs, 
  * bits whatever rows share the call. tmp: I floats, and for an int4 row I bytes after them. */
 static inline void host_rows(float *y, int ys, const gq_act *a, const float *const *xf, const uint8_t *row, int t, int I,
                              float *tmp, const float *rs, int gs) {
-    if (t < 0 && (-t == 12 || (-t == 7 && I / gs > 2048)) && !gq_exact_mode()) {   /* FP8 has no integer form: its floats against x's */
+    if (t < 0 && (-t == 12 || (((-t == 7 || -t == 15)) && I / gs > 2048)) && !gq_exact_mode()) {   /* FP8 has no integer form: its floats against x's */
         dev_dequant(tmp, row, -t, rs, gs, I);
         for (int s = 0; s < a->S; s++) {
             const float *x = xf[s];
@@ -2114,9 +2140,10 @@ static inline void host_rows(float *y, int ys, const gq_act *a, const float *con
         float half[2048], *rsx = (float *)rs;
         if (fmt == 2 || fmt == 4) { u = (uint8_t *)(tmp + I); dev_codes(u, row, I); zero = 8; }
         else if (fmt == 5) { u = (uint8_t *)(tmp + I); dev_codes3(u, row, I); zero = 4; }
-        else if (fmt == 7) {   /* the values doubled: the group's scale halved */
+        else if (fmt == 7 || fmt == 15) {   /* the values doubled: the group's scale halved */
             int8_t *w = (int8_t *)(tmp + I); dev_codes_fp4(w, row, I); w8 = w;
-            for (int g = 0; g < I / gs; g++) half[g] = 0.5f * rs[g];   /* at most 2048: above */
+            if (fmt == 7) for (int g = 0; g < I / gs; g++) half[g] = 0.5f * rs[g];   /* at most 2048: above */
+            else for (int g = 0; g < I / gs; g++) half[g] = 0.5f * dev_ue8m0(((const uint8_t *)rs)[g]);
             rsx = half;
         }
         for (int s = 0; s < a->S; s++)

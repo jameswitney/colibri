@@ -978,6 +978,7 @@ static double stream_step(int layer, int S, const int *idx, const float *w, int 
  * budget too small for the bank each print their one line and leave the plan the
  * history's. */
 static void bank_layer_case(void) {
+    rng = 7;   /* deterministic routing: the refill's expectations count the routed set */
     VktFmt f = {VKT_SRC_I4U_PAIRS_GS, 64};
     model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
     uint32_t hist[L][E], *rows[L];           /* layer 0's first two hot; the bank's layer is 1 */
@@ -1027,6 +1028,7 @@ static void bank_layer_case(void) {
     Books bk = {0, 0}; double worst = 0;
     int idx[8 * K]; float w[8 * K];
     route(4, 0, E, idx, w);
+    idx[0] = E - 3; idx[1] = E - 2; idx[2] = E - 1;   /* the queued trio routed: the refill's expectation */
     int want = 0;
     for (int i = 0; i < 4 * K; i++) {   /* the distinct queued experts the step routes */
         int dup = 0;
@@ -1484,11 +1486,12 @@ static void grouped(void) {
         {{VKT_SRC_I4S_PAIRS_GS, 32}, {VKT_SRC_I4S_PAIRS_GS, 32}, 0, "signed int4 pairs gs32"},
         {{VKT_SRC_I4U_PLANAR64, 64}, {VKT_SRC_I4U_PLANAR64, 64}, 0, "planar int4-g64"},
         {{VKT_SRC_MXFP4_F32, 32}, {VKT_SRC_MXFP4_F32, 32}, 7.0f, "MXFP4 f32 gs32 (the grouped GEMM's, mode 4)"},
+        {{VKT_SRC_MXFP4_E8M0, 32}, {VKT_SRC_MXFP4_E8M0, 32}, 7.0f, "MXFP4 ue8m0 gs32 (mode 4, packed scales)"},
     };
     int h0 = H; H = 256;
     int any_grouped = 0, any_summed = 0, any_gemv = 0;
     for (size_t c = 0; c < sizeof cs / sizeof *cs; c++) {
-        int mx = cs[c].gu.kind == VKT_SRC_MXFP4_F32;   /* its GEMM needs no streaming cases */
+        int mx = cs[c].gu.kind == VKT_SRC_MXFP4_F32 || cs[c].gu.kind == VKT_SRC_MXFP4_E8M0;   /* its GEMM needs no streaming cases */
         for (int mode = 0; mode < (mx ? 1 : 4); mode++) {   /* single, whole, mixed, decode */
             model_make(cs[c].gu, cs[c].dn);
             g_act = VKT_ACT_SWIGLU; g_limit = cs[c].limit;
@@ -2479,6 +2482,45 @@ static void host_plan(void) {
     model_free();
 }
 
+/* fmt 15 (the tier's packed MXFP4: ue8m0 scale bytes) against fmt 7 (f32 scales): the
+ * round trip is the identity -- the byte's exponent lands in the float's exponent field
+ * (vk_tier.c's expansion, the shaders' decode) -- and the packed form holds 3/4 less
+ * scale bytes, the fork's 12.75 MiB expert against the f32 form's 15.0. */
+static void packed_scales(void) {
+    int ident = 1;
+    for (int e = 0; e < 256; e++) {   /* byte -> f32 -> byte, both directions the code takes */
+        uint32_t u = (uint32_t)e << 23; float f; memcpy(&f, &u, 4);
+        uint32_t b; memcpy(&b, &f, 4);
+        if ((b >> 23) != (uint32_t)e) ident = 0;
+        uint32_t w = 0; memcpy(&w, (const uint8_t[4]){(uint8_t)e, 0, 0, 0}, 4);   /* the shader's word read, byte 0 */
+        float s = ldexpf(1.0f, (int)((w & 0xffu)) - 127);
+        if (s != f && (e != 0)) ident = 0;   /* e 0: the expansion is +0.0 (a zero exponent field), ldexp's 2^-127 differs */
+        if (e == 0 && f != 0.0f) ident = 0;
+    }
+    CHECK(ident, "packed scales: the ue8m0 <-> f32 round trip is not the identity");
+    /* the scale words the pool counts: the bytes padded to the pool's 4-byte unit */
+    int hs[2] = {192, 4096}, fs[2] = {128, 2048};   /* the harness's model and DeepSeek V4 */
+    for (int g = 0; g < 2; g++)
+        for (int k = 0; k < 2; k++) {
+            int I = k ? fs[g] : hs[g], O = k ? hs[g] : fs[g];
+            size_t nb = (size_t)O * (((size_t)I + 31) / 32);
+            size_t nw = coli_vk_tensor_scale_count(15, I, O, 32);
+            CHECK(nw * 4 >= nb && nw * 4 - nb < 4, "packed scales: the scale words hold O*ng bytes");
+            CHECK(coli_vk_tensor_scale_count(7, I, O, 32) * 4 == nb * 4,
+                  "packed scales: fmt 7 holds 4x the bytes of the ue8m0 store");
+        }
+    /* DeepSeek V4's geometry: the packed form is the fork's 12.75 MiB expert against 15.0 */
+    VktFmt pk = {VKT_SRC_MXFP4_E8M0, 32}, f32s = {VKT_SRC_MXFP4_F32, 32};
+    size_t bp = vkt_expert_bytes(4096, 2048, pk, pk), bf = vkt_expert_bytes(4096, 2048, f32s, f32s);
+    printf("  expert bytes: ue8m0-packed %.2f MiB, f32 scales %.2f MiB (x %.4f)\n",
+           bp / 1048576.0, bf / 1048576.0, (double)bf / (double)bp);
+    CHECK(bp < bf, "packed scales: the packed form did not shrink the expert");
+    CHECK((double)bf / bp > 1.176 && (double)bf / bp < 1.177, "packed scales: the shrink is not the scales' 4x on 12 of 15 MiB");
+    /* the same budget holds the same GiB in more experts: fit scales with the bytes */
+    double more = (double)bf / bp;
+    CHECK(more * bp >= bf - 4096, "packed scales: the capacity multiplier does not hold the budget");
+}
+
 int main(int argc, char **argv) {
     char buf[1024];
     const char *spv = argc > 1 ? argv[1] : coli_vk_shader_path(buf, sizeof buf);
@@ -2497,6 +2539,7 @@ int main(int argc, char **argv) {
      * reads GQ_EXACT once, so before any case (the integer form: the argument host-pairs) */
     setenv("GQ_EXACT", "1", 1);
     printf("host room:\n"); host_room();   /* pure arithmetic: needs no device */
+    printf("packed scales:\n"); packed_scales();   /* the round trip and the byte arithmetic, before the device's fill */
     printf("profile:\n"); profile();   /* pure env: needs no device, before the device's own fill */
     if (!coli_vk_init(spv)) { printf("FAIL: no Vulkan device (shaders %s)\n", spv); return 1; }
     setenv("COLI_VK_TIER_RESERVE_GB", "0", 1);

@@ -129,7 +129,9 @@
  *   VKT_SRC_I4U_PLANAR64  expert_ffn.h planar blocks of 64, v+8, f32 per 64 -> fmt 4 gs 64
  *   VKT_SRC_I3_G64        int3-g64 planes                        -> fmt 5
  *   VKT_SRC_MXFP4_F32     e2m1 pairs, f32 per gs                 -> fmt 7
- *   VKT_SRC_MXFP4_E8M0    e2m1 pairs, ue8m0 byte per gs          -> fmt 7 (kimi_k3, mimo, deepseek_v41)
+ *   VKT_SRC_MXFP4_E8M0    e2m1 pairs, ue8m0 byte per gs          -> fmt 15, the bytes packed
+ *                         as the store holds them (kimi_k3, mimo, deepseek_v4/_v41; fmt 7
+ *                         on the CUDA tier, whose ops table has no fmt 15 yet)
  *   VKT_SRC_FP8_GS        e4m3, f32 per (row, gs)                -> fmt 12
  *   VKT_SRC_FP8_BLOCK     e4m3, f32 per gs x gs block            -> fmt 12 (qwen38 native)
  *   VKT_SRC_BF16, VKT_SRC_F32                                    -> fmt 11, 10
