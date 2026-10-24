@@ -19128,6 +19128,21 @@ int main(int argc, char **argv) {
                         "block %.1f ms/tok, head %.1f ms/tok, other %.1f ms/tok (wall - block - head)\n",
                 gen_stats.generated_tokens, g_v4_prof_dfwd, wall, block, head, wall - block - head);
     }
+    /* COLI_VK_CHAIN_DPROF (OB0's S0): the prompt window's spans against the timing line's
+     * TTFT wall -- the chunk windows are the chain's share of it, and their split (the
+     * chain's prompt line at close, the tier's prompt dprof) is what every later stage's
+     * bar is expressed against. The primary device's: it owns the prompt. */
+    if (vkc_dprof()) {
+        int was = vkc_device(0);
+        VkcStats pst; vkc_stats(&pst);
+        if (pst.p_fwd)
+            fprintf(stderr, "v4_dprof prompt: %llu chunk windows, %.1f s of the %.1f s to the first token: "
+                            "host-MoE %.1f s, staging-upload %.1f s, dense A1 %.1f s, tail %.1f s\n",
+                    pst.p_fwd, pst.p_wall_ms / 1e3, gen_stats.time_to_first_token_sec,
+                    pst.p_host_ms[VKC_R_MOEH] / 1e3, pst.p_host_ms[VKC_R_STAGE] / 1e3,
+                    pst.p_host_ms[VKC_R_A1] / 1e3, pst.p_host_ms[VKC_R_TAIL] / 1e3);
+        vkc_device(was);
+    }
 #endif
 
     /* Alias session buffers for optional record-oracle path.

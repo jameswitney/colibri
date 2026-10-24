@@ -839,8 +839,11 @@ int vkc_vae(VkcBuf *x, VkcBuf *o, VkcBuf *tab, const VkcVae *p);
 int vkc_vae_ready(void);
 
 /* COLI_VK_CHAIN_DPROF: the role a frame is submitted under (vkc_role), DeepSeek V4's
- * chain's three record sites and the dmoe path's; other engines' frames land in OTHER */
-enum { VKC_R_OTHER = 0, VKC_R_A1, VKC_R_A2, VKC_R_DMOE, VKC_R_TAIL, VKC_R_N };
+ * chain's three record sites and the dmoe path's; other engines' frames land in OTHER.
+ * MOEH and STAGE stamp no frames: the host's routed-expert step of a prompt chunk and
+ * the staging uploads around it -- the prompt window's host timeline charges its wall
+ * to them (p_host_ms), the TTFT decomposition S0 measures */
+enum { VKC_R_OTHER = 0, VKC_R_A1, VKC_R_A2, VKC_R_DMOE, VKC_R_TAIL, VKC_R_MOEH, VKC_R_STAGE, VKC_R_N };
 
 /* counters, for the engines' [VK] lines */
 typedef struct {
@@ -866,6 +869,13 @@ typedef struct {
      * time spent inside vkQueueSubmit. All zero at the default. */
     unsigned long long d_fwd, d_frames, d_wait_n;
     double d_wait_ms[VKC_R_N], d_dev_ms[VKC_R_N], d_submit_ms;
+    /* the same for the prompt window (vkc_dwin(2), one per prompt chunk): p_host_ms is
+     * that window's own instrument -- the host wall charged to the role stamped when it
+     * ran, so the roles sum to p_wall_ms and the prompt's wall splits into dense frames
+     * (A1/A2), the host-MoE step (MOEH), the staging uploads (STAGE) and the tail */
+    unsigned long long p_fwd, p_frames, p_wait_n;
+    double p_wait_ms[VKC_R_N], p_dev_ms[VKC_R_N], p_submit_ms;
+    double p_host_ms[VKC_R_N], p_wall_ms;
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* mm8 (the tiled weight-stationary GEMM for fmt 12): the test/bench hooks over the
@@ -883,11 +893,14 @@ void vkc_mm8_set_splitk(int v);
 int vkc_mm8_splitk_choose(int S, int I, int O);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */
 void vkc_prof_print(void);
-/* COLI_VK_CHAIN_DPROF=1: the decode-window counters above. vkc_dwin(1) opens the window
- * (an engine's forward of one row, a decode step: d_fwd counts each opening), vkc_role
- * names the frame the engine is about to submit -- dense A1/A2, the dmoe path's, the
- * forward's tail -- and frames submitted outside the window count nowhere in them.
- * vkc_dprof: the env's answer, for the engines' own lines. */
+/* COLI_VK_CHAIN_DPROF=1: the window counters above. vkc_dwin(1) opens the decode
+ * window (an engine's forward of one row, a decode step: d_fwd counts each opening),
+ * vkc_dwin(2) opens a prompt window -- one per prompt chunk, closed by vkc_dwin(0) at
+ * the chunk's end -- and vkc_role names the frame the engine is about to submit (dense
+ * A1/A2, the dmoe path's, the forward's tail) or the host span it is about to run
+ * (MOEH, STAGE: the prompt window charges its wall to the stamped role). Frames and
+ * spans outside an open window count nowhere in them. vkc_dprof: the env's answer, for
+ * the engines' own lines. */
 int  vkc_dprof(void);
 int  vkc_dwin(int on);
 void vkc_role(int role);

@@ -1284,8 +1284,8 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
     float *state = *state_ptr, *next = *next_ptr;
     int T0 = ch->Lm - 3, taps = coli_v4_full_dspark_wanted;   /* DSpark's targets: the model's last three layers
                                                                   * (those the chain runs; the CPU taps the rest) */
-    vkc_dwin(n == 1);   /* DPROF: a forward of one row is a decode step -- the window the counters keep */
     for (int c0 = 0; c0 < n; c0 += rows) {
+        vkc_dwin(n == 1 ? 1 : prompt ? 2 : 0);   /* DPROF: a forward of one row opens the decode window; a prompt chunk its own (closed at the chunk's end) */
         int nr = n - c0 < rows ? n - c0 : rows, pb = start + c0, last = c0 + nr == n;
         V4cFwd f = {start, n, pb, nr, 0, nr * rd, LR, 0};
         if (ident) for (int s = 0; s < nr && (pb + s + 1) / 4 <= c->index_topk; s++) f.s_ident = s + 1;
@@ -1403,7 +1403,7 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
             ok = ok && vkc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)nr * D) && vkc_submit(0);    /* A1 */
             /* while it runs, the tier loads the experts this layer will likely stream (a
              * big prompt chunk only) */
-            if (ok) vkt_stream_prefetch(i, nr);
+            if (ok) { vkc_role(VKC_R_STAGE); vkt_stream_prefetch(i, nr); vkc_role(VKC_R_A1); }   /* DPROF: the staging beside A1's wait */
             ok = ok && vkc_finish();
             if (!ok) break;
             if (ch->ks.on && ly->ratio > 0) {               /* this chunk's new compressed rows into the host's */
@@ -1417,6 +1417,7 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
             ok = vkc_begin() && v4c_shared(ch, ly, nr) && vkc_submit(0);
             if (!ok) break;
             double t1 = spec_now();
+            vkc_role(VKC_R_MOEH);   /* DPROF: the host's routed-expert step (ch->host_ms above; the tier's own line splits it) */
             if (pool) coli_v4_expert_store_prefill_pool(experts, i);
             if (coli_v4_moe_routed(ch->host_routed, &engine->dense_resident.layers[i], config, experts,
                                    (const float *)vkc_ptr(ch->h2d), tokens + c0, nr, error, error_size)) {
@@ -1427,6 +1428,7 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
                 free(cs); free(wl); free(cos_); free(sin_);
                 return -1;
             }
+            vkc_role(VKC_R_STAGE);   /* DPROF: the routed rows go up, and the tier's table again after its step */
             memcpy(vkc_ptr(ch->routed), ch->host_routed, (size_t)nr * D * sizeof(float));
             ch->host_ms += (spec_now() - t1) * 1e3;
             ok = vkc_begin();
@@ -1481,6 +1483,7 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
                 for (int s = 0; s < nr; s++)
                     v4_mainh_tap(c, t, tp + ((size_t)(t - T0) * nr + s) * HD, (int64_t)pb + s);
         }
+        if (prompt && n > 1) vkc_dwin(0);   /* DPROF: the chunk's window closes at its end; a decode step's stays open (the landed discipline) */
     }
     if (pool) coli_v4_expert_store_prefill_pool(experts, -1);
     /* every chunk is through: the host's state as the CPU would have left it */
@@ -1617,6 +1620,15 @@ static void v4c_report(void) {
                     st.d_wait_ms[VKC_R_OTHER], dsum,
                     st.d_dev_ms[VKC_R_A1], st.d_dev_ms[VKC_R_A2], st.d_dev_ms[VKC_R_DMOE], st.d_dev_ms[VKC_R_TAIL],
                     st.d_dev_ms[VKC_R_OTHER], st.d_submit_ms);
+        }
+        if (st.p_fwd) {   /* DPROF: the prompt chunks' split -- the TTFT window S0 measures; the host spans tile the wall, the host-MoE step is the lever */
+            double h[VKC_R_N], wsum = 0, dsum = 0;
+            for (int r = 0; r < VKC_R_N; r++) { h[r] = st.p_host_ms[r] / 1e3; wsum += st.p_wait_ms[r]; dsum += st.p_dev_ms[r]; }
+            fprintf(stderr, "[VK] %s chain prompt: %llu chunk windows, %.1f s wall: host spans A1 %.1f s, A2 %.1f s, dmoe %.1f s, "
+                            "host-MoE %.1f s, staging-upload %.1f s, tail %.1f s, other %.1f s; waits %.1f s, device %.1f s, %.1f ms in vkQueueSubmit\n",
+                    v4c_name(ch), st.p_fwd, st.p_wall_ms / 1e3,
+                    h[VKC_R_A1], h[VKC_R_A2], h[VKC_R_DMOE], h[VKC_R_MOEH], h[VKC_R_STAGE], h[VKC_R_TAIL], h[VKC_R_OTHER],
+                    wsum / 1e3, dsum / 1e3, st.p_submit_ms);
         }
         vkc_kv_report(&ch->ks);
         {   /* COLI_VK_DMOE's own line: one line whenever the env named a layer, steps or none --

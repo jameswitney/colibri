@@ -94,7 +94,7 @@ typedef struct {
     uint64_t wait_h, sig_g;           /* hybrid steps: the host's value this frame waits for, the value it signals */
     VkQueryPool qp; int nq; unsigned char kind[VKC_PROF_Q];   /* COLI_VK_CHAIN_PROF: a timestamp after each op */
     uint32_t shape[VKC_PROF_Q];   /* COLI_VK_CHAIN_PROF=2: a matmul's (fmt, O, I) slot in prof_sh, else 0 */
-    int dec; unsigned char role;   /* COLI_VK_CHAIN_DPROF: submitted inside the decode window, under vkc_role's role */
+    int dec, prm; unsigned char role;   /* COLI_VK_CHAIN_DPROF: submitted inside the decode/prompt window, under vkc_role's role */
 } VkcFrame;
 
 typedef struct {
@@ -176,7 +176,9 @@ typedef struct {
     VkcStats st;
     int prof, kind; float ts_period; uint32_t ts_mask;
     double prof_ms[PK_N]; unsigned long long prof_n[PK_N];
-    int dwin, drole;                          /* COLI_VK_CHAIN_DPROF: the window is open, the role frames submit under */
+    int dwin, pwin, drole;                    /* COLI_VK_CHAIN_DPROF: the open window (decode / prompt chunk), the role frames submit under;
+                                               the prompt window charges its wall to the role stamped when it ran (role_t0, vkc_dwin) */
+    double role_t0, pwin_t0;
     /* COLI_VK_CHAIN_PROF=2: the matmuls' time by (fmt, rows of x, O, I), the slots' keys */
     int prof_shapes; uint64_t prof_key[64]; double prof_sh_ms[64]; unsigned long long prof_sh_n[64];
 } VkcCtx;
@@ -740,6 +742,7 @@ static int frame_wait(VkcFrame *f) {
     double w = vkc_now_ms() - t0;
     KC.st.wait_ms += w; KC.st.waits++;
     if (f->dec) { KC.st.d_wait_ms[f->role] += w; KC.st.d_wait_n++; }   /* DPROF: the frame was submitted in the window */
+    if (f->prm) { KC.st.p_wait_ms[f->role] += w; KC.st.p_wait_n++; }
     f->inflight = 0;
     if (r != VK_SUCCESS) { lose("fence wait", r); return 0; }
     if (KC.prof && f->qp && f->nq > 1) {
@@ -751,6 +754,7 @@ static int frame_wait(VkcFrame *f) {
                 KC.prof_ms[f->kind[i]] += (double)d * KC.ts_period / 1e6; KC.prof_n[f->kind[i]]++;
                 if (f->shape[i]) { KC.prof_sh_ms[f->shape[i] - 1] += (double)d * KC.ts_period / 1e6; KC.prof_sh_n[f->shape[i] - 1]++; }
                 if (f->dec) KC.st.d_dev_ms[f->role] += (double)d * KC.ts_period / 1e6;
+                if (f->prm) KC.st.p_dev_ms[f->role] += (double)d * KC.ts_period / 1e6;
             }
         f->nq = 0;
     }
@@ -853,10 +857,12 @@ int vkc_submit(int wait) {
      * record site that closes it (a begin's stamp would name the previous site: the tail's
      * frame is opened after the last layer's MoE, a dmoe layer's after the one before) */
     f->dec = KC.dwin != 0;
+    f->prm = KC.pwin != 0;
     f->role = (unsigned char)(KC.drole >= 0 && KC.drole < VKC_R_N ? KC.drole : VKC_R_OTHER);
-    double t0 = f->dec ? vkc_now_ms() : 0.0;
+    double t0 = (f->dec || f->prm) ? vkc_now_ms() : 0.0;
     VkResult r = (VkResult)coli_vk_queue_submit_dev(g_kd, KC.queue, &si, f->fence);   /* the backend's lock, staged uploads */
     if (f->dec) { KC.st.d_submit_ms += vkc_now_ms() - t0; KC.st.d_frames++; }
+    if (f->prm) { KC.st.p_submit_ms += vkc_now_ms() - t0; KC.st.p_frames++; }
     if (r != VK_SUCCESS) { lose("queue submit", r); return 0; }
     f->inflight = 1;
     KC.st.frames++;
@@ -3122,11 +3128,32 @@ int vkc_dprof(void) {
 }
 int vkc_dwin(int on) {
     if (!vkc_dprof()) return 0;
+    if (on == 2) {   /* a prompt chunk: its own window, closed by the next call (a chunk's end) */
+        if (KC.pwin) return 1;
+        KC.dwin = 0;   /* a prompt closes the decode window, as a forward of more rows always did */
+        KC.pwin = 1; KC.st.p_fwd++;
+        KC.role_t0 = KC.pwin_t0 = vkc_now_ms();
+        return 1;
+    }
+    if (KC.pwin) {   /* the chunk's end: the last role's span, and the window's wall */
+        double now = vkc_now_ms();
+        KC.st.p_host_ms[KC.drole] += now - KC.role_t0;
+        KC.st.p_wall_ms += now - KC.pwin_t0;
+        KC.pwin = 0;
+    }
     if (on && !KC.dwin) KC.st.d_fwd++;   /* a decode forward opens the window (counted once) */
     KC.dwin = on != 0;
     return 1;
 }
-void vkc_role(int role) { KC.drole = role >= 0 && role < VKC_R_N ? role : VKC_R_OTHER; }
+void vkc_role(int role) {
+    if (role < 0 || role >= VKC_R_N) role = VKC_R_OTHER;
+    if (KC.pwin) {   /* the prompt window's host timeline: the wall since the last stamp is the old role's */
+        double now = vkc_now_ms();
+        KC.st.p_host_ms[KC.drole] += now - KC.role_t0;
+        KC.role_t0 = now;
+    }
+    KC.drole = role;
+}
 
 /* ---- big prefill chunks ------------------------------------------------------------
  * The rows of a prompt chunk (vk_chain.h, vkc_chunk_rows). The free device memory is

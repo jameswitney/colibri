@@ -2379,6 +2379,45 @@ static void test_dprof(void) {
     CHECK(s1.d_wait_ms[VKC_R_OTHER] == s0.d_wait_ms[VKC_R_OTHER] && s1.d_wait_ms[VKC_R_DMOE] == s0.d_wait_ms[VKC_R_DMOE] &&
           s1.d_wait_ms[VKC_R_TAIL] == s0.d_wait_ms[VKC_R_TAIL], "dprof: the unstamped roles stay empty");
     CHECK(s1.d_submit_ms >= s0.d_submit_ms, "dprof: the submit time counts (%.3f ms)", s1.d_submit_ms - s0.d_submit_ms);
+    /* the prompt window (OB0's S0): vkc_dwin(2) opens one per chunk, vkc_dwin(0) closes it
+     * at the chunk's end, and the host timeline charges the window's wall to the role
+     * stamped when it ran -- the host-MoE step (MOEH) and the staging uploads (STAGE) stamp
+     * no frames, only wall; the dense frames stamp frames and waits as the decode window's
+     * do. The roles must tile the wall exactly and leave the decode counters alone. */
+    VkcStats s2; vkc_stats(&s2);
+    vkc_dwin(2);                                   /* a prompt chunk opens its own window (it closes the decode one) */
+    vkc_role(VKC_R_A1);
+    ok &= vkc_begin() && vkc_write(y, 0, a, (size_t)n * 4) && vkc_submit(0) && vkc_finish();   /* a dense frame, waited */
+    vkc_role(VKC_R_MOEH);                          /* the host's routed-expert step: wall, no frames */
+    for (volatile long i = 0; i < 4000000; i++) {}   /* a span the clock can see */
+    vkc_role(VKC_R_STAGE);                         /* the staging upload's frame */
+    ok &= vkc_begin() && vkc_write(x, 0, a, (size_t)n * 4) && vkc_submit(1);
+    vkc_dwin(0);                                   /* the chunk's end: the window closes */
+    ok &= vkc_begin() && vkc_write(y, 0, a, (size_t)n * 4) && vkc_submit(1);   /* outside again */
+    VkcStats s3; vkc_stats(&s3);
+    CHECK(ok, "dprof: the prompt frames ran");
+    CHECK(s3.p_fwd == s2.p_fwd + 1, "dprof: one prompt chunk window (%llu)", s3.p_fwd - s2.p_fwd);
+    CHECK(s3.p_frames == s2.p_frames + 2, "dprof: the window's two frames (%llu)", s3.p_frames - s2.p_frames);
+    CHECK(s3.p_wait_n >= s2.p_wait_n + 2, "dprof: the window's waits (%llu)", s3.p_wait_n - s2.p_wait_n);
+    CHECK(s3.p_wait_ms[VKC_R_A1] > s2.p_wait_ms[VKC_R_A1] && s3.p_wait_ms[VKC_R_STAGE] > s2.p_wait_ms[VKC_R_STAGE],
+          "dprof: the prompt roles waited (A1 %.3f ms, staging %.3f ms)",
+          s3.p_wait_ms[VKC_R_A1] - s2.p_wait_ms[VKC_R_A1], s3.p_wait_ms[VKC_R_STAGE] - s2.p_wait_ms[VKC_R_STAGE]);
+    CHECK(s3.p_host_ms[VKC_R_MOEH] - s2.p_host_ms[VKC_R_MOEH] > 0.1,
+          "dprof: the host-MoE span charges the wall (%.3f ms)", s3.p_host_ms[VKC_R_MOEH] - s2.p_host_ms[VKC_R_MOEH]);
+    CHECK(s3.p_host_ms[VKC_R_A1] > s2.p_host_ms[VKC_R_A1] && s3.p_host_ms[VKC_R_STAGE] > s2.p_host_ms[VKC_R_STAGE] &&
+          s3.p_host_ms[VKC_R_OTHER] == s2.p_host_ms[VKC_R_OTHER] && s3.p_host_ms[VKC_R_DMOE] == s2.p_host_ms[VKC_R_DMOE] &&
+          s3.p_host_ms[VKC_R_TAIL] == s2.p_host_ms[VKC_R_TAIL],
+          "dprof: the unstamped roles' host spans stay empty (A2 carries the window's head in, as designed: %.3f ms)",
+          s3.p_host_ms[VKC_R_A2] - s2.p_host_ms[VKC_R_A2]);
+    {   /* the roles tile the window's wall */
+        double hs = 0, wall = s3.p_wall_ms - s2.p_wall_ms;
+        for (int r = 0; r < VKC_R_N; r++) hs += s3.p_host_ms[r] - s2.p_host_ms[r];
+        CHECK(wall > 0 && hs > 0 && (hs - wall < 1e-3 && wall - hs < 1e-3),
+              "dprof: the host spans tile the wall (%.3f ms of %.3f ms)", hs, wall);
+    }
+    CHECK(s3.p_submit_ms >= s2.p_submit_ms, "dprof: the prompt submit time counts (%.3f ms)", s3.p_submit_ms - s2.p_submit_ms);
+    CHECK(s3.d_fwd == s2.d_fwd && s3.d_frames == s2.d_frames && s3.d_wait_n == s2.d_wait_n,
+          "dprof: the prompt window leaves the decode counters alone");
     vkc_free(x); vkc_free(y); free(a);
 }
 

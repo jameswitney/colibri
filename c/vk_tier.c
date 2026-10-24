@@ -119,6 +119,12 @@ static struct {
     double d_wait_ms, d_dev_ms, d_cpu_ms;      /* COLI_VK_CHAIN_DPROF: the join's wait, device and CPU ms of those
                                                 * steps (vkt_join), beside wait_ms/dev_ms/cpu_ms */
     unsigned long long d_up_bytes;             /* and promote()'s queued upload bytes: H1's PCIe traffic term */
+    double p_wait_ms, p_dev_ms, p_cpu_ms;      /* the same mirror for the prompt class (S > VKT_UP_ROWS): a step's whole span,
+                                                * issue to join -- its fence waits, its batches' device time, and the rest, the
+                                                * host's own loads/uploads/grouping; the engine's host-MoE window charges that
+                                                * span's wall, this line splits it (the decode class keeps d_* above) */
+    unsigned long long p_steps;
+    double p_t0, p_w0, p_d0;                   /* the span's capture, at issue's head */
     size_t stage_room;                 /* left out of the budget for a prompt chunk's staging (VktConfig.stage) */
     /* the second device (COLI_VK_DEV2) */
     int d2;                            /* the tier holds experts there */
@@ -1700,6 +1706,12 @@ static int join_big(const float **rows) {
         if (ok1) for (int q = 0; q < T.nd2; q++) memcpy((T.sy_step ? T.sy_step : T.sy) + (size_t)T.d2_idx[q] * T.c.hidden, T.d2_y[q], (size_t)T.c.hidden * sizeof(float));
         T.d2_inflight = 0;
     }
+    if (T.p_t0 > 0) {   /* DPROF: the prompt mirror closes the big step's span, issue to join (all its waits are in) */
+        double w = T.wait_ms - T.p_w0;
+        T.p_wait_ms += w; T.p_dev_ms += T.dev_ms - T.p_d0;
+        T.p_cpu_ms += vkt_now_ms() - T.p_t0 - w;
+        T.p_steps++; T.p_t0 = 0;
+    }
     int cpu_pairs = T.big_n - T.big_taken - hn;   /* the engine's own */
     if (cpu_pairs >= 32 && tc > 0) {
         double r = tc / cpu_pairs;
@@ -2166,6 +2178,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
         return 0;
     }
     if (T.d2 && !coli_vk_xb_ready_dev(1)) d2_stop("the second device stopped answering");
+    T.p_t0 = vkt_now_ms(); T.p_w0 = T.wait_ms; T.p_d0 = T.dev_ms;   /* DPROF: the prompt mirror's span opens here (the join closes it) */
     if (layer < T.last_layer || T.begin) { T.begin = 0; T.first_layer = layer; new_forward(); }
     if (T.routed_at) {   /* this step's routing: its experts are not offered to the RAM cache's eviction */
         uint32_t q = ++T.seq;
@@ -2354,6 +2367,11 @@ int vkt_join(const float **rows) {
     T.wait_ms += tw;
     T.dev_ms += dms + dms1; T.d2_ms += dms1;
     if (T.S <= VKT_UP_ROWS) { T.d_wait_ms += tw; T.d_dev_ms += dms + dms1; T.d_cpu_ms += tc; }   /* DPROF: the decode class */
+    else if (T.p_t0 > 0) {   /* DPROF: the prompt mirror (S > VKT_UP_ROWS): the span issue to join */
+        T.p_wait_ms += tw; T.p_dev_ms += dms + dms1;
+        T.p_cpu_ms += vkt_now_ms() - T.p_t0 - tw;
+        T.p_steps++; T.p_t0 = 0;
+    }
     if (dms1 > dms) dms = dms1;   /* the two ran side by side: the step waited for the slower */
     /* The balance moves only on steps where it had a choice. Waiting for more than
      * a tenth of the CPU's own time: give the CPU more. The device done well before
@@ -3027,6 +3045,9 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     if (dprof && T.d_routed)   /* COLI_VK_CHAIN_DPROF: the decode steps' wait/device/CPU split, promote's bytes */
         fprintf(stderr, " | decode dprof: waited %.1f ms, device %.1f ms, CPU %.1f ms, promoted %.1f MiB",
                 T.d_wait_ms, T.d_dev_ms, T.d_cpu_ms, (double)T.d_up_bytes / 1048576.0);
+    if (dprof && T.p_steps)   /* COLI_VK_CHAIN_DPROF: the prompt steps' span (S > VKT_UP_ROWS), issue to join: the host-MoE window's tier half */
+        fprintf(stderr, " | prompt dprof: %llu steps, waited %.1f ms, device %.1f ms, host %.1f ms",
+                T.p_steps, T.p_wait_ms, T.p_dev_ms, T.p_cpu_ms);
     if (T.failed)
         fprintf(stderr, " | failed: %llu refused by the pool, %llu copies to the device, %llu not taken by the batch",
                 T.f_pool, T.f_copy, T.f_sets);
