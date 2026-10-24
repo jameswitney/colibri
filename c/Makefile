@@ -745,6 +745,12 @@ VK_SPV   += shaders/chain_kda.spv shaders/chain_kda_rows.spv shaders/chain_mhc.s
 VK_SPV   += shaders/chain_gemv2.spv
 # DeepSeek V4.1 Flash and DeepSeek V4 attention (vk_chain.h: vkc_dsv4_*)
 VK_SPV   += shaders/chain_dsv4.spv
+# its flash-attention tile (COLI_VK_CHAIN_ATTN_FA; the fork's sparse_attn_fa family):
+# Br 8 and the Br 2 decode twin, each with the KV_F16 build that reads the f16 mirror,
+# and the mirror's gather -- five builds of the two sources, the fork's tile defines
+VK_SPV   += shaders/chain_dsv4_fa.spv shaders/chain_dsv4_fa_f16.spv \
+            shaders/chain_dsv4_fa_dec.spv shaders/chain_dsv4_fa_dec_f16.spv \
+            shaders/chain_dsv4_fa_gather.spv
 # Kimi K3's attention residuals and SiTU-GLU (vk_chain.h)
 VK_SPV   += shaders/chain_ares.spv
 # the router's pick on the device, every MoE engine's kind (vk_chain.h: vkc_route)
@@ -1058,6 +1064,33 @@ shaders/chain_qsa.spv: shaders/chain_qsa.h
 # chain_attn_flash.comp needs the same glslc as qmatmul_coop.comp below, with the same
 # fallback; without its .spv the chain keeps chain_attn.comp.
 shaders/chain_attn_flash.spv: shaders/chain_attn_flash.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+# chain_dsv4_fa.comp's five builds. The four tile builds MUST carry the -D set below
+# (the fork's lesson: a plain build silently bakes the #ifndef defaults and the host's
+# heads-per-workgroup pick then dispatches dead workgroups). Br 8 is the prefill tile,
+# Br 2 its decode twin (a head's numerics unchanged, heads/2 workgroups at tokens==1);
+# the _f16 pair reads the f16 mirror chain_dsv4_fa_gather.spv writes (the gather build
+# itself takes no defines).
+DSV4_FA_TILE = -DWorkGroupSize=256 -Drow_split=2 -DD_split=16 -DBc=16 -DHSK=512 -DHSV=512
+shaders/chain_dsv4_fa.spv: shaders/chain_dsv4_fa.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $(DSV4_FA_TILE) -DBr=8 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+shaders/chain_dsv4_fa_f16.spv: shaders/chain_dsv4_fa.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $(DSV4_FA_TILE) -DBr=8 -DKV_F16 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+shaders/chain_dsv4_fa_dec.spv: shaders/chain_dsv4_fa.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $(DSV4_FA_TILE) -DBr=2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+shaders/chain_dsv4_fa_dec_f16.spv: shaders/chain_dsv4_fa.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $(DSV4_FA_TILE) -DBr=2 -DKV_F16 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+shaders/chain_dsv4_fa_gather.spv: shaders/chain_dsv4_fa_gather.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
 	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }

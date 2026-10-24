@@ -1963,6 +1963,69 @@ static void test_ds_attn(int S, int H, int hd, int nwin, int ncmp, int cnt, int 
     free(q); free(win); free(cmp); free(sink); free(ref); free(sc); free(list); free(kvall); free(got);
 }
 
+/* the flash tile (chain_dsv4_fa.comp, COLI_VK_CHAIN_ATTN_FA) on test_ds_attn's
+ * reference, at the shapes the tile takes: hd 512, heads % 8, offsets the vec4 loads
+ * can bind. `arm` sets the lever (1 the f16 mirror, 2 the fp32 rows); S 1 rides the
+ * decode twin, S > 1 the prefill tile. The run is checked bit-stable too (the fork's
+ * own gate class: deterministic tile order, run to run). */
+static void test_ds_attn_fa(int S, int H, int nwin, int ncmp, int cnt, int flags, int arm) {
+    int hd = 512, qrow = H * hd + 4, lrow = cnt + 2, orow = H * hd + 4;
+    float *q = fvec((size_t)S * qrow, 1.f), *win = fvec((size_t)(nwin * hd + 8), 1.f), *cmp = fvec((size_t)(ncmp * hd + 8), 1.f);
+    float *sink = fvec((size_t)H + 2, 2.f), *ref = calloc((size_t)S * orow, 4), *sc = malloc((size_t)cnt * 4);
+    int *list = malloc((size_t)S * lrow * 4);
+    float *kvall = malloc((size_t)(nwin + ncmp) * hd * 4);
+    memcpy(kvall, win + 8, (size_t)nwin * hd * 4); memcpy(kvall + (size_t)nwin * hd, cmp + 8, (size_t)ncmp * hd * 4);
+    for (int s = 0; s < S; s++)
+        for (int j = 0; j < lrow; j++) {
+            int r = (int)(rnd() % 5);
+            list[s * lrow + j] = s == S - 1 && S > 1 ? -1                                     /* a row with nothing to read */
+                               : r == 0 ? -1 : r < 3 ? (int)(rnd() % (unsigned)nwin) : nwin + (int)(rnd() % (unsigned)ncmp);
+        }
+    for (int s = 0; s < S; s++)
+        for (int h = 0; h < H; h++) {
+            const float *qq = q + (size_t)s * qrow + 4 + h * hd;
+            float *o = ref + (size_t)s * orow + 4 + h * hd;
+            const int *idx = list + s * lrow + 2;
+            if (!(flags & 1)) { coli_sparse_attend_scalar(o, qq, kvall, idx, cnt, hd, sink[1 + h], 1.f / sqrtf((float)hd), sc); continue; }
+            float best = -1e30f;   /* DeepSeek V4's reference: w to bf16 before the value sum, the output to bf16 */
+            for (int j = 0; j < cnt; j++) {
+                if (idx[j] < 0) { sc[j] = -INFINITY; continue; }
+                float d = 0; for (int i = 0; i < hd; i++) d += qq[i] * kvall[(size_t)idx[j] * hd + i];
+                sc[j] = d * (1.f / sqrtf((float)hd)); if (sc[j] > best) best = sc[j];
+            }
+            float den = expf(sink[1 + h] - best);
+            for (int i = 0; i < hd; i++) o[i] = 0;
+            for (int j = 0; j < cnt; j++) {
+                if (idx[j] < 0) continue;
+                float w = expf(sc[j] - best); den += w; w = bf16r(w);
+                for (int i = 0; i < hd; i++) o[i] += w * kvall[(size_t)idx[j] * hd + i];
+            }
+            for (int i = 0; i < hd; i++) o[i] = bf16r(o[i] / den);
+        }
+    VkcBuf *qb = up(q, (size_t)S * qrow), *wb = up(win, (size_t)nwin * hd + 8), *cb = up(cmp, (size_t)ncmp * hd + 8);
+    VkcBuf *sb = up(sink, (size_t)H + 2), *ob = vkc_buf((size_t)S * orow * 4, VKC_DEV), *ob2 = vkc_buf((size_t)S * orow * 4, VKC_DEV);
+    VkcBuf *lb = vkc_buf((size_t)S * lrow * 4, VKC_DEV);
+    vkc_begin(); vkc_write(lb, 0, list, (size_t)S * lrow * 4); vkc_submit(1);
+    VkcDsAttn p = {S, H, hd, cnt, 2, lrow, nwin, 8, 8, 4, qrow, 4, orow, 1, flags, 1.f / sqrtf((float)hd)};
+    char arm_s[8]; snprintf(arm_s, sizeof arm_s, "%d", arm);
+    setenv("COLI_VK_CHAIN_ATTN_FA", arm_s, 1);
+    vkc_begin(); int ok = vkc_dsv4_attn(qb, wb, cb, lb, sb, ob, &p);
+    ok = ok && vkc_dsv4_attn(qb, wb, cb, lb, sb, ob2, &p);   /* the second run: the same bits */
+    vkc_submit(1);
+    unsetenv("COLI_VK_CHAIN_ATTN_FA");
+    float *got = down(ob, 0, (size_t)S * orow), *got2 = down(ob2, 0, (size_t)S * orow);
+    double e = 0; int bits = 1, zero = 1;
+    for (int s = 0; s < S; s++) { double r = relerr(got + (size_t)s * orow + 4, ref + (size_t)s * orow + 4, (size_t)H * hd, 1e-3); if (r > e) e = r; }
+    for (size_t i = 0; i < (size_t)S * orow; i++) bits &= got[i] == got2[i] || (isnan(got[i]) && isnan(got2[i]));
+    if (S > 1) for (int i = 0; i < H * hd; i++) zero &= got[(size_t)(S - 1) * orow + 4 + i] == 0.f;
+    double tol = (flags & 1) ? 8e-3 : 2e-3;
+    CHECK(ok && e < tol && bits && (S == 1 || zero) && !bad(got, (size_t)S * orow),
+          "dsv4 attn FA S %d H %d cnt %d flags %d arm %d: rel err %.2e%s", S, H, cnt, flags, arm, e, bits ? "" : ", UNSTABLE BITS");
+    printf("  dsv4 attn FA S %d H %d cnt %d flags %d arm %d: rel err %.2e\n", S, H, cnt, flags, arm, e);
+    vkc_free(qb); vkc_free(wb); vkc_free(cb); vkc_free(sb); vkc_free(ob); vkc_free(ob2); vkc_free(lb);
+    free(q); free(win); free(cmp); free(sink); free(ref); free(sc); free(list); free(kvall); free(got); free(got2);
+}
+
 /* deepseek_v41.c's rope_apply: interleaved pairs, forward and inverse, segments at a stride */
 static void test_ds_rope(int flags) {
     int rows = 3, per = 4, seg = 40, rd = 16, xrow = per * seg + 2, csrow = rd + 1;
@@ -4755,6 +4818,20 @@ int main(int argc, char **argv) {
     else {
         test_ds_attn(1, 4, 64, 8, 5, 13, 0); test_ds_attn(3, 2, 512, 128, 40, 300, 0); test_ds_attn(2, 3, 100, 6, 9, 20, 0);
         test_ds_attn(2, 2, 64, 8, 12, 2900, 0); test_ds_attn(3, 4, 64, 8, 5, 13, 1);
+        {   /* the flash tile's oracle (COLI_VK_CHAIN_ATTN_FA), the stream kept for the rest */
+            unsigned keep = rng;
+            VkcStats s0; vkc_stats(&s0);
+            test_ds_attn_fa(1, 8, 128, 64, 640, 1, 1);      /* the decode twin + the f16 mirror, the model's list shape */
+            test_ds_attn_fa(1, 8, 128, 64, 640, 0, 1);      /* the V4.1 class (no bf16 rounds) */
+            test_ds_attn_fa(3, 16, 128, 40, 300, 1, 1);     /* the prefill tile over dead entries and both row kinds */
+            test_ds_attn_fa(2, 8, 6, 9, 20, 1, 2);          /* the fp32 arm */
+            test_ds_attn(1, 4, 64, 8, 5, 13, 1);            /* a shape the tile refuses: mode 0 under the armed lever */
+            VkcStats s1; vkc_stats(&s1);
+            CHECK(s1.attn_fa - s0.attn_fa >= 4, "dsv4 attn FA: the tile engaged (%llu of the runs)",
+                  s1.attn_fa - s0.attn_fa);
+            printf("  dsv4 attn FA: %llu attentions on the tile\n", s1.attn_fa - s0.attn_fa);
+            rng = keep;
+        }
         test_ds_rope(0); test_ds_rope(1);
         test_ds_compress(2, 0, 0); test_ds_compress(1, 0, 0); test_ds_compress(4, 0, 0); test_ds_compress(4, 1, 1);
         test_ds_compress(3, 0, 1);

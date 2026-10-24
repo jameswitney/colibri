@@ -871,6 +871,7 @@ typedef struct {
     unsigned long long moe_gv;         /* routed-expert decode steps in our formats on chain_moe_gv.comp */
     unsigned long long mm8;            /* fmt-12 matmuls on the tiled GEMM (qmatmul_mm8.comp, COLI_VK_MM8) */
     unsigned long long mm8_split;      /* of those, the split-K ones (partial planes + the ascending-k reduce) */
+    unsigned long long attn_fa;        /* DeepSeek V4 attentions on the flash tile (chain_dsv4_fa.comp, COLI_VK_CHAIN_ATTN_FA) */
     /* COLI_VK_CHAIN_DPROF=1 (vkc_dwin/vkc_role): the decode window -- the forwards of one
      * row and the frames submitted in them, by role: the host's fence waits on those
      * frames, their device time (COLI_VK_CHAIN_PROF's timestamps; 0 without it) and the
