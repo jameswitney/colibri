@@ -141,6 +141,15 @@ static int vkc_dmoe_layer_env(void) {
     if (n < 0) n = vkc_dmoe_layer_parse(getenv("COLI_VK_DMOE"));
     return n;
 }
+/* COLI_VK_DMOE=all -- the multi-layer form (the layer-outer loop's arm): every layer of
+ * the engine's chain in one prepare (lo..L, vk_dmoe.h's own range support), the per-layer
+ * decline staying the engine's (its mask knows the hash layers and the gates). S1's arm
+ * holds exactly one layer for the run; this is the lo..L form the reorder drives. */
+static int vkc_dmoe_all_env(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_DMOE"); on = e && !strcmp(e, "all"); }
+    return on;
+}
 /* COLI_VK_DMOE_ROWS_MAX=R: the amdgpu boundary as a cap -- at most R of a prompt chunk's
  * rows per submission, vkc_submit(0) + vkc_begin between the groups (the
  * vkc_layer_recorded pattern). A whole chunk's grouped GEMMs are seconds of GPU work in

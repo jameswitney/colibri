@@ -887,6 +887,16 @@ deepseek-v4-tiny-check: deepseek-v4-tiny-generate
 # brio leg composes the whole S1 arm's shape: the bank, the chunk rows, and
 # COLI_VK_DMOE_ROWS_MAX's frame split (8-row groups) -- the amdgpu boundary's cap over
 # the banked layer's grouped GEMMs, token-exact.
+# The S3 legs (COLI_VK_CHAIN_ORDER=layer) re-run the oracle through the layer-outer
+# reorder: COLI_VK_CHAIN_ROWS=4 cuts every prompt into several chunks a layer, so the
+# order the units visit them really inverts (the reorder of one chunk is the chunk
+# order); the prefix leg exercises a layer-ordered continuation over a pinned prefix
+# (start > 0: the lowering at each layer's head against the rings' snapshot). The
+# composed leg is the whole Option-B fold at tiny: the bank rotating per layer
+# (vkt_bank_switch at each head), COLI_VK_DMOE=all's lo..L arm (layer 0 is the fixture's
+# hash layer and keeps the host's step), and the ROWS_MAX split -- a layer's first chunk
+# pays the host's step while the bank's fill publishes its places, the rest compute in
+# the frame, token-exact throughout.
 deepseek-v4-tiny-check-dmoe: deepseek-v4-tiny-generate
 	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) VK=1 deepseek-v4
@@ -903,6 +913,16 @@ deepseek-v4-tiny-check-dmoe: deepseek-v4-tiny-generate
 		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
 		--fixture ./deepseek_v4_tiny
 	COLI_VULKAN=1 COLI_VK_DMOE=1 COLI_VK_TIER_BANK_LAYER=1 COLI_VK_DMOE_ROWS=1 COLI_VK_DMOE_ROWS_MAX=8 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_CHAIN_ORDER=layer COLI_VK_CHAIN_ROWS=4 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_CHAIN_ORDER=layer COLI_VK_CHAIN_ROWS=4 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_CHAIN_ORDER=layer COLI_VK_CHAIN_ROWS=4 COLI_VK_TIER_BANK_LAYER=1 COLI_VK_DMOE=all \
+	COLI_VK_DMOE_ROWS=1 COLI_VK_DMOE_ROWS_MAX=8 $(PYTHON) tests/test_deepseek_v4_brio.py \
 		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
 		--fixture $(CURDIR)/deepseek_v4_tiny
 

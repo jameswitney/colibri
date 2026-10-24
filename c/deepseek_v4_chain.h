@@ -124,6 +124,9 @@ typedef struct {
     VkcDmoe dm;                             /* that arm: one layer's routed experts in the frame */
     ColiVkTensor *gate;                     /* the layer's ffn.gate.weight, bf16 on the device */
     const float *gate_bias;                 /* and its ffn.gate.bias, written in every armed frame */
+    uint8_t dmar[COLI_V4_MAX_LAYERS];       /* COLI_VK_DMOE's armed layers (all's lo..L mask; a layer without is the host's step) */
+    VkcBuf *xall;                           /* COLI_VK_CHAIN_ORDER=layer: the prompt's streams, resident across a layer's pass */
+    unsigned long long layer_fwd, layer_units;   /* the layer-ordered prompt forwards, their layer-chunk units (the report's line) */
     float *host_routed;
     unsigned long long forwards;
     double host_ms;
@@ -186,6 +189,23 @@ static int v4c_rows(void) {
         rows = v < 1 ? 1 : v > cw ? cw : v;
     }
     return rows;
+}
+/* COLI_VK_CHAIN_ORDER: the prompt loop's order. `chunk` (the default, unset or any other
+ * value) is today's -- a chunk of rows through every layer, then the next chunk; the
+ * default-off path is byte-identical by construction (this parse only picks a loop).
+ * `layer` is the fork's prefill order: every chunk of the prompt crosses one layer
+ * before the next layer begins, so the tier's stream window (or the bank's rotation)
+ * serves a layer's whole tenure and the carve the chunk leg measured cannot happen --
+ * the reorder is the regime where S1's bank stops coexisting with streaming and becomes
+ * it. The per-row GEMV invariant (COLI_VK_CHAIN_GEMM_ROWS' comment above the loop) makes
+ * the reorder bit-neutral at GEMM_ROWS=0: the same (layer, chunk) batches run, only their
+ * order across the forward changes. At GEMM_ROWS=-1 the tiled path's bits depend on the
+ * chunk cut, and the cut sequence is pinned identical per row (the same v4c_chunk_rows
+ * for every layer), so the reorder still changes only the serving path. */
+static int v4c_order_layer(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_ORDER"); on = e && !strcmp(e, "layer"); }
+    return on;
 }
 /* v4c_res counts instead of reserving while g_v4c_count >= 0 (the chunk's sizing) */
 static long long g_v4c_count = -1;
@@ -651,6 +671,7 @@ static void v4c_dmoe_drop(V4Chain *ch) {
     vkc_free(ch->lg); vkc_free(ch->gbias); ch->lg = ch->gbias = NULL;
     void (*forget)(ColiVkTensor *) = ch->d ? v4c_d2_forget : v4_vk_forget;
     forget(ch->gate); ch->gate = NULL; ch->gate_bias = NULL;
+    memset(ch->dmar, 0, sizeof ch->dmar);
 }
 /* ---- COLI_VK_DMOE: one layer's routed experts in the frame (vk_dmoe.h) -------------------
  * Scaffolding for the L2 measurement (docs/research/Q-l2-dmoe-map-2026-10-22.md, S1):
@@ -666,7 +687,18 @@ static void v4c_dmoe_drop(V4Chain *ch) {
  * id, and the logits come from the chain's GEMV: a token's bits can differ where a bf16
  * round does not absorb it -- the greedy/oracle check is the gate, not bit equality. A
  * hash layer (vkc_route cannot express its token table), a layer outside this chain and
- * the second device keep the host's step. 0, the default, changes nothing. */
+ * the second device keep the host's step. 0, the default, changes nothing.
+ *
+ * COLI_VK_DMOE=all is the multi-layer form the layer-outer loop (COLI_VK_CHAIN_ORDER=
+ * layer, below) drives: one prepare over lo..L (vk_dmoe.h's own range), the per-layer
+ * gate looked up at each visit (one gate tensor a layer -- the single-layer arm caches
+ * its one, the loop cannot), hash layers and layers whose gate did not reach the device
+ * masked to the host's step (ch->dmar). The arm needs the layer order: the chunk-outer
+ * loop caches one gate for its one armed layer, so `all` without the reorder declines
+ * with a line instead of computing with the wrong gate. With the bank's rotation
+ * (COLI_VK_TIER_BANK_LAYER) each layer's tenure arms its own visits: the first chunk of
+ * a layer runs the host's step (the fill seam refills the bank post-router), the rest
+ * compute in the frame from the banked residency. */
 /* COLI_VK_DMOE_ROWS: the opt-in that lets the armed layer take a prompt chunk's rows too
  * (more than VKC_DMOE_ROWS of them) through vkc_moe_rows' grouped GEMMs -- the fmt-7
  * (MXFP4) pipelines of L2 Stage B. Off (the default) the arm keeps the per-pair decode
@@ -680,12 +712,50 @@ static int v4c_dmoe_rows_wanted(void) {
     if (on < 0) { const char *e = getenv("COLI_VK_DMOE_ROWS"); on = e && *e && atoi(e) != 0; }
     return on;
 }
-static int v4c_dmoe_arm(V4Chain *ch, int rows) {
+static int v4c_dmoe_arm(V4Chain *ch, int rows, int layer_order) {
     const ColiDeepSeekV4Config *c = &ch->engine->config;
-    int n = vkc_dmoe_layer_env();
+    int n = vkc_dmoe_layer_env(), all = vkc_dmoe_all_env();
     static int told = 0;
     int big = v4c_dmoe_rows_wanted();   /* a prompt chunk's rows through the grouped GEMMs */
-    if (!n || ch->d || n < ch->lo || n >= ch->L || (!big && rows > VKC_DMOE_ROWS)) return 0;
+    if ((!n && !all) || ch->d || (!big && rows > VKC_DMOE_ROWS)) return 0;
+    if (all) {   /* COLI_VK_DMOE=all: the chain's layers in one arm (the layer-outer loop's) */
+        if (!layer_order) {
+            if (!told) fprintf(stderr, "[VK] %s chain: COLI_VK_DMOE=all follows COLI_VK_CHAIN_ORDER=layer's prompt path "
+                                       "(this forward is not one it takes: decode, a verify, a single chunk, or the reservoir "
+                                       "did not fit); the host's step keeps every layer\n", v4c_name(ch));
+            told = 1;
+            return 0;
+        }
+        memset(ch->dmar, 0, sizeof ch->dmar);
+        int armed = 0;
+        for (int i = ch->lo; i < ch->L && i < COLI_V4_MAX_LAYERS; i++) {
+            const ColiDeepSeekV4LayerWeights *w = &ch->engine->dense_resident.layers[i];
+            if (w->plan.uses_hash_router) continue;   /* vkc_route cannot give its token table */
+            if (!v4c_plain(w, "ffn.gate.weight", 11)) continue;   /* no gate on the device: the host's step */
+            ch->dmar[i] = 1; armed++;
+        }
+        if (!armed) {
+            if (!told) fprintf(stderr, "[VK] %s chain: COLI_VK_DMOE=all: no layer of %d..%d can route in the frame (hash "
+                                       "layers, or gates off the device); the host's step keeps them\n", v4c_name(ch), ch->lo, ch->L - 1);
+            told = 1;
+            return 0;
+        }
+        if (!vkc_reserve(&ch->gbias, (size_t)c->n_routed_experts * sizeof(float), VKC_DEV) ||
+            !vkc_reserve(&ch->lg, (size_t)rows * c->n_routed_experts * sizeof(float), VKC_DEV)) return 0;
+        ch->dm.big = big;
+        if (!vkc_dmoe_prepare(&ch->dm, ch->lo, ch->L - ch->lo, c->n_routed_experts, c->num_experts_per_tok,
+                              ch->D, ch->I, rows)) {
+            if (!told && !ch->dm.off && vkt_ready())
+                fprintf(stderr, "[VK] %s chain: COLI_VK_DMOE=all: the tier does not hold any of layers %d..%d's experts "
+                                "whole yet; the host's step keeps them (the bank's rotation arms them layer by layer)\n",
+                        v4c_name(ch), ch->lo, ch->L - 1);
+            told = 1;
+            return 0;
+        }
+        return 1;
+    }
+    if (n < ch->lo || n >= ch->L) return 0;
+    memset(ch->dmar, 0, sizeof ch->dmar);
     if (ch->engine->dense_resident.layers[n].plan.uses_hash_router) {
         if (!told) fprintf(stderr, "[VK] %s chain: COLI_VK_DMOE=%d is a hash layer (vkc_route cannot give its token "
                                    "table); the host's step keeps it\n", v4c_name(ch), n);
@@ -700,6 +770,7 @@ static int v4c_dmoe_arm(V4Chain *ch, int rows) {
         return 0;
     }
     if (!ch->gate_bias) ch->gate_bias = v4c_val(w, "ffn.gate.bias");
+    ch->dmar[n] = 1;
     if ((ch->gate_bias && !vkc_reserve(&ch->gbias, (size_t)c->n_routed_experts * sizeof(float), VKC_DEV)) ||
         !vkc_reserve(&ch->lg, (size_t)rows * c->n_routed_experts * sizeof(float), VKC_DEV)) return 0;
     ch->dm.big = big;   /* vk_dmoe.h's gate: a step of more than VKC_DMOE_ROWS rows */
@@ -718,7 +789,7 @@ static int v4c_dmoe_arm(V4Chain *ch, int rows) {
 static void v4c_cut(V4Chain *ch, int i, const char *why) {
     ColiV4Engine *e = ch->engine;
     if (i < ch->L) ch->L = i;
-    if (vkc_dmoe_layer_env() >= i) v4c_dmoe_drop(ch);   /* the armed layer left the chain */
+    if (vkc_dmoe_layer_env() >= i || vkc_dmoe_all_env()) v4c_dmoe_drop(ch);   /* the armed layer(s) left the chain */
     if (ch->d) { vkc_fit_shrink("deepseek_v4 dev2", &g_v4c_fit2, i - ch->lo, why); return; }
     if (e->dense_resident.device_only && e->dense_resident.device_layers > i) {
         fprintf(stderr, "[VK] deepseek_v4: layers %d to %d keep their host copies after all (the RAM plan had counted "
@@ -1039,8 +1110,11 @@ static int v4c_post(V4Chain *ch, VkcBuf *hp, int n) {
 }
 
 /* The forward being recorded: positions, rows, the RoPE tables' places in ch->cs (the
- * window table's row 0 is position pb; the compress table's row 0 is pb - rmax + 1). */
-typedef struct { int start, n, pb, nr, csW, csC, LR, s_ident; } V4cFwd;
+ * window table's row 0 is position pb; the compress table's row 0 is pb - rmax + 1),
+ * and the list rows' place in ch->list (0: the buffer's first rows -- the chunk order
+ * rewrites it a chunk at a time; the layer order's chunks live side by side, lbase the
+ * chunk's own rows, so a later layer's unit reads the chunk it is visiting). */
+typedef struct { int start, n, pb, nr, csW, csC, LR, s_ident; int lbase; } V4cFwd;
 
 /* the compressor's ring for nr rows into out (rows of D floats), then the produced rows'
  * pooled-latent pipeline: bf16, norm, bf16, RoPE at the group's first position, and the
@@ -1094,7 +1168,7 @@ static int v4c_attention(V4Chain *ch, int i, const V4cFwd *f) {
         if (ok && width > 0) {
             VkcDsScore sp = {nr, pb, 4, IH, ID, width, 0, IH * ID, 0, IH, 0, ID, 0, (int)ch->wcap,
                              1.0f / sqrtf((float)(ID * IH)), 0, 0};
-            VkcDsTopk tp = {nr, width, K, (int)ch->wcap, ch->W, f->LR, ch->Wd, 1};
+            VkcDsTopk tp = {nr, width, K, (int)ch->wcap, f->lbase + ch->W, f->LR, ch->Wd, 1};
             ok = vkc_dsv4_score(ch->iq, ch->ihw, ly->ikey, NULL, ch->isc, &sp) && vkc_dsv4_topk(ch->isc, ch->list, &tp);
             if (ok && f->s_ident > 0) {                                 /* V4_IDX_IDENTITY: index order while all fit */
                 VkcDsTopk ti = tp; ti.S = f->s_ident; ti.order = 0;
@@ -1122,7 +1196,7 @@ static int v4c_attention(V4Chain *ch, int i, const V4cFwd *f) {
     if (ly->idx) cnt += c->index_topk;
     else if (ly->ratio > 0) cnt += (pb + nr) / ly->ratio;
     int kind = ly->ratio > 0 && !ly->idx ? ly->kind : 0;
-    VkcDsAttn a = {nr, nh, hd, cnt, kind * nr * f->LR, f->LR, ch->Wd, 0, 0, 0, qrow, 0, qrow, (int)ly->o_sink, 1,
+    VkcDsAttn a = {nr, nh, hd, cnt, f->lbase + kind * nr * f->LR, f->LR, ch->Wd, 0, 0, 0, qrow, 0, qrow, (int)ly->o_sink, 1,
                    1.0f / sqrtf((float)hd)};
     if (ok && sp) {   /* stage selected cold rows, preserving V4's complete softmax and bf16 rounding */
         ColiV4AttentionView v;
@@ -1177,6 +1251,304 @@ static int v4c_read_count(ColiDeepSeekV4WindowAttentionState *s, int *count, int
  * changed; *lost = 1: a frame failed, the device marked lost); -1: the MoE failed (error
  * set, as a CPU forward failing at that layer leaves the host state). */
 static void v4c_off(V4Chain *ch) { v4c_dmoe_drop(ch); ch->failed = 1; if (!ch->d) g_v4c_mode = 0; }
+/* ---- COLI_VK_CHAIN_ORDER=layer: the prompt loop layer-outer ---------------------------------
+ * The fork's prefill order (its own comment: "A true prefill is layer-major: every prompt
+ * position crosses this layer before the next one begins"): for each layer, every chunk
+ * of the prompt; only then the next layer. What makes it legal is that a layer's pass is
+ * self-contained -- a layer reads its own attention state (its window ring, its compressed
+ * rows, its ring and indexer keys, which the chunk order lowers at its first chunk and
+ * this order lowers at the layer's head, against a snapshot of the rings taken before the
+ * first layer's pass: a later layer's mirrors still hold the state the snapshot describes
+ * while the live slot_pos has followed the earlier layers' chunks) and the streams the
+ * layer before left, resident for the whole prompt (ch->xall: each unit's rows go in and
+ * out of the chunk's scratch as it runs). The window rings never see a position of a
+ * later layer before an earlier one, so the chunk order's ring discipline holds per layer
+ * exactly, and the per-row GEMV keeps a row's bits the same (the same (layer, chunk)
+ * batches run -- only their order across the forward changes; the serving path is the
+ * only thing an arm moves).
+ *
+ * What the reorder buys is tenure: the tier's stream window (or the bank, whose explicit
+ * rotation this loop drives at the layer head -- nothing reads the old layer's experts
+ * there, the layer tail's submit waited its frames) serves every chunk of one layer
+ * before it moves, so a layer's experts are read once instead of once a chunk: the bank
+ * stops coexisting with the streaming and becomes it. The unit (one layer, one chunk) is
+ * the chunk path's layer body: the same frames, the join of the unit before deferred to
+ * the next unit's head as the chunk path defers it across the layer boundary. Two of the
+ * chunk path's per-chunk closes become per-layer: a unit's dmoe frames need not wait
+ * before the next unit records (vkc_layer_recorded bounds them), but the tier's books
+ * (vkt_dev_count) and DSpark's taps read host-mapped memory, so they drain at the loop's
+ * wait points -- a host-step unit's A1, the split's copy-back, each layer tail -- where
+ * the frames that wrote them are through; a tap is read from xall (the joined rows'
+ * home), never off xs, which the next unit's load takes.
+ *
+ * Returns 1 (the prompt is through: `next` holds the streams, `pull` the state, the
+ * caller's write-back does what it does for a chunk pass), 0 (a frame failed: the
+ * caller's lost path) or -1 (the MoE failed: the caller's failure path). cs/wl/cos_/
+ * sin_ stay the caller's to free either way. */
+static int v4c_layer_outer(V4Chain *ch, ColiV4Engine *engine,
+                           ColiDeepSeekV4WindowAttentionState **attention, const ColiDeepSeekV4Config *config,
+                           ColiExpertStore *experts, const int *tokens, const float *state, float *next,
+                           int start, int n, int pool, int rows, int LR, int dmoe, int ident,
+                           float *cs, int *wl, float *cos_, float *sin_, char *error, size_t error_size) {
+    const ColiDeepSeekV4Config *c = config;
+    int lo = ch->lo, L = ch->L, D = ch->D, HD = ch->HD, hd = ch->hd, rd = ch->rd, W = ch->W, E = start + n;
+    int ok = 1, T0 = ch->Lm - 3, taps = coli_v4_full_dspark_wanted;
+    int q0 = E - W > start ? E - W : start, nq = E - q0, q_lo = start - W + 1 < 0 ? 0 : start - W + 1;
+    int pending = 0, prev_dev = 0, prev_i = 0, prev_c0 = 0, prev_nr = 0, sent = 0;
+    int pend_tap = 0, tap_i = 0, tap_c0 = 0, tap_nr = 0;
+    int nunit = (n + rows - 1) / rows * (L - lo);
+    struct { int i, c0, nr; } *dq = malloc((size_t)(nunit > 0 ? nunit : 1) * sizeof *dq);   /* dmoe units awaiting a wait point */
+    int dqh = 0, dqt = 0;
+    int *sp0 = malloc((size_t)ch->Wd * sizeof(int));   /* the rings as the forward found them: every layer's mirror of it */
+    if (!sp0 || !dq || !vkc_begin() || !vkc_write(ch->xall, 0, state, (size_t)n * HD * sizeof(float))) {
+        free(sp0); free(dq);
+        return 0;
+    }
+    memcpy(sp0, ch->slot_pos, (size_t)ch->Wd * sizeof(int));
+    ch->layer_fwd++;
+#define V4C_LO_TAP() do {   /* the unit before's tap, from the reservoir its join went to */ \
+        if (ok && pend_tap) ok = vkc_copy(ch->taps, (size_t)(tap_i - T0) * tap_nr * HD, ch->xall, (size_t)tap_c0 * HD, (size_t)tap_nr * HD); \
+    } while (0)
+#define V4C_LO_DRAIN() do {   /* after a wait: the ids and the tap the waited frames wrote */ \
+        if (ok) { \
+            if (pend_tap && taps) { \
+                const float *tp = (const float *)vkc_ptr(ch->taps) + (size_t)(tap_i - T0) * tap_nr * HD; \
+                for (int s = 0; s < tap_nr; s++) v4_mainh_tap(c, tap_i, tp + (size_t)s * HD, (int64_t)(start + tap_c0) + s); \
+            } \
+            pend_tap = 0; \
+            while (dqh < dqt) { vkt_dev_count(dq[dqh].i, dq[dqh].nr, ch->dm.K, vkc_dmoe_ids(&ch->dm, dq[dqh].i)); dqh++; } \
+        } \
+    } while (0)
+    for (int i = lo; ok && i < L; i++) {
+        V4cLayer *ly = &ch->ly[i];
+        if (!vkc_begin()) { ok = 0; break; }
+        {   /* the layer's head: the host state lowered into this layer's mirrors, exactly the
+             * chunk order's first-chunk lowering for this layer alone, the stale test on the
+             * snapshot (the live slot_pos has followed the layers before) */
+            ColiV4AttentionView v;
+            if (coli_v4_attention_view(attention[i], &v)) { ok = 0; break; }
+            for (int q = q_lo; ok && q < start; q++)
+                if (q >= ch->win_valid || sp0[q % ch->Wd] != q)   /* stale, or its row taken since */
+                    ok = vkc_write(ly->win, (size_t)(q % ch->Wd) * hd, v.kv + (size_t)(q % W) * hd, (size_t)hd * sizeof(float));
+            if (ok && ly->ratio > 0) {
+                int t0 = ly->kv_valid, t1 = start / ly->ratio;
+                if (ok && t1 > t0 && !ch->ks.on)
+                    ok = vkc_write(ly->ckv, (size_t)t0 * hd, v.compressed + (size_t)t0 * hd, (size_t)(t1 - t0) * hd * sizeof(float));
+                ColiV4CompressorView cv;
+                size_t rf = (size_t)ly->crows * ly->cproj;
+                if (ok && !ly->ring_ok)
+                    ok = !coli_v4_compressor_view(v.compressor, &cv) && cv.rows == ly->crows && cv.projection == ly->cproj &&
+                         vkc_write(ly->ring, 0, cv.kv, rf * sizeof(float)) && vkc_write(ly->ring, rf, cv.score, rf * sizeof(float));
+                if (ok && ly->idx) {
+                    ColiV4IndexerView iv;
+                    ok = ok && !coli_v4_indexer_view(v.indexer, &iv);
+                    int k0 = ly->ik_valid, k1 = start / 4;
+                    if (ok && k1 > k0)
+                        ok = vkc_write(ly->ikey, (size_t)k0 * ch->ID, iv.keys + (size_t)k0 * ch->ID,
+                                       (size_t)(k1 - k0) * ch->ID * sizeof(float));
+                    size_t ir = (size_t)8 * 2 * ch->ID;
+                    if (ok && !ly->iring_ok)
+                        ok = !coli_v4_compressor_view(iv.compressor, &cv) && cv.rows == 8 && cv.projection == 2 * ch->ID &&
+                             vkc_write(ly->iring, 0, cv.kv, ir * sizeof(float)) && vkc_write(ly->iring, ir, cv.score, ir * sizeof(float));
+                }
+            }
+            for (int q = q_lo; ok && q < start; q++) ch->slot_pos[q % ch->Wd] = q;   /* this layer's mirrors hold them now */
+        }
+        if (ok && !ch->d) vkt_bank_switch(i);   /* the rotation, at the head: the layer tail's submit waited the old layer's frames */
+        for (int c0 = 0; ok && c0 < n; c0 += rows) {
+            vkc_dwin(2);   /* DPROF: a layer-chunk unit's window, closed at its end (the layer tail for the last) */
+            int nr = n - c0 < rows ? n - c0 : rows, pb = start + c0, ci = c0 / rows;
+            int lbase = ci * ch->nkind * rows * LR, csbase = ci * (2 * rows + ch->rmax) * rd;
+            V4cFwd f = {start, n, pb, nr, csbase, csbase + nr * rd, LR, 0, lbase};
+            if (ident) for (int s = 0; s < nr && (pb + s + 1) / 4 <= c->index_topk; s++) f.s_ident = s + 1;
+            vkc_role(VKC_R_A1);   /* DPROF: the dense frames this unit submits (the join below is its head) */
+            if (pending) {   /* the unit before: its FFN branch joins, its rows back to the reservoir */
+                ok = v4c_join(ch, prev_nr, prev_dev);
+                if (ok) ok = vkc_copy(ch->xall, (size_t)prev_c0 * HD, ch->xs, 0, (size_t)prev_nr * HD);
+                if (taps && prev_i >= T0) { pend_tap = 1; tap_i = prev_i; tap_c0 = prev_c0; tap_nr = prev_nr; }
+                pending = 0;
+            }
+            if (i == lo) {   /* this chunk's RoPE rows and lists, built and written once, into the chunk's own place:
+             * every layer's unit of this chunk reads them there -- a later chunk's build
+             * at layer lo must not take them away before the later layers visit the chunk.
+             * The build is chunk-local (the host buffers hold one chunk); the write lands
+             * at the chunk's region, where f.csW/f.csC/lbase point the kernels. */
+                for (int s = 0; s < nr + ch->rmax - 1; s++) {
+                    for (int t = 0; t < 2; t++) {
+                        if (t == 0 && s >= nr) continue;
+                        int p = t == 0 ? pb + s : pb - ch->rmax + 1 + s;
+                        float *dst = cs + (t == 0 ? 0 : nr * rd) + (size_t)s * rd;
+                        if (p < 0 || coli_v4_rope_position(cos_, sin_, rd, p, t ? c->original_max_position_embeddings : 0,
+                                                           t ? c->compress_rope_theta : c->rope_theta, c->rope_factor,
+                                                           c->rope_beta_fast, c->rope_beta_slow)) {
+                            memset(dst, 0, (size_t)rd * sizeof(float));
+                            continue;
+                        }
+                        for (int k = 0; k < rd / 2; k++) { dst[2 * k] = cos_[k]; dst[2 * k + 1] = sin_[k]; }
+                    }
+                }
+                for (int k = 0; k < ch->nkind; k++)
+                    for (int s = 0; s < nr; s++) {
+                        int p = pb + s, *row = wl + ((size_t)k * nr + s) * LR;
+                        for (int j = 0; j < W; j++) { int q = p - W + 1 + j; row[j] = q >= 0 ? q % ch->Wd : -1; }
+                        for (int j = W; j < LR; j++) {
+                            int g = j - W;
+                            row[j] = k > 0 && g < (p + 1) / ch->kratio[k] ? ch->Wd + g : -1;
+                        }
+                    }
+                ok = ok && vkc_write(ch->list, lbase, wl, (size_t)ch->nkind * nr * LR * sizeof(int)) &&
+                     vkc_write(ch->cs, csbase, cs, (size_t)(2 * nr + ch->rmax - 1) * rd * sizeof(float));
+            }
+            if (ok && ch->ks.on && ly->ratio > 0) {   /* the split: this layer's table over the chunk's new rows */
+                int r = ly->ratio, g0 = pb / r;
+                ColiV4AttentionView v;
+                if (coli_v4_attention_view(attention[i], &v)) { ok = 0; break; }
+                VkcKvPart pt = {1, hd, v.compressed, 0, ly->ckv, 0, 0};
+                vkc_kv_place(&ch->ks, ch->sli[i], g0, (pb + nr) / r - g0);
+                ok = vkc_kv_push(&ch->ks, ch->sli[i], &pt, 1, g0);
+            }
+            ok = ok && vkc_copy(ch->xs, 0, ch->xall, (size_t)c0 * HD, (size_t)nr * HD);   /* the chunk's rows in */
+            if (ok) {   /* the armed layers' table for this frame, this layer's router's bias with it */
+                const float *bias = dmoe && ch->dmar[i] ? v4c_val(&engine->dense_resident.layers[i], "ffn.gate.bias") : NULL;
+                ok = !dmoe || (vkc_dmoe_upload(&ch->dm) &&
+                               (!bias || vkc_write(ch->gbias, 0, bias, (size_t)c->n_routed_experts * sizeof(float))));
+            }
+            if (!ok) break;
+            for (int s = 0; s < nr; s++) ch->slot_pos[(pb + s) % ch->Wd] = pb + s;   /* this chunk's rows go in below */
+            ch->layer_units++;
+            ok = ok && v4c_pre(ch, ly->fna, ly->o_hca, ch->hpa, ly->o_an, nr) && v4c_attention(ch, i, &f) &&
+                 v4c_post(ch, ch->hpa, nr) && v4c_pre(ch, ly->fnf, ly->o_hcf, ch->hpf, ly->o_fn, nr);
+            ColiVkTensor *gate = ok && dmoe && ch->dmar[i] ?
+                v4c_plain(&engine->dense_resident.layers[i], "ffn.gate.weight", 11) : NULL;
+            if (ok && gate && vkc_dmoe_on(&ch->dm, i)) {     /* COLI_VK_DMOE: this layer's experts in the frame */
+                vkc_role(VKC_R_DMOE);   /* DPROF: the frame the dmoe path submits, not an A1 */
+                float lim = c->swiglu_limit;
+                VkcRoute rp = {.kind = 2, .n_group = 1, .topk_group = 1, .has_bias = ch->gbias ? 1 : 0,
+                               .norm = 1, .temp = 1.f, .scale = c->routed_scaling_factor};
+                VkcMoe mp = {.D = D, .I = ch->I, .act = 0, .limit = lim > 0.0f ? lim : 0.0f};
+                /* the shared expert and the router's logits in the same frame: no wait, no host step */
+                ok = v4c_shared(ch, ly, nr) && vkc_matmul(gate, ch->nrm, 0, ch->lg, 0, nr) &&
+                     vkc_dmoe_layer(&ch->dm, i, nr, ch->lg, ch->gbias, ch->nrm, &rp, &mp);
+                if (ok && ch->ks.on) {   /* the split's host mirror takes this chunk's rows: the frame ends here */
+                    V4C_LO_TAP();
+                    ok = vkc_submit(0) && vkc_finish();
+                    if (ok && ly->ratio > 0) {
+                        int r = ly->ratio, g0 = pb / r, np = (pb + nr) / r - g0;
+                        ColiV4AttentionView v;
+                        if (np > 0 && !coli_v4_attention_view(attention[i], &v))
+                            memcpy(v.compressed + (size_t)g0 * hd, vkc_ptr(ch->cdn), (size_t)np * hd * sizeof(float));
+                    }
+                    ok = ok && vkc_begin();
+                    V4C_LO_DRAIN();
+                } else if (ok && (c0 + nr < n || i + 1 < L))
+                    ok = vkc_layer_recorded(&sent);   /* a long frame: the device starts on these units */
+                if (ok && dqt < nunit) { dq[dqt] = (typeof(dq[0])){i, c0, nr}; dqt++; }   /* the books at the next wait */
+                prev_dev = 1;
+            } else {
+                V4C_LO_TAP();   /* the tap rides the A1 frame; the drain reads it under the wait */
+                ok = ok && vkc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)nr * D) && vkc_submit(0);    /* A1 */
+                /* while it runs, the tier loads the experts this layer will likely stream (a
+                 * big prompt chunk only): at this layer's next unit, the same layer's set */
+                if (ok) { vkc_role(VKC_R_STAGE); vkt_stream_prefetch(i, nr); vkc_role(VKC_R_A1); }   /* DPROF: the staging beside A1's wait */
+                ok = ok && vkc_finish();
+                V4C_LO_DRAIN();
+                if (!ok) break;
+                if (ch->ks.on && ly->ratio > 0) {               /* this chunk's new compressed rows into the host's */
+                    int r = ly->ratio, g0 = pb / r, np = (pb + nr) / r - g0;
+                    ColiV4AttentionView v;
+                    if (np > 0 && !coli_v4_attention_view(attention[i], &v))
+                        memcpy(v.compressed + (size_t)g0 * hd, vkc_ptr(ch->cdn), (size_t)np * hd * sizeof(float));
+                }
+                /* A2: the shared expert, while the host computes the routed experts */
+                vkc_role(VKC_R_A2);
+                ok = vkc_begin() && v4c_shared(ch, ly, nr) && vkc_submit(0);
+                if (!ok) break;
+                double t1 = spec_now();
+                vkc_role(VKC_R_MOEH);   /* DPROF: the host's routed-expert step (ch->host_ms above; the tier's own line splits it) */
+                if (pool) coli_v4_expert_store_prefill_pool(experts, i);
+                if (coli_v4_moe_routed(ch->host_routed, &engine->dense_resident.layers[i], config, experts,
+                                       (const float *)vkc_ptr(ch->h2d), tokens + c0, nr, error, error_size)) {
+                    free(sp0); free(dq);
+                    return -1;
+                }
+                vkc_role(VKC_R_STAGE);   /* DPROF: the routed rows go up, and the tier's table again after its step */
+                memcpy(vkc_ptr(ch->routed), ch->host_routed, (size_t)nr * D * sizeof(float));
+                ch->host_ms += (spec_now() - t1) * 1e3;
+                ok = vkc_begin();
+                if (ok && dmoe) ok = vkc_dmoe_upload(&ch->dm);   /* the host's step ran the tier: the table again */
+                prev_dev = 0;
+            }
+            pending = 1; prev_i = i; prev_c0 = c0; prev_nr = nr;
+            if (c0 + nr < n) vkc_dwin(0);   /* DPROF: the unit's window closes; a layer's last stays open over its tail */
+        }
+        if (!ok) break;
+        {   /* the layer's tail: the last unit's join, the state final, the frames waited -- the next
+             * layer's rotation (and its mirrors' lowering) start from a quiet device */
+            vkc_role(VKC_R_TAIL);
+            if (pending) {
+                ok = v4c_join(ch, prev_nr, prev_dev);
+                if (ok) ok = vkc_copy(ch->xall, (size_t)prev_c0 * HD, ch->xs, 0, (size_t)prev_nr * HD);
+                if (ok && taps && prev_i >= T0) { pend_tap = 1; tap_i = prev_i; tap_c0 = prev_c0; tap_nr = prev_nr; }
+                pending = 0;
+            }
+            V4C_LO_TAP();
+            ok = ok && vkc_submit(1);
+            V4C_LO_DRAIN();
+            if (ok) vkc_dwin(0);   /* DPROF: the layer's last window closes here, its frames waited */
+        }
+    }
+    if (ok) {   /* the forward's tail: the streams back whole, the state's copy-outs as the chunk path's last chunk */
+        vkc_dwin(2);   /* DPROF: the closing frame's own window (the copy-outs and the download it waits) */
+        vkc_role(VKC_R_TAIL);
+        ok = vkc_begin();   /* the last layer tail submitted: a fresh frame for what closes the forward */
+        if (ok && pending) {
+            ok = v4c_join(ch, prev_nr, prev_dev);
+            if (ok) ok = vkc_copy(ch->xall, (size_t)prev_c0 * HD, ch->xs, 0, (size_t)prev_nr * HD);
+            if (ok && taps && prev_i >= T0) { pend_tap = 1; tap_i = prev_i; tap_c0 = prev_c0; tap_nr = prev_nr; }
+            pending = 0;
+        }
+        V4C_LO_TAP();
+        ok = ok && vkc_copy(ch->xd, 0, ch->xall, 0, (size_t)n * HD);
+        for (int i = lo; ok && i < L; i++) {
+            V4cLayer *ly = &ch->ly[i];
+            VkcRegion *rg = malloc((size_t)(nq > 0 ? nq : 1) * sizeof *rg);
+            if (!rg) { ok = 0; break; }
+            for (int q = q0; q < E; q++) rg[q - q0] = (VkcRegion){ly->pw + (size_t)(q - q0) * hd, (size_t)(q % ch->Wd) * hd, (size_t)hd};
+            ok = vkc_copy_regions(ch->pull, ly->win, rg, nq);
+            free(rg);
+            if (!ok || ly->ratio <= 0) continue;
+            int r = ly->ratio, g0 = start / r, np = E / r - g0;
+            size_t rf = (size_t)ly->crows * ly->cproj, cp = (size_t)ly->cproj;
+            ok = ch->ks.on || vkc_copy(ch->pull, ly->pc, ly->ckv, (size_t)g0 * hd, (size_t)np * hd);
+            if (ok && r == 4) ok = vkc_copy(ch->pull, ly->pr, ly->ring, 0, 2 * rf);
+            else if (ok) {
+                VkcRegion *rr = malloc((size_t)2 * ly->ns * sizeof *rr);
+                if (!rr) { ok = 0; break; }
+                for (int j = 0; j < ly->ns; j++) {
+                    size_t slot = (size_t)((ly->q1 + j) % r);
+                    rr[2 * j] = (VkcRegion){ly->pr + j * cp, slot * cp, cp};
+                    rr[2 * j + 1] = (VkcRegion){ly->pr + ((size_t)ly->ns + j) * cp, rf + slot * cp, cp};
+                }
+                ok = vkc_copy_regions(ch->pull, ly->ring, rr, 2 * ly->ns);
+                free(rr);
+            }
+            if (!ok || !ly->idx) continue;
+            int k0 = start / 4, nk = E / 4 - k0;
+            ok = vkc_copy(ch->pull, ly->pk, ly->ikey, (size_t)k0 * ch->ID, (size_t)nk * ch->ID) &&
+                 vkc_copy(ch->pull, ly->pir, ly->iring, 0, (size_t)2 * 8 * 2 * ch->ID);
+        }
+        ok = ok && vkc_submit(1);
+        V4C_LO_DRAIN();
+        if (ok) memcpy(next, vkc_ptr(ch->xd), (size_t)n * HD * sizeof(float));
+        if (ok) vkc_dwin(0);
+    }
+#undef V4C_LO_TAP
+#undef V4C_LO_DRAIN
+    if (!ok) fprintf(stderr, "[VK] %s chain: a frame failed in the layer-ordered prompt\n", v4c_name(ch));
+    free(sp0); free(dq);
+    return ok ? 1 : 0;
+}
+
 static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr, float **next_ptr,
                            ColiDeepSeekV4WindowAttentionState **attention, const ColiDeepSeekV4Config *config,
                            ColiExpertStore *experts, const int *tokens, int start, int n, int pool,
@@ -1235,7 +1607,32 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
     }
     int ok = v4c_scratch(ch, rows, E, LR);
     for (int i = lo; ok && i < L; i++) ok = v4c_cache(ch, &ch->ly[i], E / (ch->ly[i].ratio > 0 ? ch->ly[i].ratio : 1) + 1);
-    int dmoe = ok && v4c_dmoe_arm(ch, rows);   /* COLI_VK_DMOE: one layer's experts in the frame, or none */
+    /* COLI_VK_CHAIN_ORDER=layer: the prompt loop layer-outer (the fork's prefill order --
+     * every prompt position crosses a layer before the next one begins), so one bank or
+     * slot window serves every chunk of a layer. Prompts of more than one chunk only:
+     * one chunk is the same order either way, and a verify keeps its chunk (the GEMV's
+     * bits, as GEMM_ROWS documents). The activations of the whole prompt stay resident
+     * across a layer's pass (xall, and xd grown to the prompt); a refusal runs this
+     * prompt in today's chunk order -- the reorder is an order, never a requirement. */
+    int order_layer = v4c_order_layer() && prompt && rows < n;
+    if (order_layer) {   /* the layer order's own buffers: the chunks' lists and RoPE tables side by side, the streams resident */
+        int nch = (n + rows - 1) / rows;
+        if (!v4c_res(&ch->xall, (size_t)n * ch->HD, VKC_DEV) || !v4c_res(&ch->xd, (size_t)n * ch->HD, VKC_DOWN) ||
+            !v4c_res(&ch->list, (size_t)nch * ch->nkind * rows * LR, VKC_DEV) ||
+            !v4c_res(&ch->cs, (size_t)nch * (2 * rows + ch->rmax) * rd, VKC_DEV)) {
+            fprintf(stderr, "[VK] %s chain: COLI_VK_CHAIN_ORDER=layer: the %d-row prompt's streams, lists and tables did not "
+                            "fit beside the chunk's; this prompt keeps the chunk order\n", nmc, n);
+            order_layer = 0;
+            if (!v4c_res(&ch->xd, (size_t)rows * ch->HD, VKC_DOWN) ||
+                !v4c_res(&ch->list, (size_t)ch->nkind * rows * LR, VKC_DEV) ||
+                !v4c_res(&ch->cs, (size_t)(2 * rows + ch->rmax) * rd, VKC_DEV)) {   /* the reserves freed them */
+                fprintf(stderr, "[VK] %s chain: device memory for %d rows at %d positions refused; the CPU runs the layers\n", nmc, rows, E);
+                v4c_off(ch);
+                return 0;
+            }
+        }
+    }
+    int dmoe = ok && v4c_dmoe_arm(ch, rows, order_layer);   /* COLI_VK_DMOE: the armed layer(s)' experts in the frame, or none */
     /* what comes back at the end: the window rows, each layer's new compressed rows and
      * keys, the rings (a ring of ratio r without the overlap: the slots this forward wrote) */
     size_t pn = 0;
@@ -1284,7 +1681,22 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
     float *state = *state_ptr, *next = *next_ptr;
     int T0 = ch->Lm - 3, taps = coli_v4_full_dspark_wanted;   /* DSpark's targets: the model's last three layers
                                                                   * (those the chain runs; the CPU taps the rest) */
-    for (int c0 = 0; c0 < n; c0 += rows) {
+    int done = 0;
+    if (order_layer) {   /* COLI_VK_CHAIN_ORDER=layer: the layer-outer path runs the prompt; 1 done, 0 a lost frame, -1 the MoE's failure */
+        int r = v4c_layer_outer(ch, engine, attention, config, experts, tokens, state, next, start, n,
+                                pool, rows, LR, dmoe, ident, cs, wl, cos_, sin_, error, error_size);
+        if (r < 0) {   /* as the chunk path leaves a failed MoE: the host state is where the forward began */
+            if (pool) coli_v4_expert_store_prefill_pool(experts, -1);
+            vkc_finish();
+            for (int k = 0; k < ch->Wd; k++) ch->slot_pos[k] = -1;   /* some layers wrote this forward's rows */
+            v4c_lower_one(ch, start);
+            free(cs); free(wl); free(cos_); free(sin_);
+            return -1;
+        }
+        if (r == 0) goto lost;
+        done = 1;
+    }
+    for (int c0 = 0; !done && c0 < n; c0 += rows) {
         vkc_dwin(n == 1 ? 1 : prompt ? 2 : 0);   /* DPROF: a forward of one row opens the decode window; a prompt chunk its own (closed at the chunk's end) */
         int nr = n - c0 < rows ? n - c0 : rows, pb = start + c0, last = c0 + nr == n;
         V4cFwd f = {start, n, pb, nr, 0, nr * rd, LR, 0};
@@ -1635,11 +2047,21 @@ static void v4c_report(void) {
              * an armed run whose gate kept the host's step (the tier never held the layer's experts
              * whole) must still say so at exit, not only in the one-time line at its first forward */
             int dn = !ch->d ? vkc_dmoe_layer_env() : 0;   /* the arm is the primary device's */
+            int da = !ch->d ? vkc_dmoe_all_env() : 0;
             if (dn)
                 fprintf(stderr, "[VK] %s chain: COLI_VK_DMOE=%d: layer %d, %llu layer steps through the dmoe path "
                                 "(%llu in-frame, %llu hybrid)%s\n",
                         v4c_name(ch), dn, dn, ch->dm.steps, ch->dm.steps - ch->dm.hyb_steps, ch->dm.hyb_steps,
                         ch->dm.steps ? "" : "; none: the host's step kept every one");
+            else if (da)
+                fprintf(stderr, "[VK] %s chain: COLI_VK_DMOE=all: layers %d..%d, %llu layer steps through the dmoe path "
+                                "(%llu in-frame, %llu hybrid)%s\n",
+                        v4c_name(ch), ch->lo, ch->L - 1, ch->dm.steps, ch->dm.steps - ch->dm.hyb_steps, ch->dm.hyb_steps,
+                        ch->dm.steps ? "" : "; none: the host's step kept every one");
+            if (ch->layer_fwd)
+                fprintf(stderr, "[VK] %s chain: COLI_VK_CHAIN_ORDER=layer: %llu layer-ordered prompt forwards, %llu "
+                                "layer-chunk units (%d layers, chunks of %d rows)\n",
+                        v4c_name(ch), ch->layer_fwd, ch->layer_units, ch->L - ch->lo, ch->rows);
         }
         vkc_dmoe_hyb_report(v4c_name(ch), &ch->dm);
         vkc_prof_print();

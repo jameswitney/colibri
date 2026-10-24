@@ -7,6 +7,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `COLI_VK_CHAIN_ORDER=layer` (DeepSeek V4's chain) + `COLI_VK_DMOE=all` (the dmoe arm's
+  multi-layer form): the prompt loop reordered layer-outer — the fork's own prefill
+  order ("A true prefill is layer-major: every prompt position crosses this layer before
+  the next one begins"), behind a default-off env whose unset value runs today's chunk
+  loop untouched. The layer-outer pass lowers each layer's attention mirrors at its own
+  head (against a pre-pass snapshot of the window rings — the live `slot_pos` follows the
+  earlier layers' chunks), keeps the prompt's streams resident across the layer's pass
+  (`ch->xall`; each layer-chunk unit copies its rows in and out of the chunk's scratch),
+  and lays the chunks' lists and RoPE tables side by side on the device so a later
+  layer's unit reads the chunk it is visiting (`V4cFwd.lbase`). The unit is the chunk
+  path's layer body verbatim — the same frames, the same per-row GEMV batches — so at
+  `COLI_VK_CHAIN_GEMM_ROWS=0` the reorder is bit-neutral by construction (verified
+  bit-equal against the chunk order at the tiny gate) and the default is byte-identical.
+  The loop drives the bank's rotation (`vkt_bank_switch` at each layer head, over the
+  quiescent tail the layer before left): one bank — or one stream-slot window — serves a
+  layer's every chunk before it moves, the at-most-once refill holding per tenure; that
+  is the regime S1's chunk leg measured the absence of (chunk-outer order needs the slots
+  for the other 42 layers every chunk, so the 3.75 GiB carve and the streaming could not
+  coexist). `COLI_VK_DMOE=all` arms the chain's whole lo..L range in one prepare (each
+  layer's gate looked up at its visit, hash layers and gate-less layers masked to the
+  host's step), declining with one line without the layer order. The tier's books and
+  DSpark's taps drain at the loop's wait points (a host-step unit's A1, the split's
+  copy-back, each layer tail) where the frames that wrote them are through. Prompts of
+  more than one chunk only; the reorder declines to the chunk order (one line) where the
+  prompt's streams, lists and tables do not fit beside the chunk's scratch.
 - `COLI_VK_TIER_BANK_LAYER` (the routed-expert tier) + `COLI_VK_DMOE_ROWS_MAX` (the
   dmoe arm's prompt path): the VRAM bank and its frame-split cap. The bank is the fork's
   eg2_bank discipline in the tier's own places — one layer's experts planned whole to
