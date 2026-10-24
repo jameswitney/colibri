@@ -765,7 +765,9 @@ extern void (*coli_v4_expert_store_ram_gave)(void);
  *   join   the taken rows, f32 (the caller rounds each to bf16); 0 = recompute
  *          them on the CPU;
  *   note   an expert the CPU computed, as the store lent it (rows16 or not);
- *   routed a routing the device served: counted as a store lookup counts one. */
+ *   routed a routing the device served: counted as a store lookup counts one;
+ *   bank   the VRAM bank's refill (COLI_VK_TIER_BANK_LAYER), post-router pre-issue:
+ *          the routed ids of the banked layer's step, whatever serves them. */
 typedef struct {
     ColiExpertStore *store;
     int (*issue)(int layer, const float *x, int S, int K, const int *idx, const float *w,
@@ -773,6 +775,7 @@ typedef struct {
     int (*join)(const float **rows);
     void (*note)(const ColiExpertView *view);
     void (*routed)(ColiExpertKey key);
+    void (*bank)(int layer, const int *idx, int n);
 } ColiV4VkTier;
 extern const ColiV4VkTier *coli_v4_vk_tier;
 

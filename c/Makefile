@@ -880,6 +880,13 @@ deepseek-v4-tiny-check: deepseek-v4-tiny-generate
 # tokens equal, as a new expectations file) is in the spec, not silently widened here.
 # COLI_VK_DMOE_ROWS=1 adds the prompt-chunk path (chain_moe_rows.comp's grouped GEMMs);
 # the long case's 72-token prompt crosses the chunk boundary, so both paths run.
+# COLI_VK_TIER_BANK_LAYER=1 runs the same tiny legs with the VRAM bank armed (S1's gate
+# addition): the tier's stream slots carved for layer 1's experts, planned to the device
+# and pinned -- the same token-exact oracle, now over the banked residency (a decline
+# where the tiny budget cannot hold the carve keeps the leg exact, only quieter). The
+# brio leg composes the whole S1 arm's shape: the bank, the chunk rows, and
+# COLI_VK_DMOE_ROWS_MAX's frame split (8-row groups) -- the amdgpu boundary's cap over
+# the banked layer's grouped GEMMs, token-exact.
 deepseek-v4-tiny-check-dmoe: deepseek-v4-tiny-generate
 	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) VK=1 deepseek-v4
@@ -890,6 +897,12 @@ deepseek-v4-tiny-check-dmoe: deepseek-v4-tiny-generate
 		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
 		--fixture $(CURDIR)/deepseek_v4_tiny
 	COLI_VULKAN=1 COLI_VK_DMOE=1 COLI_VK_DMOE_ROWS=1 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_DMOE=1 COLI_VK_TIER_BANK_LAYER=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_DMOE=1 COLI_VK_TIER_BANK_LAYER=1 COLI_VK_DMOE_ROWS=1 COLI_VK_DMOE_ROWS_MAX=8 $(PYTHON) tests/test_deepseek_v4_brio.py \
 		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
 		--fixture $(CURDIR)/deepseek_v4_tiny
 

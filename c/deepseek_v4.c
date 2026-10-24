@@ -5501,6 +5501,7 @@ static void v4_vk_token_issue(V4VkToken *vk, ColiExpertStore *store, int layer,
     for (int k = 0; k < routed; k++)
         coli_v4_expert_store_mfu_record(store, (ColiExpertKey){layer, expert_ids[k]});
     if (!tier || tier->store != store || routed < 1) return;
+    if (tier->bank) tier->bank(layer, expert_ids, routed);   /* COLI_VK_TIER_BANK_LAYER: the bank refills before the issue */
     int full = routed;
     float *xq = v4_vk_round_rows(input, 1, d);
     int *ids = malloc((size_t)full * sizeof(*ids));
@@ -6392,6 +6393,7 @@ static void v4_vk_batch_issue(V4VkBatch *vk, ColiExpertStore *store, int layer,
     coli_v4_expert_store_decode_phase(store, 0);
     if (!tier || tier->store != store) return;
     size_t routes = (size_t)batch * topk;
+    if (tier->bank && routes) tier->bank(layer, indices, (int)routes);   /* COLI_VK_TIER_BANK_LAYER: the bank refills before the issue */
     float *xq = v4_vk_round_rows(inputs, batch, d);
     uint8_t *taken = malloc(routes);
     float *contrib = malloc(routes * d * sizeof(*contrib));
@@ -13959,6 +13961,13 @@ static int v4_vkt_issue(int layer, const float *x, int S, int K, const int *idx,
 }
 static int v4_vkt_join(const float **rows) { return XT(join)(rows); }
 static void v4_vkt_routed(ColiExpertKey key) { coli_v4_expert_store_note_routed(g_v4_vkt.store, key); }
+/* The VRAM bank's refill (COLI_VK_TIER_BANK_LAYER), the engine-thread seam: the routed
+ * ids of the step about to issue, post-router pre-issue -- the bank fills its missing
+ * experts before the tier serves the step (vk_tier.h's vkt_bank_fill). */
+static void v4_vkt_bank(int layer, const int *idx, int n) {
+    if (!v4_vkt_thread()) return;
+    XT(bank_fill)(layer, idx, n);
+}
 static int v4_vkt_in_ram(void *ctx, int layer, int expert) {
     return coli_v4_expert_store_in_ram((ColiExpertStore *)ctx, (ColiExpertKey){layer, expert});
 }
@@ -14302,7 +14311,7 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
         fprintf(stderr, "%s tier deepseek_v4: the stream's fills read past the expert cache "
                 "(%d stages of %d MiB, groups of %d in parallel; COLI_VK_TIER_STREAM_BYPASS)\n",
                 XT_TAG, V4_VKT_STAGE_N, V4_VKT_STAGE_CAP >> 20, V4_VKT_STAGE_N);
-    g_v4_vkt = (ColiV4VkTier){store, v4_vkt_issue, v4_vkt_join, v4_vkt_note, v4_vkt_routed};
+    g_v4_vkt = (ColiV4VkTier){store, v4_vkt_issue, v4_vkt_join, v4_vkt_note, v4_vkt_routed, v4_vkt_bank};
     int all = c->num_hidden_layers * c->n_routed_experts;
     int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
     const char *warm = getenv("COLI_VK_TIER_WARM");   /* 0: no warm start, the tier fills as experts pass by */

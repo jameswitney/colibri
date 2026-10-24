@@ -823,6 +823,48 @@ DSpark stages at three forced acceptances, the default at five. Each must give t
 tokens and serve experts of the extra layers from the device; the sanitizer families run
 one of each.
 
+### The prefill bank (`COLI_VK_TIER_BANK_LAYER`)
+
+The tier's stream slots and one layer's experts are the same bytes doing the same job — a
+per-layer window of expert weights the device reads while a prompt's chunks cross the
+layer. `COLI_VK_TIER_BANK_LAYER=n` exchanges them: layer n's experts are planned whole to
+the device, pinned for the bank's tenure, and the **stream slot budget is carved by the
+bank's bytes** — at DeepSeek V4's scale 256 slots ≈ 3.75 GiB for 256 MXFP4 experts, the
+boot line ledgering `bank=layer 26, 256 experts (3.75 GiB), the stream slots' budget 256
+-> 2`. Two laws hold by construction:
+
+- **The carve law**: the bank and the slot budget never add, and a resident keeps its
+  place. The bank takes the slots' bytes, never the residents' — the measured answer to
+  the silent-take class (`98fcee51`: a device pin that quietly ate the streaming budget
+  halved prefetch and doubled TTFT). A tier whose slots cannot become the bank (fewer
+  slots than the layer has experts, streaming off, or a budget that cannot hold the bank
+  beside the pins and two residents) declines with one line and plans the history's, as
+  before — the operator's `COLI_VK_TIER_STREAM_SLOTS` sizes the slots.
+- **The boundary law**: the carve leaves the chunk-outer staging capacity it replaced,
+  which is the point — the bank answers the same bytes with residency (compute reads
+  VRAM) where the slots answered them with staging (183 GiB of one-shot uploads over a
+  prompt at the standing arm). `COLI_VK_DMOE_ROWS_MAX` (its own row in
+  ENVIRONMENT.md) is the companion cap that keeps each submission under the amdgpu
+  hard-recovery boundary while the banked layer's grouped GEMMs read VRAM.
+
+Because banked experts are ordinary residents, everything downstream is already landed:
+`vkt_dev_table` counts them (the dmoe gate opens with zero new gate code), the host step
+serves them, and the in-frame `COLI_VK_DMOE` path computes them. What the bank adds is
+**tenure discipline**: a per-layer validity bitmap with at-most-once refill — at the
+routed step (post-router, pre-issue) the missing set (routed, not yet valid) loads
+through the engine's bypass group reader (`COLI_VK_TIER_STREAM_BYPASS`'s reader: no
+lease, no cache slot) and uploads sequential into the bank's places, each expert at most
+once per tenure; a failed read is never re-tried, the CPU serves it, and a step of
+another layer is not the bank's. The explicit `vkt_bank_switch` seam moves the bank to
+another layer — the bitmap clears, the old layer's device copies free at a quiescent
+point (their entries publish with the epoch, exactly as a promotion's victim frees do),
+and the new layer's routed experts refill under the same at-most-once rule — the fork's
+own switch discipline, so a rotation never re-reads what a tenure already read. The
+engine's step never switches: this port's chunk-outer order visits every layer each
+chunk, and a bank that followed the visit order would thrash a place a layer — the
+rotation waits for the layer-outer reorder that will drive it. The unit gate covers the
+switch both ways (the 2-layer case), the carve's ledger line, and every decline path.
+
 ### A second device (`COLI_VK_DEV2`)
 
 The dense chain can put layers there too: [Layers on two devices](#layers-on-two-devices).

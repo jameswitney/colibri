@@ -18,6 +18,13 @@
  *            counted by vkt_dev_table whole (the dmoe gate) with no device place taken,
  *            staying put through the books' promotions, and a pool one place short of them
  *            placing none (all or nothing, like the gate);
+ *   bank     COLI_VK_TIER_BANK_LAYER (the VRAM bank): the stream slots carved for the
+ *            banked layer (the ledger line's slot pair), its experts planned whole to
+ *            the device ahead of the history and counted by vkt_dev_table (the dmoe gate),
+ *            the at-most-once refill of what the warm start left un-read through the load
+ *            hooks, the layer-switch rotation (the bitmap clears, the old layer's places
+ *            free, the new layer's routed experts refill at most once, both ways), and
+ *            the declines (out of range, no room): one line each, the plan the history's;
  *   adapt    a budget of a third of the experts and a hot set that moves halfway:
  *            experts are evicted, the new hot set becomes resident and its steps
  *            go to the device;
@@ -955,6 +962,173 @@ static double stream_step(int layer, int S, const int *idx, const float *w, int 
     free(x); free(xq); free(cpu); free(out); free(ref); free(y); free(taken); free(dev); free(res);
     return worst;
 }
+/* COLI_VK_TIER_BANK_LAYER (the VRAM bank, S1's substrate): the stream slots exchanged
+ * for one layer's experts. The carve: the boot ledger line says the slot budget's pair
+ * (12 -> 2 here), the armed plan places the banked layer's experts whole at the device
+ * ahead of the history (all or nothing, like the dmoe gate whose table then counts them
+ * -- vkt_dev_table's n == E with zero new gate code), and the warm start fills them. The
+ * refill: a step of the banked layer fills the experts the warm start left un-read
+ * (still queued) through the load hooks, each at most once a tenure -- a second call
+ * loads nothing, and another layer's step is not the bank's (the engine's seam never
+ * switches: S1's bank holds the env's layer for the run). The rotation (the fork's
+ * layer-switch discipline, the F6 case) is the explicit seam's, vkt_bank_switch: the
+ * bitmap clears, the old layer's experts free their device places, the new layer's
+ * routed experts refill at most once (both ways), and every step's rows stay the
+ * reference's. Declines: an out-of-range layer and a slot
+ * budget too small for the bank each print their one line and leave the plan the
+ * history's. */
+static void bank_layer_case(void) {
+    VktFmt f = {VKT_SRC_I4U_PAIRS_GS, 64};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    uint32_t hist[L][E], *rows[L];           /* layer 0's first two hot; the bank's layer is 1 */
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = l == 0 && e < 2 ? 100u : 0u; }
+    setenv("COLI_VK_TIER_RATE", "0", 1);          /* no promotions: residency moves with the bank alone */
+    setenv("COLI_VK_TIER_FILL", "0", 1);         /* no fill: the history's two, plus the bank's layer */
+    setenv("COLI_VK_TIER_STREAM_SLOTS", "12", 1);
+    setenv("COLI_VK_TIER_BANK_LAYER", "1", 1);
+    set_budget(24, f, f);                         /* 24 experts: 12 slots, 12 residents, the carve trades 10 */
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    vc.load = load_cb; vc.release = release_cb; vc.load_batch = load_batch_cb;
+    uint32_t *tab = malloc((size_t)E * COLI_VK_XB_ENTRY * sizeof(uint32_t));
+    /* the carve's ledger line prints at the tier's own boot, not at the plan */
+    FILE *t = tmpfile(); fflush(stderr);
+    int saved = t ? dup(2) : -1;
+    if (saved >= 0) dup2(fileno(t), 2);
+    int on = vkt_init(&vc, rows);
+    char buf[4096], line[4096] = "";
+    if (saved >= 0) {
+        fflush(stderr); dup2(saved, 2); close(saved); rewind(t);
+        while (fgets(buf, sizeof buf, t)) if (strstr(buf, "bank=layer 1")) snprintf(line, sizeof line, "%s", buf);
+        fclose(t);
+    }
+    fputs(line, stderr);
+    CHECK(on, "bank: the tier did not start");
+    int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+    CHECK((int)strlen(line) > 0 && strstr(line, "the stream slots' budget 12 -> 2"),
+          "bank: the carve's ledger line missing or wrong: %s", line);
+    fputs(line, stderr);
+    int per[L] = {0}, first = 1;
+    for (int i = 0; i < n; i++) { per[pl[i]]++; if (i < E) first &= pl[i] == 1; }
+    CHECK(n == E + 2 && per[1] == E && per[0] == 2 && first,
+          "bank: planned %d experts (layers %d/%d), not the banked layer's %d ahead of the history's 2",
+          n, per[0], per[1], E);
+    for (int i = 0; i < n; i++) {   /* the warm start, three of the banked layer's experts un-read (still queued) */
+        if (pl[i] == 1 && pe[i] >= E - 3) continue;
+        VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s);
+    }
+    vkt_put_done();
+    int res = 0;
+    for (int e = 0; e < E; e++) res += vkt_resident(1, e);
+    CHECK(res == E - 3, "bank: %d of the banked layer's %d resident after the warm start (3 left queued)", res, E);
+    CHECK(tab && vkt_dev_table(1, tab) == E - 3, "bank: the table counts %d of %d (the gate stays shut until the refill)",
+          tab ? vkt_dev_table(1, tab) : -1, E);
+    /* the refill at the routed step (post-router, pre-issue): the queued experts load
+     * through the hooks, the resident ones never re-read */
+    Books bk = {0, 0}; double worst = 0;
+    int idx[8 * K]; float w[8 * K];
+    route(4, 0, E, idx, w);
+    int want = 0;
+    for (int i = 0; i < 4 * K; i++) {   /* the distinct queued experts the step routes */
+        int dup = 0;
+        for (int j = 0; j < i; j++) dup |= idx[j] == idx[i];
+        want += !dup && idx[i] >= E - 3;
+    }
+    g_loads = 0;
+    vkt_bank_fill(1, idx, 4 * K);
+    CHECK(g_loads == want, "bank: the refill loaded %d experts, not the %d queued ones the step routed", g_loads, want);
+    res = 0;
+    for (int e = 0; e < E; e++) res += vkt_resident(1, e);
+    CHECK(res == E && vkt_dev_table(1, tab) == E, "bank: %d of %d resident after the refill, the table whole (the gate opens)", res, E);
+    g_loads = 0;
+    vkt_bank_fill(1, idx, 4 * K);   /* at most once a tenure: nothing left to load */
+    CHECK(g_loads == 0, "bank: the second refill loaded %d experts -- each is at most once a tenure", g_loads);
+    vkt_begin_forward();
+    worst = step(1, 4, idx, w, &bk);
+    CHECK(worst < 2e-3, "bank: the banked layer's rows off the reference (%.3g)", worst);
+    /* another layer's step is not the bank's: S1's engine seam never switches (a chunk-outer
+     * loop visits every layer each chunk, and a bank that followed the visit order would
+     * thrash a place a layer) -- nothing loads, nothing moves */
+    int idx0[8 * K]; float w0[8 * K];
+    route(4, 0, E, idx0, w0);
+    g_loads = 0;
+    vkt_bank_fill(0, idx0, 4 * K);
+    res = 0;
+    for (int e = 0; e < E; e++) res += vkt_resident(1, e);
+    CHECK(g_loads == 0 && res == E, "bank: another layer's step loaded %d experts or moved the bank (%d of %d still resident)",
+          g_loads, res, E);
+    /* the rotation (r2 F6), the explicit seam: switch, then the new layer's routed experts
+     * refill at most once -- the bitmap cleared, the old layer's places freed */
+    int miss0 = 0;
+    for (int i = 0; i < 4 * K; i++) { int dup = 0; for (int j = 0; j < i; j++) dup |= idx0[j] == idx0[i]; miss0 += !dup && !vkt_resident(0, idx0[i]); }
+    vkt_bank_switch(0);
+    g_loads = 0;
+    vkt_bank_fill(0, idx0, 4 * K);
+    CHECK(g_loads == miss0, "bank: the switch refilled %d experts, not the %d missing the step routed", g_loads, miss0);
+    res = 0;
+    int res1 = 0;
+    for (int e = 0; e < E; e++) { res += vkt_resident(0, e); res1 += vkt_resident(1, e); }
+    CHECK(res1 == 0, "bank: %d of the old banked layer's experts still hold device places after the switch", res1);
+    CHECK(res >= 2 + miss0, "bank: the new banked layer holds %d resident (its 2 warm and %d refilled)", res, miss0);
+    g_loads = 0;
+    vkt_bank_fill(0, idx0, 4 * K);   /* at most once holds per layer tenure */
+    CHECK(g_loads == 0, "bank: the switched layer's second refill loaded %d experts", g_loads);
+    vkt_begin_forward();
+    double r0 = step(0, 4, idx0, w0, &bk);
+    if (r0 > worst) worst = r0;
+    CHECK(r0 < 2e-3, "bank: the switched layer's rows off the reference (%.3g)", r0);
+    /* and back: the rotation both ways, the first layer's experts refilled again */
+    vkt_bank_switch(1);
+    g_loads = 0;
+    vkt_bank_fill(1, idx, 4 * K);
+    CHECK(g_loads > 0, "bank: the switch back refilled nothing (the first layer's places were freed)");
+    res1 = 0;
+    for (int e = 0; e < E; e++) res1 += vkt_resident(1, e);
+    CHECK(res1 >= E - 3, "bank: %d of the first banked layer's %d back after the switch back", res1, E);
+    vkt_report("test", 0, 0);
+    vkt_shutdown();
+    /* the declines: out of range and no room, one line each, the plan the lever-free tier's */
+    unsetenv("COLI_VK_TIER_BANK_LAYER");
+    unsetenv("COLI_VK_TIER_STREAM_SLOTS");
+    CHECK(vkt_init(&vc, rows), "bank: the tier did not start lever-free");
+    int fl[L * E], fe[L * E], n0 = vkt_plan(fl, fe, L * E);
+    vkt_shutdown();
+    for (int c = 0; c < 2; c++) {
+        if (!c) setenv("COLI_VK_TIER_BANK_LAYER", "2", 1);
+        else { setenv("COLI_VK_TIER_BANK_LAYER", "1", 1); setenv("COLI_VK_TIER_STREAM_SLOTS", "4", 1); }
+        t = tmpfile(); fflush(stderr);
+        saved = t ? dup(2) : -1;
+        if (saved >= 0) dup2(fileno(t), 2);
+        int on2 = vkt_init(&vc, rows);
+        char dline[4096] = "";
+        int said = 0;
+        if (saved >= 0) {
+            fflush(stderr); dup2(saved, 2); close(saved); rewind(t);
+            while (fgets(buf, sizeof buf, t)) {
+                fputs(buf, stderr);
+                if (strstr(buf, "COLI_VK_TIER_BANK_LAYER")) { said++; if (!dline[0]) snprintf(dline, sizeof dline, "%s", buf); }
+            }
+            fclose(t);
+        }
+        CHECK(on2, "bank: the tier did not start again (decline %d)", c);
+        int ql[L * E], qe[L * E], m = vkt_plan(ql, qe, L * E);
+        int same = m == n0, qper[L] = {0};
+        for (int i = 0; i < m; i++) qper[ql[i]]++;
+        for (int i = 0; same && i < m; i++) same = ql[i] == fl[i] && qe[i] == fe[i];
+        CHECK(said == 1 && strstr(dline, c ? "no room" : "out of range"),
+              "bank: the decline said %d lines, not the one %s", said, c ? "no-room" : "out-of-range");
+        CHECK(same && !qper[1], "bank: the declined lever moved the plan (%d experts, the lever-free %d, layer 1's %d of them)",
+              m, n0, qper[1]);
+        printf("  bank layer, %s: the plan the lever-free tier's %d experts exactly -- nothing placed\n", c ? "no room" : "out of range", m);
+        vkt_shutdown();
+        unsetenv("COLI_VK_TIER_STREAM_SLOTS");
+    }
+    free(tab);
+    unsetenv("COLI_VK_TIER_BANK_LAYER"); unsetenv("COLI_VK_TIER_STREAM_SLOTS");
+    unsetenv("COLI_VK_TIER_FILL"); unsetenv("COLI_VK_TIER_RATE");
+    setenv("COLI_VK_TIER_HOST", "0", 1);
+    model_free();
+}
+
 static void stream(void) {
     struct { VktFmt gu, dn; int act; const char *name; } cs[] = {
         {{VKT_SRC_I4U_PLANAR64, 64}, {VKT_SRC_I4U_PLANAR64, 64}, VKT_ACT_SWIGLU, "planar int4-g64"},
@@ -2342,6 +2516,7 @@ int main(int argc, char **argv) {
     printf("hot set:\n"); hotset();
     printf("pin layer:\n"); pin_layer();
     printf("pool layer:\n"); pool_layer();
+    printf("bank layer:\n"); bank_layer_case();
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
     printf("stream batch:\n"); stream_batch();

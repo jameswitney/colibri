@@ -2729,7 +2729,7 @@ int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r
     KC.kind = PK_MOE;
     int E = p->E;
     if (p->S < 1 || p->K < 1 || p->K > VKC_ROUTE_KMAX || E < 1 || E > VKC_ROUTE_EMAX || p->act != 0 || p->D % 64 ||
-        p->I % 64 || p->t_off < 0 || p->x_off || !x || !ids || !w || !table || !y || !r || !vkc_moe_rows_ready(p->gfmt, p->dfmt)) return 0;
+        p->I % 64 || p->t_off < 0 || p->x_off < 0 || !x || !ids || !w || !table || !y || !r || !vkc_moe_rows_ready(p->gfmt, p->dfmt)) return 0;
     size_t pairs = (size_t)p->S * p->K;
     int nob1 = (p->I + 31) / 32, nob0 = (p->D + 63) / 64;
     /* a pass's items at most: every expert's partial tile and the pairs' whole ones */
@@ -2757,6 +2757,7 @@ int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r
     size_t pgb = mg ? sizeof pmg : sizeof pg;
     size_t eb0 = (size_t)16 * E * 4;   /* the down pass's table */
     VkcBind gb[5] = {B(x, 0), B(r->items, 0), {r->etab->buf, 0, eb0, 0}, B(r->hid, 1), B(r->amap, 0)};
+    gb[0].off = (VkDeviceSize)p->x_off * 4u;   /* COLI_VK_DMOE_ROWS_MAX's split: a row group's x begins at its own rows */
     r->etab->last_frame = KC.serial;
     /* on the matrix units unless the caller keeps the floats (p->floats: the tier's host pool,
      * whose experts the GEMMs read over PCIe; there the floats' were faster) */

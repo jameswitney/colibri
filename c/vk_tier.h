@@ -343,6 +343,21 @@ int  vkt_dev_table(int layer, uint32_t *entries);
 void vkt_dev_count(int layer, int S, int K, const int *idx);
 void vkt_settle(void);
 int  vkt_dev_changes(unsigned since, int *slots, int max);
+/* The VRAM bank's refill (COLI_VK_TIER_BANK_LAYER, vk_tier.c "the VRAM bank"): at the
+ * banked layer's routed step, post-router and pre-issue -- the engine's tier seam --
+ * with idx the step's routed expert ids (rank order, -1 a free slot, any count). The
+ * missing set -- routed, not valid yet, not tried this tenure -- loads through
+ * VktConfig.load_batch (the bypass group reader where the engine armed it) and uploads
+ * sequential into the bank's places, each expert at most once a tenure; a failure is
+ * never re-read until the layer switches, the CPU serves it. A step of another layer is
+ * not the bank's: the env's layer holds the places for the run.
+ * vkt_bank_switch moves them to another layer (the fork's switch discipline: the bitmap
+ * clears, the old layer's device copies free at a quiescent point, the new layer's
+ * places queue) -- the rotation seam S3's layer-outer loop drives; no engine calls it
+ * in S1. No-op without the tier or the bank (the default): nothing arms, nothing
+ * changes. */
+void vkt_bank_fill(int layer, const int *idx, int n);
+void vkt_bank_switch(int layer);
 /* The dense chain's hybrid steps (vk_dmoe.h): an expert of the host pool the CPU can
  * compute in place (a GGUF block type: its rows as the file has them, in system RAM) gets
  * a zero entry, so the device skips it, and its rows in hx[e]; every other expert's entry
@@ -428,6 +443,8 @@ static inline unsigned vkt_epoch(void){return 0;}
 static inline int  vkt_dev_table(int l,uint32_t *e){(void)l;(void)e;return -1;}
 static inline void vkt_dev_count(int l,int S,int K,const int *i){(void)l;(void)S;(void)K;(void)i;}
 static inline void vkt_settle(void){}
+static inline void vkt_bank_fill(int l,const int *i,int n){(void)l;(void)i;(void)n;}
+static inline void vkt_bank_switch(int l){(void)l;}
 #endif
 
 #endif

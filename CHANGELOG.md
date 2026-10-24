@@ -7,6 +7,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `COLI_VK_TIER_BANK_LAYER` (the routed-expert tier) + `COLI_VK_DMOE_ROWS_MAX` (the
+  dmoe arm's prompt path): the VRAM bank and its frame-split cap. The bank is the fork's
+  eg2_bank discipline in the tier's own places — one layer's experts planned whole to
+  the device, pinned for the tenure, and paid for by an explicit carve of the stream
+  slots' budget (256 slots ≈ 3.75 GiB → DeepSeek V4's 256 MXFP4 experts at the standing
+  arm), so the bank and the slots never add and a resident keeps its place; the boot
+  line ledgers the trade and every decline (out of range, a hash layer, streaming off,
+  no room) prints one line and leaves the plan the history's. Because banked experts are
+  ordinary residents, `vkt_dev_table` counts them with no new gate code (the dmoe gate
+  opens — the POOL_LAYER precedent), and the bank adds the tenure discipline the slots
+  never had: a per-layer validity bitmap with at-most-once refill at the routed step
+  (post-router, pre-issue, through the bypass group reader), and an explicit switch seam
+  (`vkt_bank_switch`) that clears the bitmap, frees the old layer's places at a
+  quiescent point and refills the new layer's under the same at-most-once rule — a
+  rotation never re-reads what a tenure already read, and the engine's step never
+  rotates the bank (the chunk-outer order would thrash a place a layer; the layer-outer
+  reorder is what will drive it). `COLI_VK_DMOE_ROWS_MAX=R` caps the rows a dmoe frame's grouped GEMMs may
+  carry, `vkc_submit` + `vkc_begin` between row groups (the `vkc_layer_recorded`
+  pattern), each group routing its own rows into its own slice of the routed sum — the
+  amdgpu hard-recovery boundary (~2–4 s of GPU work in one submission; the armed chunk
+  lost the device at model scale) becomes a knob while the bits stay the whole chunk's
+  (the split-vs-unsplit unit gate is bit-exact). Both default off, byte-identical; the
+  unit gates cover the carve's ledger, the 2-layer rotation both ways, the declines, and
+  the split at equal rows, and the tiny dmoe check runs a bank-armed leg token-exact.
 - `COLI_VK_CHAIN_DPROF` (the chain, the tier, the V4 CLI bench): G1's slice S0 — the
   instrumented decode window that settles whether the ~200 ms/token fence-wait-versus-
   device-time gap is real before any code slice spends on it. `1` (default unset,

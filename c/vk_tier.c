@@ -206,6 +206,18 @@ static struct {
      * hot_order/n_hot_order the ranking it keeps them in */
     int hot, hot_scope, hot_update, hot_hash, pin_layer, pool_layer, npin, n_hot_order, *hot_order;
     uint8_t pool_said;
+    /* the VRAM bank (COLI_VK_TIER_BANK_LAYER): the tier's stream slots exchanged for one
+     * layer's experts, resident on the device and pinned for the bank's tenure. bank_layer
+     * the env's layer (-1 off), bank_on armed after the carve found the room, bank_cur the
+     * layer its places hold now (the env's at boot; a rotation's vkt_bank_switch moves it),
+     * bank_slots0 the slot budget before the carve (the ledger line's pair), bank_valid /
+     * bank_tried per expert of bank_cur (resident / refilled once this tenure -- at most
+     * once: a failure is never re-read until the layer switch clears both), the counters,
+     * bank_said the one decline line's latch */
+    int bank_layer, bank_on, bank_cur, bank_slots0;
+    uint8_t *bank_valid, *bank_tried;
+    unsigned long long bank_refills, bank_bytes;
+    uint8_t bank_said;
     double dev_ms, cpu_ms, wait_ms;
     unsigned long long rep_routed, rep_served;
     /* streaming (big prefill steps; see "streaming" below) */
@@ -644,6 +656,7 @@ static void quiesce(void) {
             v->hex = h ? h : T.full && v->host ? e : NULL;
             v->ex = e; v->state = VS_RESIDENT; T.resident++; if (kd) T.xres++; else T.dres[pl]++;
             note_change(d[i].layer * T.c.experts + d[i].eid);
+            if (T.bank_on && d[i].layer == T.bank_cur && d[i].eid < T.c.experts) T.bank_valid[d[i].eid] = 1;
             T.uploads++; T.upload_bytes += coli_vk_tensor_bytes(d[i].g) + coli_vk_tensor_bytes(d[i].u) + coli_vk_tensor_bytes(d[i].d);
             if (dv) T.d2_uploads++;
         } else {
@@ -869,6 +882,7 @@ static void promote(int layer, int e) {
     VSlot *v = slot(layer, e);
     if (!T.promote_rate || v->state != VS_RESIDENT || !v->host || v->up || kind_of(layer) || T.upromos >= T.promote_rate) return;
     if (T.pool_layer == layer) return;   /* COLI_VK_TIER_POOL_LAYER: that layer's residency is the pool, pinned there (hot_pin) -- moving it up would take the device places the lever promises not to touch */
+    if (T.bank_on && layer == T.bank_cur) return;   /* the bank's layer: its residency is the carve's, pinned (hot_pin) -- the same promise, the device's places */
     if (!v->hex) {
         if (!T.dmax[2]) return;   /* no pool behind it: nothing to copy up from */
         v->hex = v->ex;           /* a partial pool's own copy: the landing keeps it beside the device's */
@@ -957,6 +971,31 @@ int vkt_plan(int *layers, int *eids, int max) {
                     T.engine, T.pool_layer, room < 0 ? 0 : room, E, T.pool_layer);
         T.pool_said = 1;
     }
+    /* COLI_VK_TIER_BANK_LAYER (the S1 fold's substrate): layer n's experts planned into
+     * DEVICE residency, place 0, real expert tensors -- the tier's stream slots exchanged
+     * for a layer (the carve at vkt_init took the slot budget down by this layer's count,
+     * so the places this plans are the slots' bytes with a different tenure: the bank and
+     * the slot budget never add). Ahead of the pin block like the pool's, so a layer two
+     * knobs name stays wherever the first put it; all or nothing, like the dmoe gate it
+     * serves -- the armed layer serves by construction or not at all. The warm start fills
+     * these places (vkt_put); the tier's ordinary paths serve and count them from there
+     * (vkt_dev_table: zero new gate code), hot_pin pins them, and vkt_bank_fill refills a
+     * missing one at most once per layer tenure at the routed step. */
+    if (T.bank_on && !T.bank_said) {
+        int room = T.dmax[0] - T.dres[0] - T.dque[0];
+        if (room >= E && k + E <= max) {
+            for (int e = 0; e < E; e++) {
+                VSlot *v = slot(T.bank_layer, e);
+                if (v->state != VS_NONE) continue;
+                v->state = VS_QUEUED; set_place(v, 0); T.queued++; T.dque[0]++;
+                layers[k] = T.bank_layer; eids[k] = e; k++;
+            }
+            T.bank_cur = T.bank_layer;
+        } else
+            fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_BANK_LAYER=%d: %d device places free of the %d layer %d needs; nothing placed, all or nothing like the dmoe gate (the carve left the room; a smaller COLI_VK_TIER_GB took it)\n",
+                    T.engine, T.bank_layer, room < 0 ? 0 : room, E, T.bank_layer);
+        T.bank_said = 1;
+    }
     /* COLI_VK_TIER_PIN_LAYER (the COLI_VK_DMOE arm's scaffolding): layer n's
      * experts ahead of the history, so the one layer the arm wires is fully resident
      * from the warm start whatever the heat says -- hot_pin has pinned them too, so no
@@ -1040,6 +1079,11 @@ static void hot_pin(void) {
         for (int e = 0; e < E; e++) slot(T.pool_layer, e)->pin = 1;
         pinned = E;
     }
+    if (T.bank_on && T.bank_cur >= 0 && T.bank_cur < T.main_layers) {   /* the bank's layer: its places are the carve's, held for the tenure */
+        int fresh = 0;
+        for (int e = 0; e < E; e++) { VSlot *v = slot(T.bank_cur, e); if (!v->pin) { v->pin = 1; fresh++; } }
+        pinned += fresh;
+    }
     if (T.pin_layer >= 0 && T.pin_layer < T.main_layers) {   /* the explicit pin wins over the ranking */
         int fresh = 0;
         for (int e = 0; e < E; e++) { VSlot *v = slot(T.pin_layer, e); if (!v->pin) { v->pin = 1; fresh++; } }
@@ -1096,6 +1140,119 @@ int vkt_put(int layer, int eid, const VktExpertSrc *src) {
     return ok;
 }
 void vkt_put_done(void) { if (T.on) quiesce(); }
+
+/* ---- the VRAM bank (COLI_VK_TIER_BANK_LAYER) --------------------------------------
+ * The fork's bank discipline in the tier's own places: the bank holds ONE layer's
+ * experts at a time, and when the layer it holds changes the bitmap clears and the
+ * new layer's routed experts refill the places the old one held -- every expert read
+ * from the store AT MOST ONCE per layer tenure (the fork's route-aware refill: its
+ * CPU union re-read the same experts several times a layer). The switch is explicit
+ * (vkt_bank_switch), driven where nothing reads the old layer's experts -- by the
+ * engine's rule (one step in flight) that is before the new layer's issue: the device
+ * copies free at once, their entries publish with the epoch, and a chain re-reads the
+ * table at its next frame start -- the same contract promote's victim frees keep. */
+static void bank_switch(int layer) {
+    const int E = T.c.experts;
+    if (T.bank_cur >= 0 && T.bank_cur < T.c.layers && T.bank_cur != layer) {
+        for (int e = 0; e < E; e++) {
+            int i = T.bank_cur * E + e;
+            VSlot *v = &T.s[i];
+            v->pin = 0;
+            if (v->state == VS_RESIDENT && !v->host) {
+                if (T.ndfree == T.cdfree) {
+                    int nc = T.cdfree ? 2 * T.cdfree : 64;
+                    ColiVkExpert **n = realloc(T.dfree, (size_t)nc * sizeof(*n));
+                    if (!n) continue;   /* no record for the free: it stays resident, only the bitmap clears */
+                    T.dfree = n; T.cdfree = nc;
+                }
+                T.dfree[T.ndfree++] = v->ex;
+                if (v->hex) {   /* its pool copy takes it back: nothing is copied, the slot keeps serving from the pool */
+                    v->ex = v->hex; v->host = 1; T.dres[0]--; T.dres[2]++;
+                } else {
+                    v->ex = NULL; v->state = VS_NONE; T.resident--; T.dres[0]--;
+                }
+                T.evictions++;
+                note_change(i);
+            } else if (v->state == VS_QUEUED) {   /* a place the refill never filled */
+                v->state = VS_NONE; T.queued--; T.dque[0]--;
+            }
+        }
+        T.bank_cur = layer;
+    } else if (T.bank_cur < 0) T.bank_cur = layer;
+    for (int e = 0; e < E; e++) {   /* the new layer's places, as the plan would have laid them */
+        VSlot *v = slot(layer, e);
+        if (v->state == VS_NONE) { v->state = VS_QUEUED; set_place(v, 0); T.queued++; T.dque[0]++; }
+        v->pin = 1;
+    }
+    memset(T.bank_valid, 0, (size_t)E);   /* the fork's switch clear: the new tenure starts empty */
+    memset(T.bank_tried, 0, (size_t)E);
+    for (int e = 0; e < E; e++) if (slot(layer, e)->state == VS_RESIDENT) T.bank_valid[e] = 1;
+    pthread_mutex_lock(&T.mx); T.evict_pending = T.nevict + T.ndfree; pthread_mutex_unlock(&T.mx);
+    free_victims();   /* nothing in flight here: the frees land now */
+}
+/* The rotation, the explicit seam (S3's layer-outer loop; the unit gate's 2-layer case):
+ * move the bank to another layer. S1's engine seam never calls this -- a chunk-outer
+ * engine visits every layer each chunk, and a bank that followed the visit order would
+ * thrash a place a layer (the fork's prefill is layer-outer, so its bank follows its
+ * loop; the port's S1 holds the env's layer for the run and the rotation waits for the
+ * reorder). */
+void vkt_bank_switch(int layer) {
+    if (!T.on || !T.bank_on || !T.s) return;
+    if (layer < 0 || layer >= T.c.layers) return;
+    if (layer != T.bank_cur) bank_switch(layer);
+}
+/* The refill, at the armed layer's routed step (post-router, pre-issue: the engine's
+ * tier seam): the missing set -- routed, not valid, not tried yet -- loads through the
+ * engine's group reader (the bypass reader where the engine armed it: no lease, no
+ * cache slot, the stage pool's bounded reads) and uploads sequential into the bank's
+ * places, vkt_put_done landing them (the tier's ordinary upload path: its books, the
+ * bitmap and the published table). An expert that fails to load or land is marked
+ * tried -- the CPU serves it and the bank never re-reads it this tenure. A step of
+ * another layer is not the bank's: the env's layer holds the places for the run
+ * (vkt_bank_switch moves them). */
+void vkt_bank_fill(int layer, const int *idx, int n) {
+    if (!T.on || !T.bank_on || !T.s || !idx || n < 1) return;
+    if (layer < 0 || layer >= T.c.layers || layer != T.bank_cur) return;
+    const int E = T.c.experts;
+    uint8_t *seen = malloc((size_t)E);
+    int *eids = malloc((size_t)(n < E ? n : E) * sizeof(int));
+    int nm = 0;
+    if (seen && eids) {
+        memset(seen, 0, (size_t)E);
+        for (int i = 0; i < n; i++) {
+            int e = idx[i];
+            if (e < 0 || e >= E || seen[e]) continue;
+            seen[e] = 1;
+            VSlot *v = slot(layer, e);
+            if (!T.bank_valid[e] && !T.bank_tried[e] && (v->state == VS_NONE || v->state == VS_QUEUED)) eids[nm++] = e;
+        }
+    }
+    free(seen);
+    if (nm < 1) { free(eids); return; }
+    if (!T.c.load_batch && !T.c.load) {   /* no reader: the tenure's tries are spent, the CPU serves the layer */
+        for (int i = 0; i < nm; i++) T.bank_tried[eids[i]] = 1;
+        free(eids);
+        return;
+    }
+    VktExpertSrc srcs[64]; void *hs[64];
+    int at = 0;
+    while (at < nm) {
+        int g = nm - at < 64 ? nm - at : 64, got = 0;
+        if (T.c.load_batch) got = T.c.load_batch(T.c.load_ctx, layer, eids + at, g, srcs, hs);
+        else if (T.c.load(T.c.load_ctx, layer, eids[at], &srcs[0], &hs[0])) got = 1;
+        for (int i = 0; i < got; i++) {   /* what the reader returned: up it goes, one at a time */
+            int e = eids[at + i];
+            T.bank_tried[e] = 1;
+            if (vkt_put(layer, e, &srcs[i])) { T.bank_refills++; T.bank_bytes += T.exp_bytes; }
+            if (T.c.release) T.c.release(T.c.load_ctx, hs[i]);
+        }
+        if (!got) break;   /* the reader failed the group: the rest are spent too */
+        at += got;
+    }
+    for (; at < nm; at++) T.bank_tried[eids[at]] = 1;
+    free(eids);
+    vkt_put_done();   /* the quiescent point: what landed is resident, valid and published */
+}
 
 /* ---- one layer step -------------------------------------------------------------- */
 /* The per-step arrays: assignments (map), groups (bex, brows, bfirst, touched) and
@@ -2907,6 +3064,8 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         T.pin_layer = pl && *pl ? atoi(pl) : -1;
         const char *po = getenv("COLI_VK_TIER_POOL_LAYER");
         T.pool_layer = po && *po ? atoi(po) : -1;
+        const char *bk = getenv("COLI_VK_TIER_BANK_LAYER");
+        T.bank_layer = bk && *bk ? atoi(bk) : -1;
     }
     {
         ColiVkXbStats xs; coli_vk_xb_stats(&xs);
@@ -2921,12 +3080,45 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
          * after this, and staging carves the device's places only) */
         int hotpins = T.hot > 0 ? (int)((long long)T.hot * fit / 100) : 0;
         if (T.pin_layer >= 0 && T.pin_layer < T.main_layers) hotpins += T.c.experts;
+        /* COLI_VK_TIER_BANK_LAYER's carve: the bank's layer, E experts, comes out of the
+         * SLOT budget -- never the residents' -- so the bank and the slots never add and
+         * a resident keeps its place (the 98fcee51 rule: a carve that replaces budget,
+         * never silently takes it). The slots must be able to BECOME the bank: fewer of
+         * them than the bank's experts, or a budget that cannot then hold the bank beside
+         * the pins and two residents, is a decline -- one line, the plan the history's;
+         * the operator's COLI_VK_TIER_STREAM_SLOTS raises them (the standing arm's 256
+         * slots trade exactly for DeepSeek V4's 256-expert layer, ~3.75 GiB of mirror). */
+        if (T.bank_layer >= 0) {
+            char hb[32], he[32];
+            if (T.bank_layer >= T.main_layers)
+                fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_BANK_LAYER=%d is out of range (%d main layers); the bank stays off, the plan the history's\n",
+                        eng, T.bank_layer, T.main_layers);
+            else if (T.bank_layer < T.hot_hash)
+                fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_BANK_LAYER=%d is a hash layer (COLI_VK_TIER_HOT_HASH's first %d); the bank stays off, the plan the history's\n",
+                        eng, T.bank_layer, T.hot_hash);
+            else if (!want_st)
+                fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_BANK_LAYER=%d: streaming is off (COLI_VK_TIER_STREAM=0, or the engine gave no load hooks) -- the carve is the stream slots' bytes and there are none; the bank stays off, the plan the history's\n",
+                        eng, T.bank_layer);
+            else if (slots < T.c.experts || (long long)fit_raw - hotpins < (long long)T.c.experts + 2)
+                fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_BANK_LAYER=%d: no room -- %d stream slots (%s) against the bank's %d experts (%s) and %d pinned places; raise COLI_VK_TIER_STREAM_SLOTS or the budget (COLI_VK_TIER_GB); the bank stays off, the plan the history's\n",
+                        eng, T.bank_layer, slots, human((double)slots * T.exp_bytes, hb, sizeof hb), T.c.experts,
+                        human((double)T.c.experts * T.exp_bytes, he, sizeof he), hotpins);
+            else {
+                T.bank_on = 1; T.bank_cur = T.bank_layer; T.bank_slots0 = slots;
+                slots -= T.c.experts;
+                hotpins += T.c.experts;   /* the bank is pinned (hot_pin): the clamp below keeps its room like a pin's */
+                fprintf(stderr, VKT_TAG " tier %s: bank=layer %d, %d experts (%s), the stream slots' budget %d -> %d (the carve: the bank is the slots' bytes with a different tenure, the residents keep theirs)\n",
+                        eng, T.bank_layer, T.c.experts, human((double)T.c.experts * T.exp_bytes, he, sizeof he), T.bank_slots0, slots);
+            }
+        }
         if (hotpins > 0 && slots > (int)(fit_raw - hotpins)) slots = (int)(fit_raw - hotpins);
         if (want_st && slots >= 2) {
             if (fit > fit_raw - slots) fit = fit_raw - slots;
             T.st_ok = fit >= 2;
             if (!T.st_ok) fit = fit_raw > all ? all : fit_raw;
         }
+        if (T.bank_on && fit > fit_raw - slots)
+            fit = fit_raw - slots;   /* the carve's freed places join the residents even when streaming did not survive it (every slot became the bank) */
         if (T.st_ok) {
             T.st_slots = slots;
             T.st_rows_env = sr && *sr ? atoi(sr) : 0;
@@ -2972,6 +3164,15 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     T.s = calloc((size_t)T.c.layers * T.c.experts, sizeof(VSlot));
     T.grp = malloc((size_t)T.c.experts * sizeof(int));
     if (!T.s || !T.grp) { free(T.s); free(T.grp); return 0; }
+    if (T.bank_on) {   /* the bank's bitmaps (the carve above armed it) */
+        T.bank_valid = calloc((size_t)T.c.experts, 1);
+        T.bank_tried = calloc((size_t)T.c.experts, 1);
+        if (!T.bank_valid || !T.bank_tried) {
+            free(T.bank_valid); free(T.bank_tried);
+            T.bank_valid = T.bank_tried = NULL; T.bank_on = 0;
+            fprintf(stderr, VKT_TAG " tier %s: no memory for the bank's bitmap; the bank stays off, the plan the history's\n", eng);
+        }
+    }
     for (int e = 0; e < T.c.experts; e++) T.grp[e] = -1;
     T.max_dev_rows = T.c.max_rows > 0 ? T.c.max_rows : 1 << 20;
     T.last_layer = 1 << 30; T.first_layer = -1; T.decay_at = VKT_DECAY_TOKENS;
@@ -3106,6 +3307,14 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
             char hc[32];
             fprintf(stderr, ", %llu host pool experts copied into the slots (%s)", T.pc_experts, human(T.pc_bytes, hc, sizeof hc));
         }
+    }
+    if (T.bank_on) {   /* the bank (COLI_VK_TIER_BANK_LAYER): its standing beside the books it keeps */
+        int nv = 0;
+        char hb[32];
+        for (int e = 0; e < T.c.experts; e++) nv += T.bank_valid[e] != 0;
+        fprintf(stderr, " | bank: layer %d, %d of %d experts valid, %llu refilled (%s), slots %d -> %d",
+                T.bank_cur, nv, T.c.experts, T.bank_refills, human((double)T.bank_bytes, hb, sizeof hb),
+                T.bank_slots0, T.st_ok ? T.st_slots : 0);
     }
     if (T.dmax[2]) {
         ColiVkPoolStats ph; coli_vk_pool_stats(5, &ph);
@@ -3310,6 +3519,7 @@ void vkt_shutdown(void) {
     for (int h = 0; h < 2; h++) { free(T.hf[h].slot); free(T.hf[h].yout); }
     free(T.d2_idx); free(T.d2_y); free(T.d2_bex); free(T.d2_brows); free(T.d2_bx); free(T.d2_bw);
     free(T.hot_order);
+    free(T.bank_valid); free(T.bank_tried);
     free(T.hy_of); free(T.hy_v); free(T.hy_hx); free(T.hy_x); free(T.hy_gu); free(T.hy_hh); free(T.hy_out); free(T.hy_w); free(T.hy_xb); free(T.hy_src); free(T.bpool);
     memset(&T, 0, sizeof T);
 }

@@ -40,6 +40,8 @@ unsigned cut_epoch(void);
 int  cut_dev_table(int layer, uint32_t *entries);
 void cut_dev_count(int layer, int S, int K, const int *idx);
 void cut_settle(void);
+void cut_bank_fill(int layer, const int *idx, int n);   /* vk_tier.h's: the same tier, compiled here */
+void cut_bank_switch(int layer);                      /* and its rotation seam */
 int  cut_dev_changes(unsigned since, int *slots, int max);
 int  cut_dev_table_hybrid(int layer, uint32_t *entries, VktHostExpert *hx);
 int  cut_dev_entry(int layer, int eid, uint32_t *ent, uint32_t *ent_hybrid, VktHostExpert *hx, uint8_t *host);
@@ -91,5 +93,7 @@ static inline unsigned cut_epoch(void){return 0;}
 static inline int  cut_dev_table(int l,uint32_t *e){(void)l;(void)e;return -1;}
 static inline void cut_dev_count(int l,int S,int K,const int *i){(void)l;(void)S;(void)K;(void)i;}
 static inline void cut_settle(void){}
+static inline void cut_bank_fill(int l,const int *i,int n){(void)l;(void)i;(void)n;}
+static inline void cut_bank_switch(int l){(void)l;}
 #endif
 #endif

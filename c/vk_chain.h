@@ -455,10 +455,12 @@ int vkc_moe_ready(void);
  * grouped GEMMs (qmatmul_grp_gate_up_bd.comp, qmatmul_grp_bd.comp) — or, gfmt and dfmt
  * both 7, fmt 7's (qmatmul_grp_mx.comp, in floats) — over the tiles of each
  * expert's rows, dispatched with the counts the device wrote, then each row's sum over its
- * experts in rank order. p as vkc_moe's with x_off 0, act 0, E, gfmt and dfmt (the layer's
- * experts' formats), D and I multiples of 64; y as vkc_moe's. The tables and the
- * rows' hidden and down outputs live in *r between calls (vkc_moe_rows_free). 0 when the
- * device lacks the pipelines (vkc_moe_rows_ready) or a parameter is out of range. */
+ * experts in rank order. p as vkc_moe's with act 0, E, gfmt and dfmt (the layer's
+ * experts' formats), D and I multiples of 64; x_off (floats, like vkc_moe's) may name a
+ * row group's own first row -- COLI_VK_DMOE_ROWS_MAX's frame split calls this once per
+ * group, the ids/w/y offsets of the same group beside it; y as vkc_moe's. The tables and
+ * the rows' hidden and down outputs live in *r between calls (vkc_moe_rows_free). 0 when
+ * the device lacks the pipelines (vkc_moe_rows_ready) or a parameter is out of range. */
 typedef struct { VkcBuf *cnt, *amap, *items, *etab, *aux, *hid, *yk; } VkcMoeRows;
 int vkc_moe_rows_ready(int gfmt, int dfmt);
 int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r, VkcBuf *y, const VkcMoe *p);

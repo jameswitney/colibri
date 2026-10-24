@@ -97,6 +97,8 @@ static const CuTierOps *cut_ops(void) {
 
 /* the tier's names */
 #define vkt_begin_forward cut_begin_forward
+#define vkt_bank_fill cut_bank_fill
+#define vkt_bank_switch cut_bank_switch
 #define vkt_dev_changes cut_dev_changes
 #define vkt_dev_count cut_dev_count
 #define vkt_dev_entry cut_dev_entry
