@@ -53,6 +53,16 @@
  *            streamed, equals the reference, the sum the all-CPU sum, the cold experts
  *            below the rule's rows stay on the CPU, and the resident set is the warm
  *            start's before and after (streaming promotes nothing);
+ *   ring     COLI_VK_TIER_STREAM_RING, the fork's ring on the port's slots: with the env
+ *            off the ring's reader is never called (the default's own leg); with it on,
+ *            every step's rows byte-equal the inline prefetch's (the ring changes
+ *            timing, never bytes) through cut and refusing readers alike (the partial
+ *            contract and the inline fallback); the pipeline hands the next layer's
+ *            predicted set (T.pred) to the worker in the prediction's order and the
+ *            step consumes it without one inline load; a step of another layer runs
+ *            beside a parked job (the join waits only for what it needs) while the next
+ *            prefetch takes it; COLI_VK_TIER_SYNC's quiescent point drains the ring;
+ *            the teardown cancels between reads and never waits out the rest;
  *   layers   formats that change by layer (VktConfig.layer_gate_up/layer_down, a GGUF typed
  *            by layer): every device row equals the reference with the model resident,
  *            with a budget of four (the smaller form's experts take the rooms the bigger
@@ -103,6 +113,7 @@
 #include <string.h>
 #include <math.h>
 #include <unistd.h>
+#include <time.h>
 #include "../backend_vulkan.h"
 #include "../vk_tier.h"
 #include "../ggml_quants.h"   /* the block formats' CPU decoders, the reference of section blocks */
@@ -1502,6 +1513,255 @@ static void stream_batch(void) {
     unsetenv("COLI_VK_TIER_RATE"); unsetenv("COLI_VK_TIER_STREAM_SLOTS");
     unsetenv("COLI_VK_TIER_STREAM_ROWS"); unsetenv("COLI_VK_TIER_FILL");
 }
+/* ---- the stream ring (COLI_VK_TIER_STREAM_RING) ---------------------------------- */
+/* The ring's own reader: a counting hook that can cut its batches (the partial-batch
+ * contract), park inside a read until the test lets it go or a bound passes (the
+ * timing legs: a step of another layer must coexist with the running job, the sync
+ * drain must join it, the teardown must cancel it), or refuse everything (the inline
+ * fallback). g_ring_layer/g_ring_eids record the order one watched job filled. */
+static int g_ring_calls, g_ring_n, g_ring_cut, g_ring_fail, g_ring_park_ms;
+static volatile int g_ring_go, g_ring_in;
+static int g_ring_layer = -1, g_ring_eids[64];
+static double ring_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+static int ring_batch_cb(void *ctx, int layer, const int *eids, int n, VktExpertSrc *srcs, void **hs) {
+    (void)ctx;
+    __atomic_add_fetch(&g_ring_calls, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_ring_in, 1, __ATOMIC_RELAXED);
+    for (int waited = 0; !__atomic_load_n(&g_ring_go, __ATOMIC_RELAXED) && waited < g_ring_park_ms; waited++)
+        usleep(1000);
+    __atomic_store_n(&g_ring_in, 0, __ATOMIC_RELAXED);
+    if (g_ring_fail) return 0;
+    int got = g_ring_cut > 0 && n > g_ring_cut ? g_ring_cut : n;
+    if (got > 64) got = 64;
+    for (int i = 0; i < got; i++) {
+        srcs[i] = src_of(&ex[layer][eids[i]]); hs[i] = &ex[layer][eids[i]];
+        if (layer == g_ring_layer && g_ring_n < 64) g_ring_eids[g_ring_n++] = eids[i];
+    }
+    return got;
+}
+/* A routing that keeps a stable candidate set: experts 2..5 routed three rows or
+ * more each (the four the ring can hold, st_per 4), the residents and the rest cold
+ * and below the rule. Fills g_ring_idx/g_ring_w and returns the per-expert counts. */
+static int g_ring_idx[64 * K]; static float g_ring_w[64 * K];
+static void route_ring(int cnt[E]) {
+    memset(cnt, 0, E * sizeof(int));
+    for (int s = 0; s < 48; s++) {
+        for (int k = 0; k < K; k++) {
+            int e = 2 + (s / 12 + 3 * k) % 4;
+            cnt[e]++;
+            g_ring_idx[s * K + k] = e;
+            g_ring_w[s * K + k] = 0.2f + (float)((s + k) % 5) / 10.0f;
+        }
+    }
+}
+static void stream_ring(void) {
+    VktFmt f = {VKT_SRC_I4U_PAIRS_GS, 64};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    set_budget(16, f, f);
+    setenv("COLI_VK_TIER_RATE", "0", 1);
+    setenv("COLI_VK_TIER_STREAM_SLOTS", "8", 1);   /* st_per 4: the ring's half */
+    setenv("COLI_VK_TIER_STREAM_ROWS", "3", 1);
+    setenv("COLI_VK_TIER_FILL", "0", 1);
+    uint32_t hist[L][E], *rows[L];
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = e < 2 ? 100 - e : 0; }
+    /* mode 0: the hook wired, the env off -- today's inline prefetch, the default's own
+     * leg; mode 1: the ring on, its reader cutting every batch to one (the partial
+     * contract); mode 2: the ring refusing every read -- the inline fill at the step
+     * covers. Every step's rows byte-equal mode 0's: the ring changes timing, never
+     * bytes. */
+    static const int Ss[] = {48, 33, 64, 40};
+    enum { T = sizeof Ss / sizeof *Ss };
+    float *refs[T * L] = {0};
+    int rows_of[T * L] = {0};
+    for (int mode = 0; mode < 3; mode++) {
+        if (mode) setenv("COLI_VK_TIER_STREAM_RING", "1", 1); else unsetenv("COLI_VK_TIER_STREAM_RING");
+        g_ring_cut = mode == 1 ? 1 : 0; g_ring_fail = mode == 2;
+        g_ring_park_ms = 0; __atomic_store_n(&g_ring_go, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_ring_calls, 0, __ATOMIC_RELAXED);
+        rng = 7;
+        VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+        vc.load = load_cb; vc.release = release_cb; vc.ring_batch = ring_batch_cb;
+        int on = vkt_init(&vc, rows);
+        CHECK(on, "stream ring %d: the tier did not start", mode);
+        if (!on) break;
+        int pl[L * E], pe[L * E], np = vkt_plan(pl, pe, L * E);
+        for (int i = 0; i < np; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+        vkt_put_done();
+        unsigned long long streamed = 0;
+        float *mine[T * L];
+        int at = 0;
+        for (int t = 0; t < T; t++)
+            for (int l = 0; l < L; l++) {
+                int S = Ss[t], idx[64 * K]; float w[64 * K];
+                route(S, 0, E, idx, w);
+                vkt_begin_forward();
+                Books bk = {0, 0}; unsigned long long kept = 0;
+                mine[at] = malloc(sizeof(float) * (size_t)S * H);
+                rows_of[at] = S;
+                g_loads = 0;
+                stream_step(l, S, idx, w, 0, &bk, &streamed, &kept, 1, mine[at]);
+                at++;
+            }
+        if (mode)
+            for (int i = 0; i < T * L; i++) {
+                CHECK(refs[i] && mine[i] &&
+                      memcmp(refs[i], mine[i], sizeof(float) * (size_t)rows_of[i] * H) == 0,
+                      "stream ring %d: step %d's rows differ from the inline prefetch's", mode, i);
+                free(mine[i]);
+            }
+        else
+            for (int i = 0; i < T * L; i++) refs[i] = mine[i];
+        CHECK(streamed > 0, "stream ring %d: nothing streamed", mode);
+        if (mode) {
+            CHECK(__atomic_load_n(&g_ring_calls, __ATOMIC_RELAXED) > 0, "stream ring %d: the ring never read", mode);
+            CHECK(g_loads > 0, "stream ring %d: the inline fallback never engaged", mode);
+        } else
+            CHECK(__atomic_load_n(&g_ring_calls, __ATOMIC_RELAXED) == 0,
+                  "stream ring off: the ring's reader was called anyway");
+        printf("  %s: %llu assignments streamed, %d ring reads, %d inline loads\n",
+               mode ? (mode == 2 ? "refusing" : "cutting") : "inline", streamed,
+               __atomic_load_n(&g_ring_calls, __ATOMIC_RELAXED), g_loads);
+        vkt_shutdown();
+    }
+    for (int i = 0; i < T * L; i++) free(refs[i]);
+    model_free();
+
+    /* --- the pipeline: the prediction's order, one layer ahead, taken at the next
+     * prefetch and consumed by the step without one inline load ------------------- */
+    setenv("COLI_VK_TIER_STREAM_RING", "1", 1);
+    g_ring_cut = 0; g_ring_fail = 0; g_ring_park_ms = 0; __atomic_store_n(&g_ring_go, 1, __ATOMIC_RELAXED);
+    model_make(f, f);
+    rng = 3;
+    { VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+      vc.load = load_cb; vc.release = release_cb; vc.ring_batch = ring_batch_cb;
+      CHECK(vkt_init(&vc, rows), "ring pipeline: the tier did not start"); }
+    { int pl[L * E], pe[L * E], np = vkt_plan(pl, pe, L * E);
+      for (int i = 0; i < np; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+      vkt_put_done(); }
+    int cnt[E];
+    route_ring(cnt);
+    Books bk = {0, 0}; unsigned long long streamed = 0, kept = 0;
+    vkt_begin_forward();
+    stream_step(1, 48, g_ring_idx, g_ring_w, 0, &bk, &streamed, &kept, 0, NULL);   /* pred[1] established */
+    int order[E], no = 0;   /* the plan's own rule: est desc, equals keep ascending id */
+    for (int e = 0; e < E; e++)
+        if (cnt[e] >= 3 && !vkt_resident(1, e)) {
+            int at = no++;
+            while (at > 0 && cnt[order[at - 1]] < cnt[e]) { order[at] = order[at - 1]; at--; }
+            order[at] = e;
+        }
+    g_ring_layer = 1; g_ring_n = 0;
+    int handed = vkt_stream_prefetch(0, 48);
+    CHECK(handed == no && handed > 0, "ring pipeline: %d experts handed, %d predicted", handed, no);
+    stream_step(0, 48, g_ring_idx, g_ring_w, 0, &bk, &streamed, &kept, 0, NULL);   /* coexists, no join */
+    vkt_stream_prefetch(1, 48);   /* the take; the last layer submits nothing */
+    g_loads = 0;
+    stream_step(1, 48, g_ring_idx, g_ring_w, 0, &bk, &streamed, &kept, 0, NULL);
+    CHECK(g_ring_n == handed, "ring pipeline: %d of %d handed experts filled", g_ring_n, handed);
+    CHECK(g_loads == 0, "ring pipeline: %d inline loads though the ring held the step's set", g_loads);
+    int order_ok = g_ring_n == handed;
+    for (int i = 0; order_ok && i < handed; i++) order_ok &= g_ring_eids[i] == order[i];
+    CHECK(order_ok, "ring pipeline: the fill order is not the prediction's (first %d vs %d)",
+          g_ring_n > 0 ? g_ring_eids[0] : -1, no > 0 ? order[0] : -1);
+    printf("  pipeline: %d experts one layer ahead, order", handed);
+    for (int i = 0; i < handed; i++) printf(" %d", g_ring_eids[i]);
+    printf("\n");
+    vkt_shutdown(); model_free();
+    g_ring_layer = -1;
+
+    /* --- the join waits only for what it needs: a step of another layer runs beside
+     * the parked job; the next prefetch takes it ---------------------------------- */
+    model_make(f, f);
+    rng = 5;
+    { VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+      vc.load = load_cb; vc.release = release_cb; vc.ring_batch = ring_batch_cb;
+      CHECK(vkt_init(&vc, rows), "ring coexist: the tier did not start"); }
+    { int pl[L * E], pe[L * E], np = vkt_plan(pl, pe, L * E);
+      for (int i = 0; i < np; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+      vkt_put_done(); }
+    route_ring(cnt);
+    vkt_begin_forward();
+    stream_step(1, 48, g_ring_idx, g_ring_w, 0, &bk, &streamed, &kept, 0, NULL);
+    __atomic_store_n(&g_ring_go, 0, __ATOMIC_RELAXED);
+    g_ring_park_ms = 1500; __atomic_store_n(&g_ring_calls, 0, __ATOMIC_RELAXED);
+    g_ring_layer = 1; g_ring_n = 0;
+    handed = vkt_stream_prefetch(0, 48);
+    CHECK(handed > 0, "ring coexist: nothing handed");
+    double t0 = ring_now();
+    stream_step(0, 48, g_ring_idx, g_ring_w, 0, &bk, &streamed, &kept, 0, NULL);
+    double wall = ring_now() - t0;
+    CHECK(wall < 700, "ring coexist: a step of another layer waited %.0f ms on the running job", wall);
+    CHECK(__atomic_load_n(&g_ring_calls, __ATOMIC_RELAXED) == 1,
+          "ring coexist: the job went past its parked read (%d calls)",
+          __atomic_load_n(&g_ring_calls, __ATOMIC_RELAXED));
+    __atomic_store_n(&g_ring_go, 1, __ATOMIC_RELAXED);
+    vkt_stream_prefetch(1, 48);   /* the take: the read this step needs */
+    CHECK(g_ring_n == handed, "ring coexist: the take did not finish the job (%d of %d)", g_ring_n, handed);
+    g_loads = 0;
+    stream_step(1, 48, g_ring_idx, g_ring_w, 0, &bk, &streamed, &kept, 0, NULL);
+    CHECK(g_loads == 0, "ring coexist: %d inline loads after the take", g_loads);
+    printf("  coexist: the other layer's step ran beside the parked job, the take finished it\n");
+    vkt_shutdown(); model_free();
+    g_ring_layer = -1; g_ring_park_ms = 0;
+
+    /* --- COLI_VK_TIER_SYNC's drain: the quiescent point joins the ring too -------- */
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    model_make(f, f);
+    rng = 9;
+    { VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+      vc.load = load_cb; vc.release = release_cb; vc.ring_batch = ring_batch_cb;
+      CHECK(vkt_init(&vc, rows), "ring sync: the tier did not start"); }
+    { int pl[L * E], pe[L * E], np = vkt_plan(pl, pe, L * E);
+      for (int i = 0; i < np; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+      vkt_put_done(); }
+    route_ring(cnt);
+    vkt_begin_forward();
+    stream_step(1, 48, g_ring_idx, g_ring_w, 0, &bk, &streamed, &kept, 0, NULL);
+    __atomic_store_n(&g_ring_go, 0, __ATOMIC_RELAXED);
+    g_ring_park_ms = 1000;
+    vkt_stream_prefetch(0, 48);
+    t0 = ring_now();
+    vkt_settle();   /* a quiescent point: the sync drain joins the worker */
+    wall = ring_now() - t0;
+    CHECK(wall >= 400, "ring sync: the quiescent point did not wait for the ring (%.0f ms)", wall);
+    g_loads = 0;
+    stream_step(1, 48, g_ring_idx, g_ring_w, 0, &bk, &streamed, &kept, 0, NULL);
+    CHECK(g_loads == 0, "ring sync: %d inline loads after the drain", g_loads);
+    printf("  sync drain: the quiescent point waited out the parked read for the ring\n");
+    vkt_shutdown(); model_free();
+    unsetenv("COLI_VK_TIER_SYNC");
+    __atomic_store_n(&g_ring_go, 1, __ATOMIC_RELAXED); g_ring_park_ms = 0;
+
+    /* --- the teardown cancels: never wait out a discarded stream (the fork's #4) -- */
+    model_make(f, f);
+    rng = 13;
+    { VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+      vc.load = load_cb; vc.release = release_cb; vc.ring_batch = ring_batch_cb;
+      CHECK(vkt_init(&vc, rows), "ring teardown: the tier did not start"); }
+    { int pl[L * E], pe[L * E], np = vkt_plan(pl, pe, L * E);
+      for (int i = 0; i < np; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+      vkt_put_done(); }
+    route_ring(cnt);
+    vkt_begin_forward();
+    stream_step(1, 48, g_ring_idx, g_ring_w, 0, &bk, &streamed, &kept, 0, NULL);
+    __atomic_store_n(&g_ring_go, 0, __ATOMIC_RELAXED);
+    g_ring_park_ms = 300; g_ring_cut = 1;   /* 4 reads of 300 ms: 1200 ms the teardown must not pay */
+    __atomic_store_n(&g_ring_calls, 0, __ATOMIC_RELAXED);
+    CHECK(vkt_stream_prefetch(0, 48) > 0, "ring teardown: nothing handed");
+    usleep(100000);   /* the worker is inside its first read */
+    t0 = ring_now();
+    vkt_shutdown();
+    wall = ring_now() - t0;
+    int calls = __atomic_load_n(&g_ring_calls, __ATOMIC_RELAXED);
+    CHECK(wall < 900, "ring teardown: waited %.0f ms on a discarded stream", wall);
+    CHECK(calls <= 2, "ring teardown: %d reads ran after the cancel", calls);
+    printf("  teardown: cancelled, bounded to the read in flight\n");
+    model_free();
+    unsetenv("COLI_VK_TIER_STREAM_RING");
+    unsetenv("COLI_VK_TIER_RATE"); unsetenv("COLI_VK_TIER_STREAM_SLOTS");
+    unsetenv("COLI_VK_TIER_STREAM_ROWS"); unsetenv("COLI_VK_TIER_STREAM_FILL");
+    __atomic_store_n(&g_ring_go, 1, __ATOMIC_RELAXED); g_ring_cut = 0; g_ring_park_ms = 0; g_ring_fail = 0;
+}
 static void stream_commit_failure(const char *spv) {
     setenv("COLI_VK_STAGED", "1", 1);
     setenv("COLI_VK_STAGED_FAULT", "commit:1", 1);
@@ -2865,6 +3125,7 @@ int main(int argc, char **argv) {
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
     printf("stream batch:\n"); stream_batch();
+    printf("stream ring:\n"); stream_ring();
     printf("layers:\n"); layers();
     printf("promote2:\n"); promote_partial_case();
     printf("promote:\n"); promote_case();

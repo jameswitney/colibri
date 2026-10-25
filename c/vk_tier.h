@@ -116,6 +116,19 @@
  *        likely stream while the device works.
  *    COLI_VK_TIER_STREAM=0 turns it off: the tier behaves as without the hooks.
  *
+ *    COLI_VK_TIER_STREAM_RING=1 (with .ring_batch given; default off = the inline
+ *    prefetch above, unchanged) moves the fills onto a worker thread, the fork's ring
+ *    discipline: the prefetch call for layer L joins the ring's job for L (the take) and
+ *    hands the worker the NEXT layer's predicted set (T.pred, the last big step's rows
+ *    per expert at that layer -- where no prediction exists yet, a cold start, nothing
+ *    is handed over and the engine fills inline as before); the worker reads the experts
+ *    through .ring_batch and uploads them into its half of the streaming slots while the
+ *    engine computes layer L, the step joins nothing it does not need, and every miss
+ *    (an unpredicted expert, a refused read, a failed worker) takes the inline fill at
+ *    the step. COLI_VK_TIER_SYNC=1's deterministic drain includes the ring: every
+ *    quiescent point joins the worker too, so what is in the slots at a step depends on
+ *    the routing alone, never on thread timing.
+ *
  * Source kinds (VktSrc) and what the device holds -- the conversion runs on the
  * uploader thread, nothing changes in the engine's RAM:
  *   VKT_SRC_I8_ROW        int8, f32 per row                      -> fmt 1
@@ -231,6 +244,14 @@ typedef struct {
      * the first ones in order. A partial batch is consumed and released before the
      * next batch; 0 falls back to load for the next expert. */
     int  (*load_batch)(void *ctx, int layer, const int *eids, int n, VktExpertSrc *srcs, void **h);
+    /* Optional, with load: the stream ring's own reader (COLI_VK_TIER_STREAM_RING), the
+     * group shape of load_batch called on the ring's worker thread instead of the
+     * engine thread -- straight from the engine's store, off its leases and caches, so
+     * it must take no lock the engine's own loads take (a bypass/pread reader). Only a
+     * leading prefix need be filled (the first ones in order), released by release(ctx,
+     * h) on the same thread; an expert it does not fill stays to the engine's inline
+     * fill at the step. Without it the ring never arms. */
+    int  (*ring_batch)(void *ctx, int layer, const int *eids, int n, VktExpertSrc *srcs, void **h);
     /* Optional: layers past `layers` (an MTP head's) whose experts the engine holds in another
      * form (extra_gate_up, extra_down), with the same geometry: index them layers..
      * layers+extra_layers-1 in every call. They never stream (an MTP head's steps are a few

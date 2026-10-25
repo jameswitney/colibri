@@ -259,6 +259,17 @@ static struct {
      * place by the GEMMs; bpool[e] marks them in the step */
     int pool_copy; uint8_t *bpool;
     unsigned long long pc_experts; double pc_bytes;
+    /* the stream ring (COLI_VK_TIER_STREAM_RING, the fork's v4_ram class): ring_on the
+     * env armed it (and the engine gave ring_batch), ring_run a job's worker is in
+     * flight, ring_lo/hi the slot range the running job owns -- the engine's scans skip
+     * it (the join, not a read, is the handoff), ring_stop the teardown's cancel flag
+     * (polled between reads: never wait out a stream the run is discarding), ring_job
+     * the job itself, ring_half the half the next job takes. ring_ok drops to 0 for
+     * good when a worker could not be made; the inline fill takes over from there. */
+    int ring_on, ring_ok, ring_run, ring_stop, ring_lo, ring_hi, ring_half;
+    pthread_t ring_th;
+    struct VRing *ring_job;
+    unsigned long long ring_jobs, ring_experts;
 } T;
 
 /* "2.31 GiB", "35.0 MiB", "9.5 KiB": the budget lines read on a 24 GB card and a tiny fixture alike */
@@ -646,8 +657,14 @@ static void free_victims(void) {
     pthread_cond_broadcast(&T.cv_room);
     pthread_mutex_unlock(&T.mx);
 }
+static void st_ring_take(void);   /* the stream ring's join (COLI_VK_TIER_STREAM_RING): before any engine touch of the slots it fills */
+static void st_ring_cancel(void);
 static void quiesce(void) {
     if (T.inflight) return;
+    /* COLI_VK_TIER_SYNC=1: the stream ring joins the drain too -- what is in the slots
+     * at a quiescent point then depends on the routing alone, never on thread timing
+     * (the uploader's contract, extended to the ring's worker) */
+    if (T.sync) st_ring_take();
     int freed = 0, had = T.nevict + T.ndfree;
     for (int i = 0; i < T.nevict; i++) {
         VSlot *v = &T.s[T.evict[i]];
@@ -1515,10 +1532,70 @@ static void st_copy_group(int layer, const int *eids, const int *slots, int n, u
     }
     if (good) { T.pc_experts += (unsigned long long)n; T.pc_bytes += bytes; }
 }
+/* A device upload group can exceed the RAM cache. Consume each cache-sized
+ * batch completely before loading the next, which may reuse those RAM slots.
+ * A partial batch is capacity, not a reason to serialize all remaining reads.
+ * Fill the uploader's bounded staging window across the complete group: committing
+ * each expert separately drains that window and waits for a fence after just three
+ * matrices, serializing transfers on discrete GPUs. A failed group is wholly left to
+ * the CPU; no partial expert is published. The reader is a pair of hooks with their
+ * ctx -- the engine's (this thread) or the stream ring's (the ring worker, whose
+ * reader fills only a prefix and has no lone fallback: what it does not fill stays to
+ * the inline fill at the step). stop, polled between reads, is the ring teardown's
+ * cancel (never wait out a stream the run is discarding); pref marks the slots as a
+ * prefetch's (the ring's fills are one). The books land in ms and done -- the caller's,
+ * the engine's T's or the worker's job's, merged at the join. */
+static void st_fill_load(int layer, const int *eids, const int *slots, int n, uint8_t *ok,
+                         int (*batch)(void *, int, const int *, int, VktExpertSrc *, void **),
+                         int (*one)(void *, int, int, VktExpertSrc *, void **), void *ctx,
+                         volatile int *stop, int pref, double *ms, int *done) {
+    VktExpertSrc srcs[64]; void *hs[64];
+    if (n > 64) n = 64;
+    memset(ok, 0, (size_t)n);   /* a reader that fills nothing, or a stop before it, leaves every expert the inline fill's */
+    for (int base = 0; base < n;) {
+        if (stop && __atomic_load_n(stop, __ATOMIC_ACQUIRE)) return;
+        int left = n - base;
+        int got = batch && (left >= 2 || !one) ? batch(ctx, layer, eids + base, left, srcs, hs) : 0;
+        if (got < 0 || got > left) got = 0;
+        if (got) {
+            double t0 = vkt_now_ms();
+            #pragma omp parallel for schedule(dynamic, 1) if (T.st_par)
+            for (int j = 0; j < got; j++)
+                ok[base + j] = (uint8_t)st_put(layer, eids[base + j], &T.st[slots[base + j]], &srcs[j], 0);
+            *ms += vkt_now_ms() - t0;
+            for (int j = 0; j < got; j++) T.c.release(T.c.load_ctx, hs[j]);
+            base += got;
+            continue;
+        }
+        if (!one) return;   /* the ring's reader: the rest are the inline fill's */
+        /* A lone expert, or an engine without a usable batch hook. Its rows can
+         * still convert in parallel (COLI_VK_TIER_STREAM_PAR=0 keeps one thread). */
+        void *h = NULL; VktExpertSrc src;
+        ok[base] = 0;
+        if (one(ctx, layer, eids[base], &src, &h)) {
+            double t0 = vkt_now_ms();
+            ok[base] = (uint8_t)st_put(layer, eids[base], &T.st[slots[base]], &src, T.st_par);
+            *ms += vkt_now_ms() - t0;
+            T.c.release(T.c.load_ctx, h);
+        }
+        base++;
+    }
+    double t0 = vkt_now_ms();
+    ColiVkTensor *tensors[3 * 64]; int nt = 0;
+    for (int i = 0; i < n; i++) if (ok[i])
+        for (int k = 0; k < 3; k++) tensors[nt++] = T.st[slots[i]].t[k];
+    if (nt && !coli_vk_tensor_commit(tensors, nt)) memset(ok, 0, (size_t)n);
+    for (int i = 0; i < n; i++) {
+        VStage *v = &T.st[slots[i]];
+        if (!ok[i]) { v->state = SS_FREE; continue; }
+        v->layer = layer; v->eid = eids[i]; v->state = SS_FILLED; v->pending = 0; v->pref = pref;
+        (*done)++;
+    }
+    *ms += vkt_now_ms() - t0;
+}
 /* experts into slots: pool[i] set (or NULL), the host pool's copied on the device, the rest
  * loaded by the engine and uploaded */
 static void st_fill_group(int layer, const int *eids, const int *slots, int n, uint8_t *ok, const uint8_t *pool, int half) {
-    VktExpertSrc srcs[64]; void *hs[64];
     if (n > 64) n = 64;
     if (pool) {
         int ce[64], cs[64], ci[64], nc = 0, le[64], ls[64], li[64], nl = 0;
@@ -1532,53 +1609,8 @@ static void st_fill_group(int layer, const int *eids, const int *slots, int n, u
         return;
     }
     double ms = 0;
-    /* A device upload group can exceed the RAM cache. Consume each cache-sized
-     * batch completely before loading the next, which may reuse those RAM slots.
-     * A partial batch is capacity, not a reason to serialize all remaining reads. */
-    for (int base = 0; base < n;) {
-        int left = n - base;
-        int got = T.c.load_batch && left >= 2
-                ? T.c.load_batch(T.c.load_ctx, layer, eids + base, left, srcs, hs) : 0;
-        if (got < 0 || got > left) got = 0;
-        if (got) {
-            double t0 = vkt_now_ms();
-            #pragma omp parallel for schedule(dynamic, 1) if (T.st_par)
-            for (int j = 0; j < got; j++)
-                ok[base + j] = (uint8_t)st_put(layer, eids[base + j], &T.st[slots[base + j]], &srcs[j], 0);
-            ms += vkt_now_ms() - t0;
-            for (int j = 0; j < got; j++) T.c.release(T.c.load_ctx, hs[j]);
-            base += got;
-            continue;
-        }
-        /* A lone expert, or an engine without a usable batch hook. Its rows can
-         * still convert in parallel (COLI_VK_TIER_STREAM_PAR=0 keeps one thread). */
-        void *h = NULL; VktExpertSrc src;
-        ok[base] = 0;
-        if (T.c.load(T.c.load_ctx, layer, eids[base], &src, &h)) {
-            double t0 = vkt_now_ms();
-            ok[base] = (uint8_t)st_put(layer, eids[base], &T.st[slots[base]], &src, T.st_par);
-            ms += vkt_now_ms() - t0;
-            T.c.release(T.c.load_ctx, h);
-        }
-        base++;
-    }
-    double t0 = vkt_now_ms();
-    /* Fill the uploader's bounded staging window across the complete group.
-     * Committing each expert separately drains that window and waits for a
-     * fence after just three matrices, serializing transfers on discrete GPUs.
-     * A failed group is wholly left to the CPU; no partial expert is published. */
-    ColiVkTensor *tensors[3 * 64]; int nt = 0;
-    for (int i = 0; i < n; i++) if (ok[i])
-        for (int k = 0; k < 3; k++) tensors[nt++] = T.st[slots[i]].t[k];
-    if (nt && !coli_vk_tensor_commit(tensors, nt)) memset(ok, 0, (size_t)n);
     int done = 0;
-    for (int i = 0; i < n; i++) {
-        VStage *v = &T.st[slots[i]];
-        if (!ok[i]) { v->state = SS_FREE; continue; }
-        v->layer = layer; v->eid = eids[i]; v->state = SS_FILLED; v->pending = 0; v->pref = 0;
-        done++;
-    }
-    ms += vkt_now_ms() - t0;
+    st_fill_load(layer, eids, slots, n, ok, T.c.load_batch, T.c.load, T.c.load_ctx, NULL, 0, &ms, &done);
     T.st_up_ms += ms; T.st_bytes += (unsigned long long)done * T.exp_bytes;
     if (done && ms > 0) { double bw = (double)done * T.exp_bytes / ms; T.bw_up = T.bw_up > 0 ? 0.8 * T.bw_up + 0.2 * bw : bw; }
 }
@@ -1720,8 +1752,11 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
         ndev += cls[e] == BC_DEV; nst += cls[e] == BC_STREAM; nd2 += cls[e] == BC_DEV2;
         if (cls[e] == BC_CPU) { nkept++; kept_rows += cnt[e]; }
     }
-    /* prefetched slots this step does not stream go back */
+    /* prefetched slots this step does not stream go back; the running ring job's half
+     * is the next step's set, not this step's leftovers -- it goes back when its own
+     * step takes it, never here */
     for (int i = 0; T.st && i < T.st_n; i++) {
+        if (T.ring_run && i >= T.ring_lo && i < T.ring_hi) continue;
         VStage *v = &T.st[i];
         if (v->state == SS_FILLED && (v->layer != layer || cls[v->eid] != BC_STREAM)) v->state = SS_FREE;
     }
@@ -1793,6 +1828,7 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
     if (!ok) { free(order); free(bex); free(brows); free(bx); free(bw); free(bidx); free(eslot); T.big = 0; return 0; }
     for (int e = 0; e < E; e++) { eslot[e] = -1; if (cls[e] == BC_DEV) order[no++] = e; }
     for (int i = 0; T.st && i < T.st_n; i++) {
+        if (T.ring_run && i >= T.ring_lo && i < T.ring_hi) continue;   /* the ring's half is another layer's; the join hands it over, never this scan */
         VStage *v = &T.st[i];
         if (v->state == SS_FILLED && v->layer == layer && cls[v->eid] == BC_STREAM && eslot[v->eid] < 0) {
             eslot[v->eid] = i; order[no++] = v->eid;
@@ -1840,9 +1876,17 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
                 for (int o2 = o; o2 < no && gn < room; o2++)
                     if (cls[order[o2]] == BC_STREAM && eslot[order[o2]] < 0) gid[gn++] = order[o2];
                 int nfree = 0;
+                if (T.ring_run) {   /* free room outside the ring's half first; short of it, take the ring (another layer's set) rather than race it */
+                    for (int i = 0; i < T.st_n; i++)
+                        if (!(i >= T.ring_lo && i < T.ring_hi) && T.st[i].state == SS_FREE) nfree++;
+                    if (nfree < gn) st_ring_take();
+                }
                 for (int tries = 0; tries < 3; tries++) {
                     nfree = 0;
-                    for (int i = 0; i < T.st_n && nfree < gn; i++) if (T.st[i].state == SS_FREE) gsl[nfree++] = i;
+                    for (int i = 0; i < T.st_n && nfree < gn; i++) {
+                        if (T.ring_run && i >= T.ring_lo && i < T.ring_hi) continue;
+                        if (T.st[i].state == SS_FREE) gsl[nfree++] = i;
+                    }
                     if (nfree >= gn) break;
                     int old = coli_vk_xb_sub_busy(T.sk % 2) ? (int)(T.sk % 2) : (int)((T.sk + 1) % 2);
                     if (cur && old == curh && cnt_b) old = !curh;   /* never the half being filled */
@@ -1984,17 +2028,15 @@ static int join_big(const float **rows) {
     return 1;
 }
 
-/* layer's likely streamed experts into the free slots, while the device runs its attention */
-int vkt_stream_prefetch(int layer, int S) {
-    if (!T.on || !T.st_ok || T.inflight || layer < 0 || layer >= T.main_layers || S < T.gemm_rows) return 0;
-    if (!coli_vk_xb_ready() || !st_alloc()) return 0;
+/* layer's likely streamed experts, best first: the prediction's rows per expert where
+ * the layer has a big step behind it (T.pred), else the heat; the resident and the
+ * below-rule ones never make the list. cand must hold T.c.experts ints; returns the
+ * count, capped at `cap`. Called on the engine thread (the slot table is read). */
+static int st_prefetch_plan(int layer, int S, int *cand, int cap) {
     const int E = T.c.experts, K = T.c.topk;
     int R = stream_min_rows();
-    /* the slots a step before left filled are free again */
-    for (int i = 0; i < T.st_n; i++) if (T.st[i].state != SS_BUSY) T.st[i].state = SS_FREE;
     double *est = malloc((size_t)E * sizeof(double));
-    int *cand = malloc((size_t)E * sizeof(int));
-    if (!est || !cand) { free(est); free(cand); return 0; }
+    if (!est) return 0;
     double tot = 0;
     if (T.pred && T.pred_ok[layer]) {
         double sum = 0;
@@ -2010,12 +2052,132 @@ int vkt_stream_prefetch(int layer, int S) {
         for (int e = 0; e < E; e++) {
             VSlot *v = slot(layer, e);
             if (v->state == VS_RESIDENT || est[e] < R) continue;
-            int at = nc++;
+            int at = nc;
             while (at > 0 && est[cand[at - 1]] < est[e]) { cand[at] = cand[at - 1]; at--; }
             cand[at] = e;
+            nc++;
         }
+    free(est);
+    if (nc > cap) nc = cap;
+    return nc;
+}
+
+/* ---- the stream ring (COLI_VK_TIER_STREAM_RING) ----------------------------------
+ * The fork's v4_ram class on the port's slots: while the engine computes layer L, a
+ * worker fills the NEXT layer's predicted set into the half of the streaming slots the
+ * step is not using (they alternate -- the half L's own prefilled set sits in is the
+ * one L's sub-batches read, and join_big frees it before the next job takes it). One
+ * job, one worker at a time: the prefetch call for layer L is the fork's switch point --
+ * it joins the running job (the take; the books merge, the slot handoff is the join,
+ * never a concurrent read) and hands the worker layer L+1's plan where a prediction
+ * exists (a cold layer, the first chunk's walk, keeps the inline fill at the step --
+ * the fallback that also covers every miss: an unpredicted expert, a refused read, a
+ * worker that could not be made). The engine's scans skip the running job's slot range;
+ * an inline fill short of room elsewhere joins the ring rather than race it. */
+struct VRing { int layer, n, lo, hi; int *eids; double ms; int done; unsigned long long got; };
+
+static void *st_ring_worker(void *argument) {
+    struct VRing *job = argument;
+    for (int used = 0; used < job->n; used += 64) {   /* the fill group's cap */
+        int gn = job->n - used < 64 ? job->n - used : 64, gsl[64];
+        uint8_t gok[64];
+        for (int i = 0; i < gn; i++) gsl[i] = job->lo + used + i;
+        st_fill_load(job->layer, job->eids + used, gsl, gn, gok, T.c.ring_batch, NULL,
+                     T.c.load_ctx, &T.ring_stop, 1, &job->ms, &job->done);
+        for (int i = 0; i < gn; i++) job->got += gok[i];
+    }
+    return NULL;
+}
+
+/* Join the running job (the take). A cancelled job's books still count what it filled,
+ * but its upload-rate sample does not (a cut-off stream is not a sample -- the fork's
+ * rule); nothing merges twice. */
+static void st_ring_join(int cancelled) {
+    if (!T.ring_run) return;
+    pthread_join(T.ring_th, NULL);
+    T.ring_run = 0;
+    struct VRing *job = T.ring_job;
+    T.ring_job = NULL;
+    if (!job) return;
+    T.pf_n += job->got;
+    T.st_up_ms += job->ms;
+    T.st_bytes += (unsigned long long)job->done * T.exp_bytes;
+    T.ring_experts += job->got;
+    if (!cancelled && job->done && job->ms > 0) {
+        double bw = (double)job->done * T.exp_bytes / job->ms;
+        T.bw_up = T.bw_up > 0 ? 0.8 * T.bw_up + 0.2 * bw : bw;
+    }
+    free(job->eids);
+    free(job);
+}
+
+static void st_ring_take(void) { st_ring_join(0); }
+
+/* The teardown's cancel (the fork's issue #4): ask the worker to stop between reads and
+ * join -- the wait bounds to the read in flight, not the rest of the layer. */
+static void st_ring_cancel(void) {
+    if (!T.ring_run) return;
+    __atomic_store_n(&T.ring_stop, 1, __ATOMIC_RELEASE);
+    st_ring_join(1);
+    __atomic_store_n(&T.ring_stop, 0, __ATOMIC_RELEASE);
+}
+
+/* The prefetch's ring arm: the take of the job that runs, then the next layer's plan to
+ * the worker. Returns the experts handed over, 0 when there was nothing to hand (a
+ * cold layer, the last one), -1 when the ring cannot this time and the inline fill
+ * takes the call. */
+static int st_ring_submit(int layer, int S) {
+    st_ring_take();
+    if (!T.ring_ok) return -1;
+    const int next = layer + 1;
+    if (next >= T.main_layers || !T.pred || !T.pred_ok[next]) return 0;
+    int *cand = malloc((size_t)T.c.experts * sizeof(int));
+    if (!cand) return -1;
+    /* The half the running step is not reading: one sub-batch's worth (st_per), so the
+     * job's set and the step's own fills share the window without meeting. An expert
+     * the engine still holds in RAM is left to the inline fill (its read is cheap). */
+    int nc = st_prefetch_plan(next, S, cand, T.st_per);
+    for (int i = 0; i < nc; i++)
+        if (T.c.in_ram && T.c.in_ram(T.c.ram_ctx, next, cand[i])) { cand[i] = -1; }
+    int n = 0;
+    for (int i = 0; i < nc; i++) if (cand[i] >= 0) cand[n++] = cand[i];
+    if (!n) { free(cand); return 0; }
+    struct VRing *job = calloc(1, sizeof *job);
+    if (!job) { free(cand); return -1; }
+    job->layer = next;
+    job->eids = cand;
+    job->n = n;
+    T.ring_half ^= 1;
+    job->lo = T.ring_half ? T.st_per : 0;
+    job->hi = T.ring_half ? (T.st_per * 2 < T.st_n ? T.st_per * 2 : T.st_n) : T.st_per;
+    T.ring_lo = job->lo; T.ring_hi = job->hi;
+    if (pthread_create(&T.ring_th, NULL, st_ring_worker, job)) {
+        fprintf(stderr, VKT_TAG " tier %s: no thread for the stream ring; the prefetch fills inline for the rest of the run\n", T.engine);
+        T.ring_ok = 0;
+        free(job->eids); free(job);
+        return -1;
+    }
+    T.ring_job = job;
+    T.ring_run = 1;
+    T.ring_jobs++;
+    return n;
+}
+
+/* layer's likely streamed experts into the free slots, while the device runs its attention */
+int vkt_stream_prefetch(int layer, int S) {
+    if (!T.on || !T.st_ok || T.inflight || layer < 0 || layer >= T.main_layers || S < T.gemm_rows) return 0;
+    if (!coli_vk_xb_ready() || !st_alloc()) return 0;
+    if (T.ring_on) {
+        int n = st_ring_submit(layer, S);
+        if (n >= 0) return n;
+    }
+    const int E = T.c.experts;
+    int *cand = malloc((size_t)E * sizeof(int));
+    if (!cand) return 0;
+    /* the slots a step before left filled are free again */
+    for (int i = 0; i < T.st_n; i++) if (T.st[i].state != SS_BUSY) T.st[i].state = SS_FREE;
+    int nc = st_prefetch_plan(layer, S, cand, T.st_n);
     int got = 0, used = 0;
-    if (nc > T.st_n) nc = T.st_n;
     while (used < nc) {   /* groups of a sub-batch's worth, into the slots in order */
         int gn = nc - used < T.st_per ? nc - used : T.st_per, gsl[64]; uint8_t gok[64];
         if (gn > 64) gn = 64;
@@ -2025,7 +2187,7 @@ int vkt_stream_prefetch(int layer, int S) {
         used += gn;
     }
     T.pf_n += (unsigned long long)got;
-    free(est); free(cand);
+    free(cand);
     return got;
 }
 
@@ -2433,6 +2595,10 @@ static const float *hy_keep_x(const float *src) {
 static int issue(int layer, const float *x, int S, int K, const int *idx, const float *w, uint8_t *taken) {
     if (S > 0 && K > 0) memset(taken, 0, (size_t)S * K);
     if (!T.on || T.inflight || layer < 0 || layer >= T.c.layers || S < 1 || K < 1) return 0;
+    /* a decode-class step retires stream slots (decode growth): the ring's half is
+     * not the engine's to take while a job runs -- join it first (a big step coexists
+     * with the running job instead, the halves apart) */
+    if (S <= VKT_UP_ROWS) st_ring_take();
     if (!coli_vk_xb_ready()) {
         if (T.on) { fprintf(stderr, VKT_TAG " tier %s: the device stopped answering, the experts stay on the CPU\n", T.engine); T.on = 0; }
         return 0;
@@ -3408,6 +3574,8 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (pthread_mutex_init(&T.mx, NULL) || pthread_cond_init(&T.cv, NULL) || pthread_cond_init(&T.cv_room, NULL) ||
         pthread_cond_init(&T.cv_done, NULL)) return 0;
     { const char *sy = getenv("COLI_VK_TIER_SYNC"); T.sync = sy && *sy == '1'; }
+    { const char *rg = getenv("COLI_VK_TIER_STREAM_RING"); T.ring_on = rg && *rg && atoi(rg) != 0 && !!T.c.ring_batch; }
+    T.ring_ok = T.ring_on;
     if (pthread_create(&T.th, NULL, uploader, NULL)) return 0;
     T.th_on = 1;
     T.on = 1;
@@ -3436,7 +3604,10 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
             T.uma ? (cap && *cap ? "shared RAM (COLI_VK_TIER_GB)" : "shared RAM: a quarter of what the expert cache leaves")
                   : "device memory", coli_vk_xb_queue_shared() ? "shared" : "own", T.rate,
             T.balance ? ", balanced against the CPU" : "", T.sync ? ", uploads awaited (COLI_VK_TIER_SYNC)" : "");
-    if (T.st_ok) fprintf(stderr, ", streaming cold experts of prompt steps through %d slots", T.st_slots);
+    if (T.st_ok) {
+        fprintf(stderr, ", streaming cold experts of prompt steps through %d slots", T.st_slots);
+        if (T.ring_on) fprintf(stderr, ", the stream ring on (COLI_VK_TIER_STREAM_RING)");
+    }
     if (T.xmax) {
         char hx[32], hp[32];
         fprintf(stderr, "; the extra layers' experts (%d, fmt %d): %d of %s in a pool of %s", T.c.extra_layers,
@@ -3466,6 +3637,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
 
 void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long long disk_loads) {
     if (!T.s) return;
+    if (!T.inflight) st_ring_take();   /* a running job's books merge before the line reads them; a report inside a step waits for its own join */
     /* cu_tier.c compiles this file again for a CUDA device, where the Vulkan chain's
      * accessor is not linked: the env is read here too (the same grammar as vkc_dprof) */
     static int dprof = -1;
@@ -3523,6 +3695,7 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
                 T.st_up_ms > 0 ? (double)T.st_bytes / T.st_up_ms / 1e6 : 0.0, T.st_rows, T.st_subs, T.pf_n, T.pf_used,
                 T.st_kept, T.st_kept_rows, stream_min_rows(), T.st_rows_env > 0 ? " (fixed)" : "");
         if (T.st_sums) fprintf(stderr, ", %llu steps summed on the device", T.st_sums);
+        if (T.ring_jobs) fprintf(stderr, ", the ring %llu jobs (%llu experts)", T.ring_jobs, T.ring_experts);
         if (T.pc_experts) {
             char hc[32];
             fprintf(stderr, ", %llu host pool experts copied into the slots (%s)", T.pc_experts, human(T.pc_bytes, hc, sizeof hc));
@@ -3649,6 +3822,7 @@ static int dev_entry_hybrid(int layer, int e, uint32_t *o, VktHostExpert *hx) {
  * served (the device took every resident one) */
 void vkt_dev_count(int layer, int S, int K, const int *idx) {
     if (!T.on || layer < 0 || layer >= T.c.layers || S < 1 || K < 1 || !idx) return;
+    if (S <= VKT_UP_ROWS) st_ring_take();   /* a decode frame's promote path retires stream slots: the ring joins first (issue's note) */
     if (layer < T.last_layer || T.begin) { T.begin = 0; T.first_layer = layer; new_forward(); }
     if (T.routed_at) {
         uint32_t q = ++T.seq;
@@ -3707,6 +3881,7 @@ void vkt_ram_gave(void) { __atomic_add_fetch(&T.ram_gave, 1, __ATOMIC_RELAXED); 
 
 void vkt_shutdown(void) {
     if (!T.s) return;
+    st_ring_cancel();   /* the ring's worker first: never wait out a stream the teardown discards (the fork's issue #4) */
     if (T.th_on) {
         pthread_mutex_lock(&T.mx); T.stop = 1; pthread_cond_broadcast(&T.cv); pthread_cond_broadcast(&T.cv_room); pthread_cond_broadcast(&T.cv_done); pthread_mutex_unlock(&T.mx);
         pthread_join(T.th, NULL);

@@ -14209,6 +14209,85 @@ static int v4_vkt_load_batch(void *ctx, int layer, const int *eids, int n,
     return got;
 }
 
+/* The stream ring's reader (COLI_VK_TIER_STREAM_RING, the fork's v4_ram_worker class):
+ * v4_vkt_load_batch's shape, called by the tier's ring worker instead of the engine
+ * thread -- so no v4_vkt_thread() gate, no lease fallback, and a stage pool of the
+ * ring's own: the engine's pool above is handed out on the engine thread alone, and
+ * this one on the worker alone (the busy flags and the take below never race, which
+ * is the whole difference from a shared pool). An expert the store already holds in
+ * RAM stops the prefix -- the tier's plan asks in_ram and leaves those out, and one
+ * that slips through stays to the engine's inline fill at the step, like a failed
+ * read: the partial ring is profit, the inline path is the fallback. The buffers are
+ * made once and kept for the process, like the engine's own. */
+static unsigned char *v4_vkt_ring_stage[V4_VKT_STAGE_N];
+static unsigned char v4_vkt_ring_stage_busy[V4_VKT_STAGE_N];
+static int v4_vkt_ring_stage_state;
+static int v4_vkt_ring_stage_init(ColiExpertStore *store) {
+    if (v4_vkt_ring_stage_state) return v4_vkt_ring_stage_state > 0;
+    v4_vkt_ring_stage_state = -1;
+    uint64_t record = coli_v4_expert_store_record_bytes(store);
+    if (!record || record + 8192u > V4_VKT_STAGE_CAP) {
+        fprintf(stderr, "%s tier deepseek_v4: an expert's %.1f MiB does not fit a %d MiB ring stage; "
+                        "the ring's reads stay with the engine's fills\n",
+                XT_TAG, record / 1048576.0, V4_VKT_STAGE_CAP >> 20);
+        return 0;
+    }
+    for (int i = 0; i < V4_VKT_STAGE_N; i++) {
+        if (posix_memalign((void **)&v4_vkt_ring_stage[i], 4096, V4_VKT_STAGE_CAP)) {
+            while (i > 0) compat_aligned_free(v4_vkt_ring_stage[--i]);
+            fprintf(stderr, "%s tier deepseek_v4: no memory for the ring's %d x %d MiB stage pool; "
+                            "the ring's reads stay with the engine's fills\n",
+                    XT_TAG, V4_VKT_STAGE_N, V4_VKT_STAGE_CAP >> 20);
+            return 0;
+        }
+    }
+    v4_vkt_ring_stage_state = 1;
+    return 1;
+}
+static int v4_vkt_ring_batch(void *ctx, int layer, const int *eids, int n,
+                             VktExpertSrc *srcs, void **hs) {
+    ColiExpertStore *store = ctx;
+    if (n > 64) n = 64;
+    if (n < 1 || !v4_vkt_ring_stage_init(store)) return 0;
+    int st[64], plan = 0;
+    for (int i = 0; i < n && plan < V4_VKT_STAGE_N; i++) {
+        if (coli_v4_expert_store_in_ram(store, (ColiExpertKey){layer, eids[i]})) break;
+        int stage = -1;
+        for (int j = 0; j < V4_VKT_STAGE_N; j++)
+            if (!v4_vkt_ring_stage_busy[j]) { v4_vkt_ring_stage_busy[j] = 1; stage = j; break; }
+        if (stage < 0) break;   /* the pool bounds the batch; the rest come next call */
+        st[plan++] = stage;
+    }
+    if (!plan) return 0;
+    void *hh[64];
+    unsigned char ok[64];
+    #pragma omp parallel for schedule(dynamic, 1) if (plan > 1) \
+            num_threads(plan > V4_VKT_STAGE_N ? V4_VKT_STAGE_N : plan)
+    for (int i = 0; i < plan; i++) {
+        V4VkHold *hold = calloc(1, sizeof *hold);
+        ok[i] = 0; hh[i] = NULL;
+        if (!hold) { v4_vkt_ring_stage_busy[st[i]] = 0; continue; }
+        if (!coli_v4_expert_store_read_private(store, (ColiExpertKey){layer, eids[i]},
+                                               v4_vkt_ring_stage[st[i]], &hold->view) &&
+            !v4_vkt_rows(&hold->view, &srcs[i], &hold->buffer)) {
+            hold->stage = st[i];
+            hh[i] = hold;
+            ok[i] = 1;
+        } else {
+            free(hold->buffer);
+            free(hold);
+            v4_vkt_ring_stage_busy[st[i]] = 0;
+        }
+    }
+    int got = 0;
+    while (got < plan && ok[got]) got++;
+    for (int i = 0; i < plan; i++) {
+        if (i < got) hs[i] = hh[i];
+        else if (hh[i]) v4_vkt_unhold(store, hh[i]);          /* a hold made past a failure */
+        else if (st[i] >= 0) v4_vkt_ring_stage_busy[st[i]] = 0;   /* a buffer nothing was read into */
+    }
+    return got;
+}
 
 /* The state the serve's sessions allocate after the tier starts, every slot at the
  * context: the window and compressed KV and the indexer's keys (as the RAM plan's
@@ -14321,7 +14400,10 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
                         ? (size_t)(engine->runtime.ram_budget_bytes - engine->runtime.ram_planned_bytes) : 0,
                     .in_ram = v4_vkt_in_ram, .ram_ctx = store,
                     .load = v4_vkt_load, .release = v4_vkt_unhold, .load_ctx = store,
-                    .load_batch = v4_vkt_bypass ? v4_vkt_load_batch : NULL};
+                    .load_batch = v4_vkt_bypass ? v4_vkt_load_batch : NULL,
+                    /* the ring's reader: the Vulkan backend's commit is any-thread; the CUDA
+                     * tier keeps its fills on the engine thread as before (no armed ring) */
+                    .ring_batch = v4_vkt_bypass && !xt_cuda() ? v4_vkt_ring_batch : NULL};
     /* COLI_VK_TIER_DECODE_GROW's rank: the decode-only counts (.coli_mfu), handed over
      * as rows only where the engine's geometry is the fork table's own (the check is
      * the store unit's, which owns the table's macros); the tier keeps its copy and
