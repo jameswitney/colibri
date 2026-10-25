@@ -264,7 +264,7 @@ PORT_PLAN below is the 2026-10-19/22 decision record; its F-number statuses are 
   tiny ×2 (torch absent — the banked fixture, weights borrowed read-only), tiny-dmoe 8 legs,
   serve-framing, cu_tier syntax; no ENVIRONMENT row (no knob landed).
   Report: `docs/research/AK-pw-a2-zero-disk-decode-2026-10-25.md`.
-## Session 2026-10-25 VI (PW-C3 — the S=1 mHC fusion slice, manager-run parity wave 2)
+## Session 2026-10-25 VII (PW-C3 — the S=1 mHC fusion slice, manager-run parity wave 2)
 
 - **PW-C3 landed on `port/pw-c3`** (from `d30df627`, sole writer): `COLI_VK_CHAIN_MHC_S1`
   (default off, byte-identical unset) — the fork's single-dispatch decode mHC pair
