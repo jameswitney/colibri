@@ -5,6 +5,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `vk-tier-check`/`vk-strict-check` at the W1 hotfix tip (test-only, PW-A2's close): `d73b82e1`
+  made fmt 15 opt-in (`COLI_VK_TIER_FMT15`) without updating PW-D's `packed_scales` unit case,
+  which asserts the packed-form byte shrink (12.75 vs 15.00 MiB, ×1.1765) through
+  `vkt_expert_bytes` — un-armed that now returns the f32 form's bytes, so the case (and the
+  strict gate's unset leg, which re-runs the same binary) failed at every post-hotfix head.
+  The case now keeps its env-independent half (ue8m0↔f32 identity, scale-word counts) in every
+  leg and runs the shrink half in a new armed third leg of `vk-tier-check`
+  (`COLI_VK_TIER_FMT15=1 … fmt15`, the host-pairs pattern, the env set before
+  `tier_fmt15()`'s one-time cache) — which holds whichever way the default later lands.
+
 ### Notes
 
 - The parity wave's decode-disk lane (PW-A2, "zero-disk decode") closed **premise-falsified,

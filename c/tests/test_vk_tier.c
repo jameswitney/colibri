@@ -2634,8 +2634,17 @@ static void host_plan(void) {
 /* fmt 15 (the tier's packed MXFP4: ue8m0 scale bytes) against fmt 7 (f32 scales): the
  * round trip is the identity -- the byte's exponent lands in the float's exponent field
  * (vk_tier.c's expansion, the shaders' decode) -- and the packed form holds 3/4 less
- * scale bytes, the fork's 12.75 MiB expert against the f32 form's 15.0. */
-static void packed_scales(void) {
+ * scale bytes, the fork's 12.75 MiB expert against the f32 form's 15.0.
+ *
+ * The two halves live on different legs since the W1 P0 hotfix (d73b82e1) made the
+ * packed form opt-in: the identity and the scale-word counts are properties of the
+ * formats themselves and run in every leg; the byte-shrink half reads them through
+ * vkt_expert_bytes, whose dev_fmt() routes MXFP4_E8M0 to fmt 15 only while
+ * COLI_VK_TIER_FMT15=1 is armed -- so it runs only in the gate's armed "fmt15" leg
+ * (the env is set at main's top, before tier_fmt15()'s one-time cache). The armed leg
+ * asserts the shrink whichever way the default later lands: if fmt 15 returns to
+ * default-on the env is redundant and every check still holds. */
+static void packed_scales(int bytes) {
     int ident = 1;
     for (int e = 0; e < 256; e++) {   /* byte -> f32 -> byte, both directions the code takes */
         uint32_t u = (uint32_t)e << 23; float f; memcpy(&f, &u, 4);
@@ -2658,6 +2667,7 @@ static void packed_scales(void) {
             CHECK(coli_vk_tensor_scale_count(7, I, O, 32) * 4 == nb * 4,
                   "packed scales: fmt 7 holds 4x the bytes of the ue8m0 store");
         }
+    if (!bytes) return;   /* the shrink half is the armed leg's: the comment above */
     /* DeepSeek V4's geometry: the packed form is the fork's 12.75 MiB expert against 15.0 */
     VktFmt pk = {VKT_SRC_MXFP4_E8M0, 32}, f32s = {VKT_SRC_MXFP4_F32, 32};
     size_t bp = vkt_expert_bytes(4096, 2048, pk, pk), bf = vkt_expert_bytes(4096, 2048, f32s, f32s);
@@ -2673,6 +2683,12 @@ static void packed_scales(void) {
 int main(int argc, char **argv) {
     char buf[1024];
     const char *spv = argc > 1 ? argv[1] : coli_vk_shader_path(buf, sizeof buf);
+    /* the armed leg: the whole default suite with fmt 15 on (the packed form is opt-in
+     * since the W1 P0), so packed_scales' shrink half has the form it asserts and every
+     * other case runs the packed path too. Set before anything can warm tier_fmt15()'s
+     * one-time cache. */
+    int fmt15_leg = argc > 2 && !strcmp(argv[2], "fmt15");
+    if (fmt15_leg) setenv("COLI_VK_TIER_FMT15", "1", 1);
     if (argc > 2 && !strcmp(argv[2], "host-pairs")) {   /* the CPU's integer form: no device, GQ_EXACT unread */
         unsetenv("GQ_EXACT");
         printf("host pairs, the integer form:\n"); host_pairs_case(5e-2);
@@ -2688,7 +2704,7 @@ int main(int argc, char **argv) {
      * reads GQ_EXACT once, so before any case (the integer form: the argument host-pairs) */
     setenv("GQ_EXACT", "1", 1);
     printf("host room:\n"); host_room();   /* pure arithmetic: needs no device */
-    printf("packed scales:\n"); packed_scales();   /* the round trip and the byte arithmetic, before the device's fill */
+    printf("packed scales:\n"); packed_scales(fmt15_leg);   /* the round trip and the byte arithmetic, before the device's fill */
     printf("profile:\n"); profile();   /* pure env: needs no device, before the device's own fill */
     if (!coli_vk_init(spv)) { printf("FAIL: no Vulkan device (shaders %s)\n", spv); return 1; }
     setenv("COLI_VK_TIER_RESERVE_GB", "0", 1);
