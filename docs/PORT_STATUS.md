@@ -229,3 +229,43 @@ PORT_PLAN below is the 2026-10-19/22 decision record; its F-number statuses are 
   138–142 s expectation was D-contingent and is withdrawn). D11 text counts: C0 3/3 stable, 9/9 armed reps
   diverge (G mid-text — the residency class; F/GF from token 1 — the FA numerics class; GF ≠ F: the
   levers are additive in time, not in tokens). Full record: `docs/research/AI-pw-w1-2026-10-25.md`.
+
+## Session 2026-10-26 (PW-Dfix — the fmt-15 P0's root cause, fix, default restored, and the model-smoke gate, lane pw-dfix)
+
+- **Landed on `port/pw-dfix`** (from `d30df627`; this worktree, sole writer; every GPU launch settled to
+  the W1 592 031 744 B baseline, no `/dev/dri` holders): **the W1 P0's root cause found and fixed** — it
+  was never the packed form. `host_pairs` (vk_tier.c), the tier's hybrid CPU path that computes host-pool
+  experts in place, advanced each output row's scale pointer in **float** units while fmt 15's scales are
+  packed **ue8m0 bytes** — every output row past the first read its bytes 4× too deep, past the 262 144-B
+  scale range into the host pool's other bytes: garbage exponents → 2^127-scale weights → non-finite
+  expert rows → one layer below, the router fails exactly as W1 saw; a 1-expert host pool reads past the
+  mapping (SIGSEGV, the crash leg). **Reproduced at model scale deterministically** (the smoke shape:
+  fmt-15 legs rc=1 ×4, `HOST=0` legs rc=0 ×2 — the discriminator), at unit scale (model geometry + forced
+  hybrid: 24 576 non-finite values, fmt 7 clean), and even at H=192 — **the gates had stayed green because
+  `rel()`'s NaN comparison is false** (a non-finite row never raises `worst`; the old hybrid case passed
+  with 27 wrong rows and `worst 0.00e+00`). Fix: **`host_scale_row`** (the byte stride for fmt 15, the f32
+  stride verbatim for the rest — fmt 7 bit-identical by construction), plus the same class closed in
+  `qmatmul_grp_gemv.comp`'s writer tail (`fmt != 15` on the per-row scale multiply — latent: the grouped
+  GEMV needs cooperative matrices this rig lacks), plus `COLI_VK_TIER_FMT15` re-read as asked (the hotfix's
+  process-lifetime cache hid it from a second `vkt_init`).
+- **fmt 15 is the default again** (+17.6 % tier capacity; `COLI_VK_TIER_FMT15=0` the fmt-7 escape hatch).
+  Model-scale evidence: the new smoke gate PASS at defaults, at `=1`, at `=0` (the pre-fix tree fails the
+  same fmt-15 legs deterministically). **The regression test is the minimized repro** (`model_hybrid_case`
+  in test_vk_tier.c — fmt 15 at hidden 4096/inter 2048 with the hybrid forced: 18 rows, 32 768 non-finite
+  pre-fix → 0 post-fix; every row checked finite element-wise, NaN-blindness closed).
+- **The institutional debt paid: `deepseek-v4-smoke`** (make target + `tests/deepseek_v4_smoke.sh`) — the
+  real checkpoint (MODEL env, default the rig's path), ~100-token prompt, 16 tokens; rc=0 + coherent
+  generated_text + no failure lines; **skips cleanly** without model/device/build, **fails** on `/dev/dri`
+  co-tenants; the frozen usage/mfu snapshots copied in where they exist. Wired into the standard set below
+  and the model's Validation section (docs/deepseek-v4.md).
+- **Gates all green on the final tree**: vk-tier (both modes, incl. the new model-geometry case), vk-chain
+  (12 039 frames), strict ×3, tiny CPU+VK token-exact, prefix, brio, dmoe legs (plain/ROWS=1/BANK/BANK+
+  ROWS_MAX=8), serve-framing, cu_tier + vk_tier CUDA syntax, VK_TEST mapped (digest `34df89280461294a`,
+  bit-equal PW-D's) and staged. Closed in passing: the hotfix had flipped the fmt default without re-running
+  the tier gate — `packed_scales` failed at every default run since (it now arms the lever explicitly).
+  **The standard gate set for tier/chain-default slices is now: vk-tier-check, vk-chain-check,
+  vk-strict-check, the tiny oracles (CPU + `COLI_VULKAN=1`), serve-framing, cu_tier syntax, and
+  `deepseek-v4-smoke` at defaults plus any lever the slice arms.** Owed: D's reads re-armed (the −15…−16 s
+  TTFT expectation, still unmeasured); a coop-matrix rig's dispatch check for the grouped GEMV's fmt-15
+  tail; the union prefill router failure should fill `moe_reason()` like the decode path's does. Report:
+  `docs/research/AJ-pw-dfix-2026-10-26.md`.
