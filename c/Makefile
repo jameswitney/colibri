@@ -874,6 +874,18 @@ deepseek-v4-tiny-check: deepseek-v4-tiny-generate
 		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
 		--fixture $(CURDIR)/deepseek_v4_tiny
 
+# deepseek-v4-smoke — the model-scale smoke gate (AI-pw-w1's institutional lesson: a
+# slice that changes a tier/chain default owes one short generation on the real model
+# before merge; the fmt-15 P0's every unit gate stayed green because no unit geometry
+# reaches the model's). The real checkpoint (MODEL, default the rig's path) on a
+# ~100-token prompt for 16 tokens: rc=0, a coherent generated_text, no failure lines.
+# SKIPS cleanly when the model, the Vulkan device or the build is absent; the tier's
+# format lever rides the caller's environment (COLI_VK_TIER_FMT15=0 runs the escape
+# hatch). tests/deepseek_v4_smoke.sh has the cases.
+.PHONY: deepseek-v4-smoke
+deepseek-v4-smoke:
+	bash tests/deepseek_v4_smoke.sh
+
 # COLI_VK_DMOE's own gate (the L2 Stage A wiring, specs/L2-chain-moe-vkdmoe.md section
 # 5.3): the tiny check with the arm on -- the same three harnesses, the same token-exact
 # oracle, one non-hash layer's routed experts in the frame instead of the host's step.
