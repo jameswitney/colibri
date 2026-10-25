@@ -955,7 +955,7 @@ static double stream_step(int layer, int S, const int *idx, const float *w, int 
             if (taken[i] && joined) {
                 for (int d = 0; d < H; d++) dr[d] = v4 ? bf16r(dev[i][d]) : dev[i][d];
                 c = dr;
-                double r = rel(c, y, H); if (r > worst) worst = r;
+                double r = rel(c, y, H); if (!(r <= worst)) worst = r;   /* a NaN counts as the worst */
                 if (!res[i]) (*streamed)++;
             }
             for (int d = 0; d < H; d++) { ref[(size_t)s * H + d] += (v4 ? 1.0f : w[i]) * y[d]; out[(size_t)s * H + d] += (v4 ? 1.0f : w[i]) * c[d]; }
@@ -2405,7 +2405,7 @@ static void v4_hybrid_case(void) {
                     float dr[HF_MAX];
                     expert_v4(&ex[l][idx[i]], xq + (size_t)(i / K) * H, w[i], limit, y);
                     for (int d = 0; d < H; d++) dr[d] = bf16r(rows[i][d]);
-                    double r = rel(dr, y, H); if (r > worst) worst = r;
+                    double r = rel(dr, y, H); if (!(r <= worst)) worst = r;   /* a NaN counts as the worst */
                     same += !memcmp(dr, y, (size_t)H * sizeof(float));
                     dev++;
                 }
@@ -2767,14 +2767,14 @@ static void host_plan(void) {
 
  * scale bytes, the fork's 12.75 MiB expert against the f32 form's 15.0.
  *
- * The two halves live on different legs since the W1 P0 hotfix (d73b82e1) made the
- * packed form opt-in: the identity and the scale-word counts are properties of the
- * formats themselves and run in every leg; the byte-shrink half reads them through
- * vkt_expert_bytes, whose dev_fmt() routes MXFP4_E8M0 to fmt 15 only while
- * COLI_VK_TIER_FMT15=1 is armed -- so it runs only in the gate's armed "fmt15" leg
- * (the env is set at main's top, before tier_fmt15()'s one-time cache). The armed leg
- * asserts the shrink whichever way the default later lands: if fmt 15 returns to
- * default-on the env is redundant and every check still holds. */
+ * The two halves live on different legs: the identity and the scale-word counts are
+ * properties of the formats themselves and run in every leg; the byte-shrink half
+ * reads them through vkt_expert_bytes, whose dev_fmt() routes MXFP4_E8M0 to fmt 15
+ * -- the default again since PW-Dfix fixed the W1 P0's host_pairs stride and undid
+ * the opt-in hotfix (d73b82e1); tier_fmt15() re-reads the env on every call, no
+ * cache. The armed "fmt15" leg still runs the shrink half as the pin: it unsets
+ * the env before the measure, so the assertion reads the tree's default and holds
+ * whichever way the default later lands. */
 static void packed_scales(int bytes) {
 
     int ident = 1;
@@ -2818,10 +2818,11 @@ static void packed_scales(int bytes) {
 int main(int argc, char **argv) {
     char buf[1024];
     const char *spv = argc > 1 ? argv[1] : coli_vk_shader_path(buf, sizeof buf);
-    /* the armed leg: the whole default suite with fmt 15 on (the packed form is opt-in
-     * since the W1 P0), so packed_scales' shrink half has the form it asserts and every
-     * other case runs the packed path too. Set before anything can warm tier_fmt15()'s
-     * one-time cache. */
+    /* the armed leg: the whole default suite with fmt 15 pinned on -- the default
+     * itself again since PW-Dfix, so the env is belt-and-braces: every case runs the
+     * packed path, and packed_scales' shrink half asserts it at the unset default.
+     * tier_fmt15() re-reads the env on every call (no cache), so the set's timing is
+     * free; it stays at main's top regardless. */
     int fmt15_leg = argc > 2 && !strcmp(argv[2], "fmt15");
     if (fmt15_leg) setenv("COLI_VK_TIER_FMT15", "1", 1);
     if (argc > 2 && !strcmp(argv[2], "host-pairs")) {   /* the CPU's integer form: no device, GQ_EXACT unread */
