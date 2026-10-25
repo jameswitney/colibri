@@ -314,21 +314,22 @@ static size_t src_scale_bytes(VktFmt f, int I, int O) {
     return (size_t)O * ng * 4;
 }
 /* The backend format a source kind lands in; 0 when the combination is not one.
- * VKT_SRC_MXFP4_E8M0's scales are ue8m0 bytes: the Vulkan backend can keep them
+ * VKT_SRC_MXFP4_E8M0's scales are ue8m0 bytes: the Vulkan backend keeps them
  * packed (fmt 15, 12.75 MiB a DeepSeek V4 expert against fmt 7's 15.0 -- the expansion
  * to f32 is exact, so the packing changes bytes, never values). The W1 window's P0
- * (AI-pw-w1-2026-10-25) found the packed form corrupts resident-expert compute at
- * model scale -- the router's input goes non-finite one layer below a resident
- * expert, on every arm at the fmt-15 tip, while every unit/tiny gate stayed green
- * (their shapes provably cannot reach the model's) -- so fmt 15 is OPT-IN until that
- * defect is found and fixed: COLI_VK_TIER_FMT15=1 arms the packed form, the f32-scale
- * fmt 7 is the standing default again. The CUDA tier's ops table (cu_xb.cu) has no
- * fmt 15 at all: it keeps the f32-scale form. */
+ * (AI-pw-w1-2026-10-25) was NOT this form itself: host_pairs, the hybrid CPU path that
+ * reads host-pool experts in place, advanced each output row's scale pointer by the
+ * f32-scale stride, so fmt 15's packed bytes were read 4x too deep -- past the scale
+ * range into the pool's other bytes, 2^127-scale garbage, non-finite expert rows and the
+ * router failing one layer below (the unit gates stayed green because their rel()'s NaN
+ * comparison is false: a non-finite row never raises a worst; fixed with host_scale_row,
+ * PW-Dfix -- AJ-pw-dfix-2026-10-26). fmt 15 is the default again; COLI_VK_TIER_FMT15=0
+ * keeps the f32-scale fmt 7. The CUDA tier's ops table (cu_xb.cu) has no fmt 15 at all:
+ * it keeps the f32-scale form. */
 #ifndef COLI_CUDA
-static int tier_fmt15(void) {
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("COLI_VK_TIER_FMT15"); on = e && *e && *e != '0' ? 1 : 0; }
-    return on;
+static int tier_fmt15(void) {   /* COLI_VK_TIER_FMT15: the packed form unless it says 0 */
+    const char *e = getenv("COLI_VK_TIER_FMT15");
+    return !(e && *e == '0') ? 1 : 0;
 }
 #endif
 static int dev_fmt(VktFmt f, int *fmt, int *gs) {
@@ -346,7 +347,7 @@ static int dev_fmt(VktFmt f, int *fmt, int *gs) {
 #ifdef COLI_CUDA
         *fmt = 7;
 #else
-        *fmt = tier_fmt15() ? 15 : 7;   /* opt-in since the W1 P0: see tier_fmt15 above */
+        *fmt = tier_fmt15() ? 15 : 7;   /* COLI_VK_TIER_FMT15=0 keeps fmt 7: see tier_fmt15 above */
 #endif
         *gs = g; return g >= 8 && g % 8 == 0;
     case VKT_SRC_MXFP4_F32: *fmt = 7; *gs = g; return g >= 8 && g % 8 == 0;
@@ -435,7 +436,7 @@ static void convert_par(VktFmt f, int I, int O, const uint8_t *codes, const void
         for (size_t i = 0; i < n; i++) { uint32_t u = (uint32_t)e[i] << 23; memcpy(&sc[i], &u, 4); }
         return;
 #else
-        if (!tier_fmt15()) {   /* fmt 7, the standing default since the W1 P0: expand ue8m0 -> f32 2^(s-127) */
+        if (!tier_fmt15()) {   /* fmt 7, the escape hatch (COLI_VK_TIER_FMT15=0): ue8m0 -> f32 2^(s-127) */
             for (size_t i = 0; i < n; i++) { uint32_t u = (uint32_t)e[i] << 23; memcpy(&sc[i], &u, 4); }
             return;
         }
@@ -2283,6 +2284,17 @@ static void hy_act_v4(float *h, const float *g, const float *u, int I, float lim
 }
 /* pw: the pairs' route weights for DeepSeek V4's expert (hy_act_v4, the weight in the row as
  * the device's), NULL for SwiGLU */
+/* One output row's scales of a matrix the CPU computes from the host pool's rows: the
+ * f32-scale formats stride ng floats a row (host_pairs' callers); fmt 15's are the packed
+ * ue8m0 BYTES, ng a row -- a quarter of the f32 stride, so the two must not share the
+ * pointer arithmetic (the W1 P0: every row past the first read its bytes 4x too deep,
+ * past the scale range into the pool's other bytes, 2^127-scale garbage and non-finite
+ * expert outputs at model scale; AI-pw-w1-2026-10-25, PW-Dfix). */
+static const float *host_scale_row(const float *base, int t, int gs, int I, int row) {
+    size_t ng = gs ? (size_t)((I + gs - 1) / gs) : 1;
+    if (t == -15) return (const float *)((const uint8_t *)base + (size_t)row * ng);   /* a byte a group */
+    return base + (size_t)row * ng;
+}
 static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
                       float limit, int nt, float *gu, float *hh, float *dn, const float *pw) {
     if (np < 1) return 1;
@@ -2335,7 +2347,7 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
             const int g = (int)(r / (2 * I)), o = (int)(r % (2 * I)), q0 = gs[g]; const VktHostExpert *h = hx[ord[q0]];
             const int oo = o < I ? o : o - I;
             const uint8_t *row = (o < I ? h->g : h->u) + (size_t)oo * h->rgu;
-            const float *rs = h->tg < 0 ? (o < I ? h->sg : h->su) + (size_t)oo * (h->gsgu ? (D + h->gsgu - 1) / h->gsgu : 1) : NULL;
+            const float *rs = h->tg < 0 ? host_scale_row(o < I ? h->sg : h->su, h->tg, h->gsgu, D, oo) : NULL;
             host_rows(gu + (size_t)q0 * 2 * I + o, 2 * I, &ag[g], xo + q0, row, h->tg, D, tmp, rs, h->gsgu);
         }
         #pragma omp for schedule(static)
@@ -2358,7 +2370,7 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
         for (int64_t r = 0; r < (int64_t)ng * D; r++) {
             if (!tmp) continue;
             const int g = (int)(r / D), o = (int)(r % D), q0 = gs[g]; const VktHostExpert *h = hx[ord[q0]];
-            const float *rs = h->td < 0 ? h->sd + (size_t)o * (h->gsd ? (I + h->gsd - 1) / h->gsd : 1) : NULL;
+            const float *rs = h->td < 0 ? host_scale_row(h->sd, h->td, h->gsd, I, o) : NULL;
             host_rows(dy + (size_t)q0 * D + o, D, &ah[g], ho + q0, h->d + (size_t)o * h->rd, h->td, I, tmp, rs, h->gsd);
         }
         free(tmp);

@@ -37,6 +37,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   async MoE read+compute lanes (census row 7, never-tested on the port, fork-priced +23 % decode)
   — handed to the campaign as the re-briefed PW-E. Evidence and arithmetic:
   `docs/research/AK-pw-a2-zero-disk-decode-2026-10-25.md`.
+- **PW-Dfix (2026-10-26): the W1 fmt-15 P0 is found, fixed, and fmt 15 is the default
+  again.** The defect was never the packed form itself: `host_pairs` — the tier's hybrid
+  CPU path that computes host-pool experts in place — advanced each output row's *scale*
+  pointer by the f32-scale stride, so fmt 15's packed ue8m0 bytes were read 4× too deep
+  (past the 256 KiB scale range into the host pool's other bytes; a byte ≥ 0xC0 decodes to
+  a scale ≥ 2^65, garbage bytes to 2^127 — non-finite expert rows, and one layer below the
+  router fails exactly as the window saw; a 1-expert pool reads past the mapping and
+  segfaults). Row 0 is always correct — a decode-class step's single-row hybrid pair
+  passes — and no unit geometry leaves the scale range, which is how every gate stayed
+  green while the model died (the green runs also leaned on `rel()`'s NaN comparison being
+  false: a NaN row never raises a `worst`). Fixed by `host_scale_row` (vk_tier.c: the byte
+  stride for fmt 15, the f32 stride for every other format); the same class found and
+  closed in `qmatmul_grp_gemv.comp`'s writer tail (`fmt != 15` added to the per-row scale
+  guard — latent, the grouped GEMV needs cooperative matrices this rig lacks).
+  `COLI_VK_TIER_FMT15` is now the **default-on** form with `0` as the fmt-7 escape hatch;
+  the model-scale evidence: the new `deepseek-v4-smoke` gate PASSes at defaults, with
+  `COLI_VK_TIER_FMT15=1`, and with `=0`, where the pre-fix tree failed the same legs
+  deterministically (rc=1, "chained block failed in MoE"). The regression test is the
+  minimized repro (`model_hybrid_case`, test_vk_tier.c: fmt 15 at hidden 4096/inter 2048
+  with the hybrid forced — 18 rows, 32768 non-finite values pre-fix, clean post-fix).
+  Full record: `docs/research/AJ-pw-dfix-2026-10-26.md`.
 
 - The parity wave's first kernel slice (PW-C1, "move the LM head matmul to the
   device") closed **premise-falsified, no code change**: the head matmul already
@@ -86,7 +107,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   itself now prices. The hotfix keeps all the fmt-15 code and makes it opt-in —
   `COLI_VK_TIER_FMT15=1` arms the packed form (+17.6 % tier capacity at the same bytes
   once its resident-path defect is found and fixed); unset, the f32-scale fmt 7 is the
-  standing default again, byte-identical to the pre-PW-D tier.
+  standing default again, byte-identical to the pre-PW-D tier. **Superseded by PW-Dfix
+  (2026-10-26)**: the defect is found and fixed (the hybrid path's scale stride, not the
+  packed form) and fmt 15 is the default again — see the Notes above and
+  `docs/research/AJ-pw-dfix-2026-10-26.md`.
+- `deepseek-v4-smoke` — the model-scale smoke gate (make target,
+  tests/deepseek_v4_smoke.sh): the W1 window's institutional lesson made standing — a
+  slice that changes a tier/chain default owes one ~2-minute generation on the real model
+  before merge. Runs DeepSeek V4 Flash (MODEL, default the rig's path) on a ~100-token
+  prompt for 16 tokens; checks rc=0, a coherent generated_text, and the failure lines
+  ("chained block failed", "device is lost", a nonzero failed counter); skips cleanly
+  when the model, the Vulkan device or the build is absent, fails when the card has other
+  holders.
 
 - `COLI_VK_TIER_DECODE_GROW` (the Vulkan expert tier, default off): demand-growing decode
   residency — the tier's resident set stops being the warm start's fixed one. At the first

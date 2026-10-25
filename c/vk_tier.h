@@ -371,7 +371,8 @@ void vkt_bank_switch(int layer);
  * a zero entry, so the device skips it, and its rows in hx[e]; every other expert's entry
  * as vkt_dev_table gives it, its hx[e] zero. The count is vkt_dev_table's. */
 /* tg, td: a ggml type (>= 0) or -fmt, colibri's int8 and int4 device formats (fmt 1, 13, 2, 4)
- * with their f32 scales sg/su/sd (a row's, or a group's of gsgu/gsd columns); rgu, rd: bytes a row */
+ * with their scales sg/su/sd -- f32 (a row's, or a group's of gsgu/gsd columns), fmt 15's the
+ * packed ue8m0 bytes, one a group (host_scale_row strides the two apart); rgu, rd: bytes a row */
 typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; const float *sg, *su, *sd; int gsgu, gsd; } VktHostExpert;
 int  vkt_dev_table_hybrid(int layer, uint32_t *entries, VktHostExpert *hx);
 int  vkt_dev_entry(int layer, int eid, uint32_t *ent, uint32_t *ent_hybrid, VktHostExpert *hx, uint8_t *host);
@@ -417,7 +418,7 @@ static inline int vkt_score(int l,uint64_t *s){(void)l;(void)s;return -1;}
 static inline size_t vkt_host_room(size_t avail, size_t budget, size_t spare, int planned, size_t hold){
     (void)avail;(void)budget;(void)spare;(void)planned;(void)hold;return 0;}
 
-typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; const float *sg, *su, *sd; int gsgu, gsd; } VktHostExpert;   /* rgu, rd: bytes a row */
+typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; const float *sg, *su, *sd; int gsgu, gsd; } VktHostExpert;   /* rgu, rd: bytes a row; sg/su/sd: f32 scales, fmt 15's ue8m0 bytes */
 
 static inline int vkt_dev_table_hybrid(int l,uint32_t *e,VktHostExpert *h){(void)l;(void)e;(void)h;return -1;}
 static inline int vkt_dev_entry(int l,int e,uint32_t *t,uint32_t *th,VktHostExpert *h,uint8_t *o){(void)l;(void)e;(void)t;(void)th;(void)h;(void)o;return -1;}

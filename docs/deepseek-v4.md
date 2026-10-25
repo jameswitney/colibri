@@ -513,6 +513,24 @@ python -m pip install -r tools/requirements-deepseek-v4-tiny.txt
 make deepseek-v4-tiny-check
 ```
 
+Model-scale smoke (the real checkpoint, a ~100-token prompt for 16 tokens; needs
+`make deepseek_v4 VK=1`):
+
+```bash
+make deepseek-v4-smoke MODEL=/path/to/DeepSeek-V4-Flash
+```
+
+One short real-model generation is in the standard gate set for a slice that
+changes a tier or chain default: every unit and tiny gate passed the fmt-15
+packed-scale defect of 2026-10-26 because their geometries cannot reach the
+model's resident path, and one ~2-minute generation caught it
+(`docs/research/AJ-pw-dfix-2026-10-26.md`). The gate checks the exit code, a
+coherent generated text, and the failure lines that defect printed; it skips
+cleanly when the model, the Vulkan device or the build is absent, fails when
+the card has other holders, and leaves the model's expert history as it found
+it. The tier's levers ride the caller's environment: `COLI_VK_TIER_FMT15=0`
+runs the same generation on the f32-scale escape hatch.
+
 Real checkpoint oracle:
 
 ```bash
