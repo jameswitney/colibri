@@ -2799,7 +2799,6 @@ static void packed_scales(int bytes) {
             CHECK(coli_vk_tensor_scale_count(7, I, O, 32) * 4 == nb * 4,
                   "packed scales: fmt 7 holds 4x the bytes of the ue8m0 store");
         }
-D
     if (!bytes) return;   /* the shrink half is the armed leg's: the comment above */
     /* DeepSeek V4's geometry: the packed form is the fork's 12.75 MiB expert against 15.0 */
 
