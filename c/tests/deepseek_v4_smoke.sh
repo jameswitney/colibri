@@ -56,9 +56,10 @@ VRAM0=""
 
 LOG=${DEEPSEEK_V4_SMOKE_LOG:-$(mktemp -t dsv4-smoke-XXXXXX.log)}
 
-# the rig's frozen expert-history snapshots, where they exist (the bench arms'
-# protocol): the warm start plans by the same counts every run, and the gate leaves
-# the shared model's history as it found it
+# The rig's frozen expert-history snapshots, where they exist (the bench arms'
+# protocol): copied in before the run so the warm start plans by the same counts
+# every run, and back in after it (the engine writes its own counts at exit) so
+# the gate leaves the shared model's history exactly as it found it
 for s in coli_usage coli_mfu; do
     [ -f "/root/Projects/colibri-upstream/bench/$s.fixed" ] && \
         cp "/root/Projects/colibri-upstream/bench/$s.fixed" "$MODEL/.$s"
@@ -74,6 +75,12 @@ timeout "$TIMEOUT_S" env COLI_VULKAN=1 COLI_TEMP=0 KVSAVE=0 V4_PREFIX_CKPT=0 COL
     --memory-gb "$RAM_GB" >"$LOG" 2>&1
 rc=$?
 set -e
+# and back out: the engine writes its own counts at exit, so the frozen snapshots
+# return (every rig consumer copies them in fresh anyway -- the arms' protocol)
+for s in coli_usage coli_mfu; do
+    [ -f "/root/Projects/colibri-upstream/bench/$s.fixed" ] && \
+        cp "/root/Projects/colibri-upstream/bench/$s.fixed" "$MODEL/.$s"
+done
 echo "deepseek-v4-smoke: rc=$rc, log $LOG"
 
 # absent environment is a skip, not a failure
