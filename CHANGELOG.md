@@ -24,6 +24,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `COLI_VK_TIER_FMT15` — the P0 hotfix of the W1 bench window (2026-10-25): PW-D's
+  ue8m0-packed scales (device fmt 15) landed unconditional after a lossless proof at unit
+  scale, but the window's first model-scale arms found the packed form corrupts
+  resident-expert compute at the model's shapes (the router's input goes non-finite one
+  layer below a resident expert; bisected clean→broken exactly at the PW-D merge, with
+  PW-C2's tip clean beside it — `docs/research/AI-pw-w1-…md`). Every unit/tiny gate had
+  stayed green: their geometries cannot reach the model's, a class of miss the window
+  itself now prices. The hotfix keeps all the fmt-15 code and makes it opt-in —
+  `COLI_VK_TIER_FMT15=1` arms the packed form (+17.6 % tier capacity at the same bytes
+  once its resident-path defect is found and fixed); unset, the f32-scale fmt 7 is the
+  standing default again, byte-identical to the pre-PW-D tier.
+
 - `COLI_VK_TIER_DECODE_GROW` (the Vulkan expert tier, default off): demand-growing decode
   residency — the tier's resident set stops being the warm start's fixed one. At the first
   decode-class step the tier probes what the device actually has free (the boot budget could only

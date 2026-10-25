@@ -314,10 +314,23 @@ static size_t src_scale_bytes(VktFmt f, int I, int O) {
     return (size_t)O * ng * 4;
 }
 /* The backend format a source kind lands in; 0 when the combination is not one.
- * VKT_SRC_MXFP4_E8M0's scales are ue8m0 bytes already: the Vulkan backend keeps them
+ * VKT_SRC_MXFP4_E8M0's scales are ue8m0 bytes: the Vulkan backend can keep them
  * packed (fmt 15, 12.75 MiB a DeepSeek V4 expert against fmt 7's 15.0 -- the expansion
- * to f32 is exact, so the packing changes bytes, never values). The CUDA tier's ops
- * table (cu_xb.cu) has no fmt 15 yet: it keeps the f32-scale form. */
+ * to f32 is exact, so the packing changes bytes, never values). The W1 window's P0
+ * (AI-pw-w1-2026-10-25) found the packed form corrupts resident-expert compute at
+ * model scale -- the router's input goes non-finite one layer below a resident
+ * expert, on every arm at the fmt-15 tip, while every unit/tiny gate stayed green
+ * (their shapes provably cannot reach the model's) -- so fmt 15 is OPT-IN until that
+ * defect is found and fixed: COLI_VK_TIER_FMT15=1 arms the packed form, the f32-scale
+ * fmt 7 is the standing default again. The CUDA tier's ops table (cu_xb.cu) has no
+ * fmt 15 at all: it keeps the f32-scale form. */
+#ifndef COLI_CUDA
+static int tier_fmt15(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_TIER_FMT15"); on = e && *e && *e != '0' ? 1 : 0; }
+    return on;
+}
+#endif
 static int dev_fmt(VktFmt f, int *fmt, int *gs) {
     int g = f.gs;
     if (f.kind >= VKT_SRC_GGML) { *fmt = 100 + (int)(f.kind - VKT_SRC_GGML); *gs = 0; return coli_vk_block_elems(*fmt) > 0; }
@@ -333,7 +346,7 @@ static int dev_fmt(VktFmt f, int *fmt, int *gs) {
 #ifdef COLI_CUDA
         *fmt = 7;
 #else
-        *fmt = 15;
+        *fmt = tier_fmt15() ? 15 : 7;   /* opt-in since the W1 P0: see tier_fmt15 above */
 #endif
         *gs = g; return g >= 8 && g % 8 == 0;
     case VKT_SRC_MXFP4_F32: *fmt = 7; *gs = g; return g >= 8 && g % 8 == 0;
@@ -422,6 +435,10 @@ static void convert_par(VktFmt f, int I, int O, const uint8_t *codes, const void
         for (size_t i = 0; i < n; i++) { uint32_t u = (uint32_t)e[i] << 23; memcpy(&sc[i], &u, 4); }
         return;
 #else
+        if (!tier_fmt15()) {   /* fmt 7, the standing default since the W1 P0: expand ue8m0 -> f32 2^(s-127) */
+            for (size_t i = 0; i < n; i++) { uint32_t u = (uint32_t)e[i] << 23; memcpy(&sc[i], &u, 4); }
+            return;
+        }
         /* fmt 15: the bytes as they are, the word pad zeroed (never read, copied whole) */
         size_t words = ((n + 3) / 4) * 4;
         memcpy(sc, e, n);
