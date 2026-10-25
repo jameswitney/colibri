@@ -55,6 +55,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `COLI_VK_CHAIN_MHC_S1` (DeepSeek V4's chain, default off): the S=1 mHC slice of the
+  parity wave (PW-C3) — the fork's single-dispatch decode mHC pair (`mhc_dec_{pre,post}.comp`,
+  its Level-1 fusion) as `chain_mhc_dec.comp` on `chain_mhc`'s own buffers, offsets and
+  `hp` layout. A one-row forward's mHC site drops from eight dispatches (the fn matmul,
+  SPLIT, COLLAPSE, two bf16 rounds, the branch norm, POST and its round — the multi-
+  dispatch class the fork measured regressing at one row, 0.315 -> 1.161 ms/call) to
+  three (the matmul, one 256-thread workgroup for the whole pre tail, one thread-an-
+  output post with the round folded). The fork's own numbers for the pair: the op tick a
+  wash (0.317-0.321 vs the host loop's 0.306-0.311 ms/call), its +19 % decode win living
+  in the serialized host path the port's in-frame chain never had — so this is the
+  in-frame consolidation slice, not that number. Thresholded class against the standing
+  chain per D11 (the fused bodies' single-rounding fmas, fma reduction trees, the other
+  multiply order in the branch norm): unit-oracle at S=1 measures 5.8e-11 on the state
+  and bit-identical outputs at the model geometry, the tiny oracle token-exact with the
+  lever on; any refusal (streams > 8, hidden > 4096, a missing pipeline, the lever
+  unset) records the standing chain, byte-identical by construction. The lane also
+  re-armed `test_vk_tier`'s `packed_scales` around `COLI_VK_TIER_FMT15` — the W1 hotfix
+  (`d73b82e1`) made fmt 15 opt-in and left the test expecting the packed bytes by
+  default, which had `vk-tier-check`/`vk-strict-check` red at the branch point (proven
+  on the base tree; PW-D's debt, not the mHC change). Report:
+  `docs/research/AL-pw-c3-mhc-s1-fusion-2026-10-25.md`.
 - `COLI_VK_TIER_FMT15` — the P0 hotfix of the W1 bench window (2026-10-25): PW-D's
   ue8m0-packed scales (device fmt 15) landed unconditional after a lossless proof at unit
   scale, but the window's first model-scale arms found the packed form corrupts

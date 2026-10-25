@@ -2634,6 +2634,7 @@ static void host_plan(void) {
 /* fmt 15 (the tier's packed MXFP4: ue8m0 scale bytes) against fmt 7 (f32 scales): the
  * round trip is the identity -- the byte's exponent lands in the float's exponent field
  * (vk_tier.c's expansion, the shaders' decode) -- and the packed form holds 3/4 less
+
  * scale bytes, the fork's 12.75 MiB expert against the f32 form's 15.0.
  *
  * The two halves live on different legs since the W1 P0 hotfix (d73b82e1) made the
@@ -2645,6 +2646,7 @@ static void host_plan(void) {
  * asserts the shrink whichever way the default later lands: if fmt 15 returns to
  * default-on the env is redundant and every check still holds. */
 static void packed_scales(int bytes) {
+
     int ident = 1;
     for (int e = 0; e < 256; e++) {   /* byte -> f32 -> byte, both directions the code takes */
         uint32_t u = (uint32_t)e << 23; float f; memcpy(&f, &u, 4);
@@ -2678,6 +2680,7 @@ static void packed_scales(int bytes) {
     /* the same budget holds the same GiB in more experts: fit scales with the bytes */
     double more = (double)bf / bp;
     CHECK(more * bp >= bf - 4096, "packed scales: the capacity multiplier does not hold the budget");
+    unsetenv("COLI_VK_TIER_FMT15");
 }
 
 int main(int argc, char **argv) {

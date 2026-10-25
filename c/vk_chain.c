@@ -467,6 +467,7 @@ static int coop_on(const char *env) {
 
 static void dsv4_init(void);       /* chain_dsv4.comp (DeepSeek V4.1 / V4), below */
 static void dsv4_fa_shutdown(void);  /* chain_dsv4_fa.comp (COLI_VK_CHAIN_ATTN_FA), below */
+static void mhcd_shutdown(void);   /* chain_mhc_dec.comp (COLI_VK_CHAIN_MHC_S1), below */
 static void dsv4_shutdown(void);
 static void kvs_shutdown(void);    /* chain_kvs.comp (the split KV cache), below */
 /* The compute shared memory a workgroup may declare: the device's
@@ -2199,6 +2200,65 @@ int vkc_mhc(int mode, VkcBuf *x, VkcBuf *m, VkcBuf *hp, VkcBuf *prm, VkcBuf *y, 
     return n == 0 || record(KC.mpipe[PM_MHC], bd, 5, &pc, sizeof pc, gx, gy, 1);
 }
 
+/* ---- the S=1 single-dispatch mHC pair (chain_mhc_dec.comp, COLI_VK_CHAIN_MHC_S1) --------
+ * The fork's mhc_dec_{pre,post}.comp (its Level-1 decode fusion, d11fba5b) on chain_mhc's
+ * own buffers and offsets: mode 0 records the whole pre tail of a one-row site -- the
+ * RMS-inverse, the Sinkhorn, the collapse and the branch RMSNorm, the bf16 rounds folded
+ * -- as ONE 256-thread workgroup over the streams x, the fn matmul's mixes m, the hc
+ * scale/base (prm at hc_off) and the branch norm weight (prm at n_off), into hp
+ * (chain_mhc's [pre H][post H][comb H*H] layout, so a standing POST can consume it) and
+ * the normed row y; mode 1 is the post, one thread an output, the bf16 round folded. At
+ * S = 1 the standing chain is six dispatches a site (matmul, SPLIT, COLLAPSE, round,
+ * norm, round) plus POST and a round -- the multi-dispatch class the fork measured
+ * regressing at one row (its COLI_VK_MHC_DECODE, 0.315 -> 1.161 ms/call) before the same
+ * bodies fused took the op back to a wash. COLI_VK_CHAIN_MHC_S1 (read per call, so a
+ * test arms it case by case): unset/0 keeps the standing chain, byte-identical by
+ * construction (the module is not even loaded); 1 takes the pair wherever a forward is
+ * one row. A shape the shader cannot take (H > 8 streams, D > 4096 -- the collapsed row
+ * stages in LDS at the fork's own cap) or a pipeline that did not load makes the call
+ * refuse and the caller's standing chain run -- never a misread. Numerics: the fork's
+ * fused bodies verbatim, a thresholded class against the standing chain (the affine and
+ * collapse products single-rounding fmas where the standing shaders make two roundings,
+ * fma reduction trees against strided adds, (x*inv)*w against (x*w)*r) -- D11's class,
+ * not bit-identity. The dispatches record under PK_MHC, so the DPROF mHC bucket keeps
+ * counting them; vkc_stats's mhc_dec counts engagements. */
+static struct { VkShaderModule mod; VkPipeline pipe; int tried; } g_mhcd[2];
+#define MHCD (g_mhcd[g_kd])
+static void mhcd_shutdown(void) {
+    if (MHCD.pipe) vkDestroyPipeline(KC.dev, MHCD.pipe, NULL);
+    if (MHCD.mod) vkDestroyShaderModule(KC.dev, MHCD.mod, NULL);
+    memset(&MHCD, 0, sizeof MHCD);
+}
+static VkPipeline mhcd_pipe(void) {   /* lazy: only an armed call loads the module */
+    if (MHCD.pipe || MHCD.tried || !vkc_ready()) return MHCD.pipe;
+    MHCD.tried = 1;
+    if ((MHCD.mod = load_module(KC.core.spv_path, "chain_mhc_dec.spv"))) MHCD.pipe = make_pipe(MHCD.mod, NULL);
+    return MHCD.pipe;
+}
+static int mhc_dec_wanted(void) {   /* COLI_VK_CHAIN_MHC_S1: 1 the fused pair, else the standing chain */
+    const char *e = getenv("COLI_VK_CHAIN_MHC_S1");
+    return e && *e && *e != '0';
+}
+int vkc_mhc_dec(int mode, VkcBuf *x, VkcBuf *m, VkcBuf *hp, VkcBuf *prm, VkcBuf *y, const VkcMhcDec *p) {
+    if (mode < 0 || mode > 1 || !mhc_dec_wanted() || p->H < 1 || p->H > 8 || p->D < 1 || p->D > 4096 ||
+        p->iters < (mode == 0 ? 1 : 0) || p->x_off < 0 || p->m_off < 0 || p->hp_off < 0 || p->y_off < 0 ||
+        (mode == 0 && (p->hc_off < 0 || p->n_off < 0))) return 0;
+    VkPipeline pipe = mhcd_pipe();
+    if (!pipe) return 0;
+    struct { int mode; VkcMhcDec b; } pc = {mode, *p};
+    VkcBind bd[5] = {B(x, 0), B(m, 0), B(hp, mode == 0), B(prm, 0), B(y, 1)};
+    KC.kind = PK_MHC;
+    if (mode == 0) {   /* the pre: the whole tail, one workgroup */
+        if (!record(pipe, bd, 5, &pc, sizeof pc, 1, 1, 1)) return 0;
+    } else {           /* the post: one thread an output */
+        uint32_t gx, gy;
+        grid(((uint64_t)p->H * p->D + 255) / 256, &gx, &gy);
+        if (!record(pipe, bd, 5, &pc, sizeof pc, gx, gy, 1)) return 0;
+    }
+    KC.st.mhc_dec++;
+    return 1;
+}
+
 /* ---- attention residuals and SiTU-GLU (chain_ares.comp) ---------------------------- */
 /* the router's pick (chain_route.comp): one workgroup per row */
 int vkc_route_ready(void) { return vkc_ready() && KC.mpipe[PM_ROUTE]; }
@@ -3500,6 +3560,7 @@ void vkc_shutdown(void) {
     if (KC.dsl) vkDestroyDescriptorSetLayout(KC.dev, KC.dsl, NULL);
     dsv4_shutdown();
     dsv4_fa_shutdown();
+    mhcd_shutdown();
     kvs_shutdown();
     memset(&KC, 0, sizeof KC);
     KC.cur = -1; KC.gemm_rows = -1;
