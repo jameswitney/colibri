@@ -204,3 +204,28 @@ PORT_PLAN below is the 2026-10-19/22 decision record; its F-number statuses are 
   arm line's own `decode grow armed: <free> -> <K> places` print at fork geometry) and the
   `promo_cap`-vs-fork-install-rate question are left to the manager's W1/W2 windows. Report:
   `docs/research/AH-pw-a1-decode-grow-2026-10-25.md`.
+## Session 2026-10-25 V (bench-W1 — the manager window: the fmt-15 P0, the hotfix, and the first model-scale parity verdicts)
+
+- **The W1 window ran to completion on `port/up-2276`** (the manager-run parity wave's first window; this
+  worktree, sole writer; every leg logged under `/root/bench-colibri/up2276/w1-*`): C0/G/F/GF ×3
+  interleaved + one GF DPROF rep at the standing TTFT shape, **and found a P0 before its first verdict** —
+  **PW-D's fmt 15 (ue8m0-packed scales) corrupts resident-path expert compute at model scale** (mid-decode
+  MoE router failure `first index -1`, varying layer; bisected clean→broken exactly at the PW-D merge,
+  PW-C2's tip and the pre-PW-D tip clean beside it, stream-off still failing ⇒ the resident path; every
+  unit/tiny gate had stayed green — their geometries cannot reach the model's). **Hotfix `d73b82e1`**
+  (`COLI_VK_TIER_FMT15`, opt-in; fmt 7 the standing default again, byte-identical to pre-PW-D), smoke-
+  confirmed at model scale; **D's reads DEFERRED** and the institutional debt recorded (a ~2-min
+  model-scale smoke gate owed for tier/chain-default slices). Two window false starts kept as evidence:
+  the 2304-row auto-fit drift (post-event free-VRAM shift; one amdgpu hard-recover) and the wrong
+  `COLI_VK_CHAIN_ROWS` pin (the CPU's ≤128-row class, its 800.7-s TTFT leg) — take 3 ran
+  `COLI_VK_CHAIN_ROWS_MAX=2048`, the baselines' exact shape, 13/13 legs clean, the card back at the
+  592 031 744 B baseline (+4.5 MiB) at close. **Verdicts (medians, ±20 % bands): G PASS** — decode device
+  share 13.1 % → 24.9 % (1.90×; 0 free VRAM probed, all 154 installs from retired stream slots, 273 → 427
+  residents, evictions 0, decode +16.0 %; whole-run disk bytes *not* down, 93.08 vs 91.95 GB — the installs
+  are one-time cold uploads); **F PASS over the band (favorable)** — attention bucket 46 337.0 → 1779.1 ms
+  whole-run (−96.2 %, dispatches exactly 2×: 5590 vs 2795), decode A1 −55.6 ms/tok (the band's top),
+  decode rate +8.8 % vs the +3–5 % pre-registration, TTFT −5.1 %; **GF additive PASS** — 86.6 % of the
+  G+F decode-wall sum; **D DEFERRED** (no D arm; C0 155.317 s sits in the pre-D reference class — the
+  138–142 s expectation was D-contingent and is withdrawn). D11 text counts: C0 3/3 stable, 9/9 armed reps
+  diverge (G mid-text — the residency class; F/GF from token 1 — the FA numerics class; GF ≠ F: the
+  levers are additive in time, not in tokens). Full record: `docs/research/AI-pw-w1-2026-10-25.md`.

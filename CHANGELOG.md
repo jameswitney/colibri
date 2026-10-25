@@ -29,7 +29,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   scale, but the window's first model-scale arms found the packed form corrupts
   resident-expert compute at the model's shapes (the router's input goes non-finite one
   layer below a resident expert; bisected clean→broken exactly at the PW-D merge, with
-  PW-C2's tip clean beside it — `docs/research/AI-pw-w1-…md`). Every unit/tiny gate had
+  PW-C2's tip clean beside it — `docs/research/AI-pw-w1-2026-10-25.md`). Every unit/tiny gate had
   stayed green: their geometries cannot reach the model's, a class of miss the window
   itself now prices. The hotfix keeps all the fmt-15 code and makes it opt-in —
   `COLI_VK_TIER_FMT15=1` arms the packed form (+17.6 % tier capacity at the same bytes
