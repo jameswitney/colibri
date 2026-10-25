@@ -1969,6 +1969,136 @@ static void pool_layer(void) {
     setenv("COLI_VK_TIER_HOST", "0", 1);
     model_free();
 }
+
+/* The model's geometry (PW-Dfix, the W1 P0's regression test): the hybrid host-pool path
+ * of fmt 15 at DeepSeek V4 Flash's shapes -- hidden 4096, inter 2048, gs 32, the V4
+ * roundings. The P0: host_pairs advanced each output row's scale pointer by the f32-scale
+ * stride while fmt 15's scales are packed ue8m0 bytes (a quarter of it), so every output
+ * row past the first read its bytes 4x too deep -- past the scale range into the host
+ * pool's other bytes, up to 2^127-scale garbage and non-finite expert rows; at model scale
+ * the router one layer below took them as input and failed (AI-pw-w1-2026-10-25). Every
+ * tier-held row is checked finite AND against the reference -- rel()'s NaN comparison is
+ * false, so a NaN row never raises a plain `worst` (that is how the unit gates stayed green
+ * while the model died); the hybrid pairs are forced with COLI_VK_HYBRID_PCIE=0 beside a
+ * device budget too small for the layer. */
+static unsigned long long hy_pairs(const char *line);   /* below: the report's hybrid pairs */
+static void model_hybrid_case(void) {
+    enum { MH = 4096, MF = 2048, ME = 8, MK = 6, GS = 32 };   /* the model's geometry, a layer's slice */
+    const float limit = 10.0f;
+    static const float lut[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
+    static const VktFmt mf = {VKT_SRC_MXFP4_E8M0, GS};
+    struct { uint8_t *gc, *uc, *dc, *gs, *us, *ds; } m[ME];
+    size_t rg = (size_t)(MH + 1) / 2, rd = (size_t)(MF + 1) / 2, sg = (size_t)MF * (MH / GS), sd = (size_t)MH * (MF / GS);
+    int ok = 1;
+    for (int e = 0; e < ME; e++) {
+        m[e].gc = malloc(rg * MF); m[e].uc = malloc(rg * MF); m[e].dc = malloc(rd * MH);
+        m[e].gs = malloc(sg); m[e].us = malloc(sg); m[e].ds = malloc(sd);
+        for (size_t i = 0; i < rg * MF; i++) { m[e].gc[i] = (uint8_t)rnd(); m[e].uc[i] = (uint8_t)rnd(); }
+        for (size_t i = 0; i < rd * MH; i++) m[e].dc[i] = (uint8_t)rnd();
+        for (size_t i = 0; i < sg; i++) { m[e].gs[i] = (uint8_t)(118 + rnd() % 4); m[e].us[i] = (uint8_t)(118 + rnd() % 4); }
+        for (size_t i = 0; i < sd; i++) m[e].ds[i] = (uint8_t)(118 + rnd() % 4);
+        ok &= m[e].gc && m[e].uc && m[e].dc && m[e].gs && m[e].us && m[e].ds;
+    }
+    if (!ok) { CHECK(0, "model hybrid: no memory for the model's experts"); goto free_model; }
+    {
+    setenv("COLI_VK_TIER_FMT15", "1", 1);
+    setenv("COLI_VK_TIER_HOST", "1", 1); setenv("COLI_VK_TIER_SYNC", "1", 1);
+    setenv("COLI_VK_TIER_PROMOTE", "0", 1); setenv("GQ_EXACT", "1", 1);
+    setenv("COLI_VK_HYBRID_PCIE", "0", 1);   /* every host pool pair the CPU's: the corrupt path */
+    const double one = (double)vkt_expert_bytes(MH, MF, mf, mf);
+    char b[64];
+    snprintf(b, sizeof b, "%.12f", 2.5 * one / 1073741824.0); setenv("COLI_VK_TIER_GB", b, 1);   /* 2 of 8 on the device */
+    snprintf(b, sizeof b, "%.12f", (ME + 0.5) * one / 1073741824.0); setenv("COLI_VK_TIER_HOST_GB", b, 1);
+    VktConfig vc = {.engine = "test", .layers = 1, .experts = ME, .hidden = MH, .inter = MF, .topk = MK,
+                    .gate_up = mf, .down = mf, .act = VKT_ACT_SWIGLU_V4, .act_limit = limit,
+                    .act_a = 4.f, .act_b = 25.f, .max_rows = 1 << 20, .ram_reserve = (size_t)4 << 30};
+    int on = vkt_init(&vc, NULL);
+    CHECK(on, "model hybrid: the tier did not start");
+    unsigned long long dev = 0, bad = 0, nf = 0, hy = 0;
+    double worst = 0;
+    float *x = malloc(sizeof(float) * MH), *y = malloc(sizeof(float) * MH), *h = malloc(sizeof(float) * MF);
+    if (on && x && y && h) {
+        for (int e = 0; e < ME; e++) { VktExpertSrc src = {m[e].gc, m[e].uc, m[e].dc, m[e].gs, m[e].us, m[e].ds}; vkt_put(0, e, &src); }
+        vkt_put_done();
+        for (int t = 0; t < 4; t++) {   /* decode-class steps over the layer */
+            int idx[MK]; float w[MK]; uint8_t taken[MK]; const float *rows[MK];
+            for (int k = 0; k < MK; k++) { idx[k] = (t * 3 + k) % ME; w[k] = 0.2f + (rnd() % 100) / 200.0f; }
+            for (int i = 0; i < MH; i++) x[i] = frnd() * 4.0f;
+            qdq128(x, MH);   /* the engine's rounding of the activation */
+            int n = vkt_issue_w(0, x, 1, MK, idx, w, taken);
+            for (int i = 0; i < MK; i++)
+                if (!taken[i]) { VktExpertSrc src = {m[idx[i]].gc, m[idx[i]].uc, m[idx[i]].dc,
+                                                     m[idx[i]].gs, m[idx[i]].us, m[idx[i]].ds}; vkt_note(0, idx[i], &src); }
+            CHECK(n ? vkt_join(rows) : 1, "model hybrid: join failed");
+            for (int k = 0; k < MK; k++) {
+                if (!taken[k]) continue;
+                /* the reference: the engine's arithmetic (v4_act's at these shapes) */
+                for (int o = 0; o < MF; o++) {
+                    double ga = 0, ua = 0;
+                    const uint8_t *gr = m[idx[k]].gc + (size_t)o * rg, *ur = m[idx[k]].uc + (size_t)o * rg;
+                    for (int g = 0; g < MH / GS; g++) {
+                        double gp = 0, up = 0;
+                        for (int j = 0; j < GS; j++) {
+                            int i = g * GS + j;
+                            int nib = (i & 1) ? gr[i >> 1] >> 4 : gr[i >> 1] & 15;
+                            gp += x[i] * ((nib & 8) ? -lut[nib & 7] : lut[nib & 7]);
+                            nib = (i & 1) ? ur[i >> 1] >> 4 : ur[i >> 1] & 15;
+                            up += x[i] * ((nib & 8) ? -lut[nib & 7] : lut[nib & 7]);
+                        }
+                        uint32_t u; float s;
+                        u = (uint32_t)m[idx[k]].gs[(size_t)o * (MH / GS) + g] << 23; memcpy(&s, &u, 4); ga += gp * s;
+                        u = (uint32_t)m[idx[k]].us[(size_t)o * (MH / GS) + g] << 23; memcpy(&s, &u, 4); ua += up * s;
+                    }
+                    float g = bf16r((float)ga), u = bf16r((float)ua);
+                    g = fminf(g, limit); u = fmaxf(-limit, fminf(u, limit));
+                    float sg = g >= 0 ? 1.0f / (1.0f + expf(-g)) : expf(g) / (1.0f + expf(g));
+                    h[o] = bf16r(g * sg * u * w[k]);
+                }
+                qdq128(h, MF);
+                for (int o = 0; o < MH; o++) {
+                    double a = 0;
+                    const uint8_t *dr = m[idx[k]].dc + (size_t)o * rd;
+                    for (int g = 0; g < MF / GS; g++) {
+                        double p = 0;
+                        for (int j = 0; j < GS; j++) {
+                            int i = g * GS + j;
+                            int nib = (i & 1) ? dr[i >> 1] >> 4 : dr[i >> 1] & 15;
+                            p += h[i] * ((nib & 8) ? -lut[nib & 7] : lut[nib & 7]);
+                        }
+                        uint32_t u = (uint32_t)m[idx[k]].ds[(size_t)o * (MF / GS) + g] << 23; float s; memcpy(&s, &u, 4);
+                        a += p * s;
+                    }
+                    y[o] = bf16r((float)a);
+                }
+                for (int o = 0; o < MH; o++) if (!isfinite(rows[k][o])) nf++;
+                double r = rel(rows[k], y, MH);
+                if (!isfinite(r) || r > 2e-2) bad++;   /* a NaN row counts: rel's NaN compare is false */
+                if (isfinite(r) && r > worst) worst = r;
+                dev++;
+            }
+        }
+    }
+    {
+        char line[4096]; report_line(line, sizeof line);   /* this case's own hybrid pairs */
+        unsigned long long pairs = hy_pairs(line);
+        hy = pairs == ~0ull ? 0 : pairs;
+    }
+    vkt_shutdown();
+    unsetenv("COLI_VK_HYBRID_PCIE"); unsetenv("GQ_EXACT"); unsetenv("COLI_VK_TIER_PROMOTE");
+    unsetenv("COLI_VK_TIER_SYNC"); unsetenv("COLI_VK_TIER_HOST_GB"); unsetenv("COLI_VK_TIER_GB");
+    unsetenv("COLI_VK_TIER_FMT15");
+    setenv("COLI_VK_TIER_HOST", "0", 1);
+    printf("  fmt 15 at the model's geometry (hidden %d, inter %d), %llu hybrid pairs: %llu rows, %llu off the "
+           "reference, %llu non-finite, worst rel %.2e\n", MH, MF, hy, dev, bad, nf, worst);
+    CHECK(hy > 0, "model hybrid: no host pool pair ran on the CPU (the P0's path)");
+    CHECK(dev > 0, "model hybrid: the tier took nothing");
+    CHECK(bad == 0 && nf == 0, "model hybrid: the host pool's rows corrupt at the model's geometry");
+    free(x); free(y); free(h);
+    }
+free_model:
+    for (int e = 0; e < ME; e++) { free(m[e].gc); free(m[e].uc); free(m[e].dc); free(m[e].gs); free(m[e].us); free(m[e].ds); }
+}
+
 /* A pool short of every expert, promotions on (COLI_VK_TIER_PROMOTE): a routed pooled
  * expert moves up to the device, the coldest resident gives way -- with no pool copy of
  * its own, its device copy is freed and the slot empties -- and every row stays the
@@ -2658,9 +2788,12 @@ static void packed_scales(void) {
             CHECK(coli_vk_tensor_scale_count(7, I, O, 32) * 4 == nb * 4,
                   "packed scales: fmt 7 holds 4x the bytes of the ue8m0 store");
         }
-    /* DeepSeek V4's geometry: the packed form is the fork's 12.75 MiB expert against 15.0 */
+    /* DeepSeek V4's geometry: the packed form is the fork's 12.75 MiB expert against 15.0
+     * (the lever armed for the arithmetic: fmt 15 has been opt-in since the W1 hotfix) */
+    setenv("COLI_VK_TIER_FMT15", "1", 1);
     VktFmt pk = {VKT_SRC_MXFP4_E8M0, 32}, f32s = {VKT_SRC_MXFP4_F32, 32};
     size_t bp = vkt_expert_bytes(4096, 2048, pk, pk), bf = vkt_expert_bytes(4096, 2048, f32s, f32s);
+    unsetenv("COLI_VK_TIER_FMT15");
     printf("  expert bytes: ue8m0-packed %.2f MiB, f32 scales %.2f MiB (x %.4f)\n",
            bp / 1048576.0, bf / 1048576.0, (double)bf / (double)bp);
     CHECK(bp < bf, "packed scales: the packed form did not shrink the expert");
@@ -2721,6 +2854,7 @@ int main(int argc, char **argv) {
     hybrid_case((VktFmt){VKT_SRC_I4U_PAIRS_GS, 64}, (VktFmt){VKT_SRC_I4U_PAIRS_GS, 64}, "int4-g64");
     hybrid_case((VktFmt){VKT_SRC_I8_ROW, 0}, (VktFmt){VKT_SRC_I8_ROW, 0}, "int8");
     v4_hybrid_case();
+    printf("model geometry:\n"); model_hybrid_case();
     printf("pool copy:\n"); pool_copy_case();
     printf("host pairs:\n"); host_pairs_case(2e-3);
     printf("host pool:\n"); host_plan();
