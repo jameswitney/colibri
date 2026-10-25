@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- `COLI_VK_TIER_STREAM_RING` (default off): the stream's prefills move off the engine
+  thread onto a ring worker — the fork's `v4_ram` class on the port's slots (the parity
+  census's rank-1 never-tested row, the mechanism behind the measured STAGE 105.6 s prefill
+  bucket). The prefetch call for layer L joins the running job (the take) and hands the
+  worker layer L+1's predicted set (`T.pred`), read through a bypass stage pool of the ring's
+  own and uploaded into the half of the streaming slots the running step is not reading; a
+  step of another layer runs beside the job, every miss (a cold layer, an unpredicted
+  expert, a refused read, a failed worker) takes the inline fill at the step,
+  `COLI_VK_TIER_SYNC=1`'s deterministic drain includes the ring, and the teardown cancels
+  between reads. Unset: the ring's reader is never called, the inline prefetch byte-identical
+  (proven by a base-vs-arm tiny A/B). Evidence:
+  `docs/research/AN-pw-b-stream-ring-2026-10-26.md`.
+
 ### Fixed
 
 - `vk-tier-check`/`vk-strict-check` at the W1 hotfix tip (test-only, PW-A2's close): `d73b82e1`

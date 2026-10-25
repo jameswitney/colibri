@@ -844,7 +844,7 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 		--fixture ./kimi_k3_tiny
 
 .PHONY: deepseek-v4 deepseek_v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
-	deepseek-v4-tiny-check deepseek-v4-tiny-check-dmoe deepseek-v4-clean
+	deepseek-v4-tiny-check deepseek-v4-tiny-check-dmoe deepseek-v4-tiny-check-ring deepseek-v4-clean
 ifeq ($(COLI_V4_SUPPORTED),1)
 # Every shader the other engines build (VK_SPV, empty without VK=1): backend_vulkan.c
 # looks for them at run time and goes without one that is not there, and
@@ -949,6 +949,23 @@ deepseek-v4-tiny-check-dmoe: deepseek-v4-tiny-generate
 
 deepseek-v4-oracle: deepseek-v4
 	@test -n "$(MODEL)" || { echo "usage: make deepseek-v4-oracle MODEL=/path/to/checkpoint" >&2; exit 2; }
+
+# COLI_VK_TIER_STREAM_RING's own gate (PW-B, the fork's ring class): the tiny oracle with
+# the stream's fills moved onto the ring's worker -- the same token-exact expectations,
+# the arm's environment on (COLI_VK_TIER_STREAM_BYPASS arms the ring's bypass reader,
+# which the ring requires). The tiny fixture keeps every expert resident, so the ring
+# itself is shape-inert here (the PW-C2 precedent); the mechanics live in test_vk_tier's
+# `ring` case and the engagement in deepseek-v4-smoke with the same two envs.
+.PHONY: deepseek-v4-tiny-check-ring
+deepseek-v4-tiny-check-ring: deepseek-v4-tiny-generate
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) VK=1 deepseek-v4
+	COLI_VULKAN=1 COLI_VK_TIER_STREAM_BYPASS=1 COLI_VK_TIER_STREAM_RING=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_STREAM_BYPASS=1 COLI_VK_TIER_STREAM_RING=1 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
 	$(PYTHON) tools/make_deepseek_v4_oracle.py --model "$(MODEL)" \
 		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
 		--output tests/deepseek_v4_oracle.json \

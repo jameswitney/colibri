@@ -328,3 +328,53 @@ PORT_PLAN below is the 2026-10-19/22 decision record; its F-number statuses are 
   TTFT expectation, still unmeasured); a coop-matrix rig's dispatch check for the grouped GEMV's fmt-15
   tail; the union prefill router failure should fill `moe_reason()` like the decode path's does. Report:
   `docs/research/AJ-pw-dfix-2026-10-26.md`.
+
+## Session 2026-10-26 II (PW-B — the stream ring, parity wave 3, lane pw-b)
+
+- **PW-B landed on `port/pw-b`** (from `a8f45741`; this worktree, sole writer; GPU for gates + the
+  smoke only, no benchmark arms): **`COLI_VK_TIER_STREAM_RING`** (default off) — the port's stream
+  fills moved off the engine thread onto a ring worker, the fork's `v4_ram` class mapped onto the
+  tier's own machinery (the placement census's rank-1 never-tested row, the mechanism behind X-ob0's
+  measured **STAGE 105.6 s of the 159.0 s prefill window** at 1.74 GB/s effective against the fork's
+  join-0 invisible 137.4 GiB). The design: the prefetch call for layer L is the fork's switch point
+  — it **takes** the running job (join; the books merge) and hands the worker **layer L+1's
+  predicted set** (`T.pred`, the same plan the inline path uses, now also excluding the engine's
+  in-RAM experts), read through **a bypass stage pool of the ring's own** (the engine's stays the
+  engine's — that is what keeps both lock-free) and uploaded into **the half of the streaming slots
+  the running step is not reading** (the halves alternate; join_big frees the step's half before the
+  next job takes it). The engine's step joins only what it needs: a big step runs *beside* the job
+  (issue_big's three slot scans skip the job's half; an inline fill short of room outside it joins
+  rather than races), decode-class steps and `vkt_report` join, **`COLI_VK_TIER_SYNC=1`'s
+  deterministic drain includes the ring** (quiesce joins it — the documented contract extended, not
+  broken), and the teardown cancels between reads (the fork's issue #4: never wait out a discarded
+  stream). Every miss — a cold next layer (**the prompt's first chunk keeps the inline fill**, the
+  charter's cold-start fallback), an unpredicted expert, a refused read, a worker that could not be
+  made — takes the inline fill at the step; the CUDA tier does not arm (its fills stay
+  engine-threaded). The fill body was extracted into `st_fill_load` (hooks/stop/books parametrised;
+  the engine path's behaviour identical, `left >= 2 || !one` keeping the lone fallback's shape).
+- **Unit evidence** (`test_vk_tier`'s new `ring` case, in all three gate legs): the fills-ahead
+  **prediction order** (the consuming step loads zero experts inline, the order equals the plan's),
+  **the join waits only for what's needed** (a step of another layer completes beside a parked read,
+  4 ms against a 700 ms bound; the next prefetch takes it), **SYNC determinism** (the quiescent
+  point waits out the parked read, outputs exact), **the inline fallback** (a fail-all reader; every
+  step byte-equal the inline leg's), **the teardown cancel** (bounded to the read in flight), and
+  **default-off** (the hook wired with the env unset is never called).
+- **Gates all green on the final tree**: vk-tier ×3 legs, vk-chain (12,114 frames), strict ×4 (one
+  intermittent `frag` jitter **reproduced on the clean base archive** — the pre-existing unmasked
+  tier-stat class; two earlier flake-protocol catches were mine and fixed — timing values in the
+  case's stdout), tiny/prefix/brio token-exact, the dmoe ×8 legs, the ring tiny legs (the new
+  `deepseek-v4-tiny-check-ring` target; shape-inert at tiny, the PW-C2 precedent), serve-framing,
+  cu_tier + vk_tier CUDA syntax, **`deepseek-v4-smoke` PASS at defaults AND with the ring on**
+  (vram0 the 600,981,504 B floor, back at floor, no holders), plus a **2-chunk engagement leg**
+  (`COLI_VK_CHAIN_ROWS=32`): `the ring 10 jobs (8 experts)`, `prefetched 8 (4 used)` — the reads,
+  the off-thread fills and the prefilled-slot consumption all engage at model scale.
+  **Default-off byte-identity**: a clean `git archive a8f45741` base vs this tree, the tiny harness
+  — every PASS line and token identical, the diff host-state noise only (the X-ob0 discipline).
+- **Not claimed**: no benchmark arm ran (the window's rule), so the campaign's STAGE 105.6 → <10 s
+  is unmeasured — and the pred-gated design's honest ceiling is recorded: **chunk 0's 43 units keep
+  the inline fill** (no next-layer prediction exists on a layer's first visit), so the fork-literal
+  cold shape (a whole-layer fill with no prediction — a one-rule arm on this machinery:
+  `st_ring_submit`'s cold branch filling the plan's whole non-resident set instead of nothing) is
+  the follow-up the bench lane should pre-register beside the arm. Owed to the arm: the chunk-1 join
+  tail, the prediction overlap at S=2048, the in-RAM exclusion's inline remainder.
+  Report: `docs/research/AN-pw-b-stream-ring-2026-10-26.md`.
