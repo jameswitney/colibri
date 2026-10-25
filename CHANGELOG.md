@@ -24,6 +24,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `COLI_VK_TIER_DECODE_GROW` (the Vulkan expert tier, default off): demand-growing decode
+  residency — the tier's resident set stops being the warm start's fixed one. At the first
+  decode-class step the tier probes what the device actually has free (the boot budget could only
+  guess at what the chain, the KV mirror and the head take; by now they have taken it) and grows its
+  budget into that first, then — only beyond it — retires stream slots one place at a time as decode
+  demand installs (`COLI_VK_TIER_DECODE_GROW_GB` bounds both sources,
+  `COLI_VK_TIER_DECODE_GROW_RESERVE_GB`, default 0.5, is what the probe leaves for what still
+  allocates at decode). The installs rank by the engine's decode-only counts (the `.coli_mfu` table,
+  handed over as `VktConfig.decode_heat` through `coli_v4_expert_store_mfu_history`): the cutoff is
+  the K-th largest count over the experts the device does not hold — the fork's `cache_reorder`
+  rule — and an expert at or above it installs into a grown place, never a victim's (no eviction,
+  the warm set stands), while one below it installs not at all at a decode step: the grown room is
+  the rank's. `vkt_wants` mirrors the gate and `promote` takes it too where grown room exists, so
+  the merged-history warm cannot spend the growth before decode's hot; prefill keeps the standing
+  note path. The census's asymmetry answered: the fork's decode grew ~8.3 GiB of MFU-ranked demand
+  installs (`gpu_cap=954`) where the port's set was fixed (277 residents, `evictions 0`, decode
+  device share 13–22 %). Unit proof (`test_vk_tier` `decode_grow`): free-VRAM growth 6 -> 8 by
+  decode-only rank with the below-cutoff routed experts never installed (cutoff 40), slot-beyond
+  growth 6 -> 9 with slots 6 -> 3 and the cap refusing the fourth install (cutoff 30), the default
+  growing nothing; the report line's `decode grow:` clause is the engagement print. Evidence:
+  `docs/research/AH-pw-a1-decode-grow-2026-10-25.md`.
 - `COLI_VK_CHAIN_ATTN_FA` (DeepSeek V4/V4.1's chain): the fork's `sparse_attn_fa` tile
   ported onto `vkc_dsv4_attn`'s contract (`chain_dsv4_fa.comp` — same bindings and push
   constants as `chain_dsv4.comp` mode 0, so the one call dispatches either): a workgroup

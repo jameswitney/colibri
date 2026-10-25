@@ -170,3 +170,37 @@ PORT_PLAN below is the 2026-10-19/22 decision record; its F-number statuses are 
 ## Session 2026-10-25 IV (PW-fix1 — the review's P2 fix list + the FA timing harness in-tree, lane pw-fix1)
 
 - **PW-fix1 landed on `port/pw-fix1`** (from `2c57868e`, the PW-C2+PW-D merge head; the review's fix list — all P2, none blocking — closed and its 8.4×/51× reproducibility gap filled): (1) `coli_vk_tensor_import` **refuses fmt 15** beside `upload_tensor_pool`'s refusal — the import's `gs` ternary never stamped 15, so an imported tier tensor would have carried `gs 0` with the ue8m0 bytes read as float scales; AE §3's stated invariant now matches the code, and a new VK_TEST gate block in `run_late_cases` proves **both** refusals (upload + import) on a device whose host import is live. (2) The `scales_wide`/`coop_fmt` fmt-15 wide-gap closed by **dropping 15 from `coop_fmt`** (and the now-dead 15 token in `xb_coop_slot`'s rung check): tier tensors never carry `scales_wide`'s f16-range flag, so a packed scale past fp16's range would have reached the coop GEMM unguarded — the smaller/safer side of the review's either/or (decode-in-`scales_wide` would be dead code: both call sites are inside the upload that already refuses 15), fp32 GEMM takes the form until a cooperative-matrix rig proves the packed decode (this rig has none; the branch stays compile-checked). (3) ENVIRONMENT's `COLI_VK_XB_GROUPED_MX` and `COLI_VK_DMOE_ROWS` rows say **fmt 7/15** per the gates; the FA row and AG §2 gained the review's nuance — arm 1's mirror failing degrades one rung to the **fp32 tile**, mode 0 stays the tile's own refusals. (4) AG §4's throwaway timing harness is **in-tree** (`c/tests/bench_chain_attn_fa.c` + its on-demand `make tests/bench_chain_attn_fa VK=1` rule, the `bench_attn_f32` pattern): §4's methodology verbatim (one arm a lever, a warm-up frame that grows arm 1's mirror scratch, best-of-3 frames timed at the submit, `attn_fa` engagement checked per arm). One rig fact surfaced: the first S 256 run (10 mode-0 dispatches ≈ 3 s one submission) hit this box's amdgpu hard recovery — the K1/P1 boundary class `COLI_VK_DMOE_ROWS_MAX` documents — so the chunk arms default to **3 dispatches a frame** (~0.9 s of GPU work, clear of the ~2–4 s boundary; `COLI_VK_BENCH_N` overrides). **Re-measured through the in-tree copy** (RX 6900 XT): decode 1,811 → 191 µs arm 1 (**9.5×**, §4 said 8.4×) / 199 µs arm 2; S 256 chunk 305.4 ms → 6.17 ms (**49.5×**, §4 said 51×) — all inside the ±20% band, nothing to flag loudly (AG §8 has the table). Gates: vk-chain **PASS** (12,039 frames, the four FA cases at their bars), vk-tier **PASS ×2**, vk-strict **PASS ×3** (no flake), VK_TEST matmul-only **PASS** with the f16/import digest **`34df89280461294a`** == PW-D's (the new refusal gate is bits-neutral), tiny ×5 legs (CPU/VK/VK+FA/prefix/brio) all PASS token-exact, serve-framing ok, cu_tier CUDA syntax clean; fixture weights borrowed from up2276-merge's banked copy (config/ref/tokenizer diff-equal, no torch here). Report: `docs/research/AG-pw-c2-fa-flash-attention-2026-10-25.md` §8.
+## Session 2026-10-25 IV (PW-A1 — demand-growing decode residency, lane pw-a1, resumed)
+
+- **PW-A1 landed on `port/pw-a1`** (from `2c57868e`, the PW-D merge; the lane was resumed after a
+  usage-limit kill at the tier-check run, its uncommitted cut inherited and finished):
+  `COLI_VK_TIER_DECODE_GROW` — the census's decode-residency asymmetry answered as a default-off
+  policy lever. The tier's resident set stops being the warm start's fixed one: at the **first
+  decode-class step** the tier probes what the device really has free (`VK_EXT_memory_budget` less
+  `COLI_VK_TIER_DECODE_GROW_RESERVE_GB`, 0.5 default — the boot budget could only guess at what the
+  chain/KV/head take) and grows its budget into that first, then retires **stream slots one place at
+  a time** beyond it (floor of two, the bytes moved to the residents' budget), `COLI_VK_TIER_DECODE_GROW_GB`
+  bounding both. Installs rank by the engine's **decode-only** counts (S7's `.coli_mfu`, handed over
+  as `VktConfig.decode_heat` via `coli_v4_expert_store_mfu_history`, geometry-gated to the fork
+  table's own): cutoff = K-th largest over the experts the device does not hold (the fork's
+  `cache_reorder` rule); at-or-above installs into a grown place **never a victim's** (the warm set
+  stands, `evictions 0` stays 0), below installs not at all at a decode step — and the same gate in
+  `vkt_wants` and `promote` so the merged-history warm cannot spend the growth. **The resume fixed
+  three defects in the inherited cut**: a slot-tensor double free in the retire (the `ColiVkExpert`
+  owns the slot's tensors), the rank gate covering only the dg branch (below-cutoff ordinary
+  free-room installs were taking the grown places), and `MFU_*` macros referenced outside the store
+  unit that owns `mfu_table.h` (every `COLI_V4_UNIT_*` + Vulkan compile broke; the geometry check
+  was already inside the store's export). **Unit proof** (`test_vk_tier` `decode_grow`, RX 6900 XT):
+  free-VRAM leg 6 -> 8 residents by decode-only rank, curve 6 6 8 8, below-cutoff routed experts
+  never installed, evictions 0 (cutoff 40); slots-beyond leg 6 -> 9 with slots 6 -> 3 and the cap
+  refusing the fourth (cutoff 30); default leg grows nothing, no clause. **Default-off/armed-inert**:
+  tiny ×2 token-exact at defaults; `COLI_VK_TIER_DECODE_GROW=1` at tiny declines on geometry (4
+  experts, not the fork's 256) with the recorded line and stays token-exact — the armed path cannot
+  touch a non-fork-geometry model; the D11 count-band class stands for the armed path at fork
+  geometry. **Gates all green run-1**: tier (both modes), chain (12,039 frames), strict, tiny ×2
+  (torch absent on the box — the shared banked fixture, byte-identical config/ref/tokenizer, used
+  in place of the regeneration step), tiny-dmoe (all 8 legs), serve-framing, cu_tier syntax;
+  `vulkan_engines.sh deepseek` env-blocked pre-existing. No bench arms — the model-scale probe (the
+  arm line's own `decode grow armed: <free> -> <K> places` print at fork geometry) and the
+  `promo_cap`-vs-fork-install-rate question are left to the manager's W1/W2 windows. Report:
+  `docs/research/AH-pw-a1-decode-grow-2026-10-25.md`.
