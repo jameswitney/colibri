@@ -25,6 +25,12 @@
  *            hooks, the layer-switch rotation (the bitmap clears, the old layer's places
  *            free, the new layer's routed experts refill at most once, both ways), and
  *            the declines (out of range, no room): one line each, the plan the history's;
+ *   dgrow    COLI_VK_TIER_DECODE_GROW: the resident set grows over a decode sequence by
+ *            the decode-only rank (VktConfig.decode_heat, warmer than the merged history
+ *            the warm start filled by) -- free VRAM first, then stream slots retired a
+ *            place at a time, the budget and the rank cutoff respected both ways (the
+ *            below-cutoff routed expert never installs), and the env unset growing
+ *            nothing;
  *   adapt    a budget of a third of the experts and a hot set that moves halfway:
  *            experts are evicted, the new hot set becomes resident and its steps
  *            go to the device;
@@ -1128,6 +1134,149 @@ static void bank_layer_case(void) {
     unsetenv("COLI_VK_TIER_BANK_LAYER"); unsetenv("COLI_VK_TIER_STREAM_SLOTS");
     unsetenv("COLI_VK_TIER_FILL"); unsetenv("COLI_VK_TIER_RATE");
     setenv("COLI_VK_TIER_HOST", "0", 1);
+    model_free();
+}
+
+/* COLI_VK_TIER_DECODE_GROW: the armed tier's resident set grows over a decode sequence
+ * by the DECODE-ONLY rank (VktConfig.decode_heat), which here ranks differently than the
+ * merged history the warm start filled by -- free VRAM first (leg A: a capped probe)
+ * and the stream slots only beyond (leg B: the reserve kills the free part, the installs
+ * retire slots a place at a time), the budget respected, the below-cutoff routed experts
+ * never installed, and the env unset growing nothing (leg C, the default). */
+static int dg_res(void) { int n = 0; for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) n += vkt_resident(l, e); return n; }
+static void report_line(char *out, size_t n);   /* below: the tier's report line as a string */
+static void decode_grow(void) {
+    rng = 7;
+    VktFmt f = {VKT_SRC_I8_ROW, 0};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    const double eb = (double)vkt_expert_bytes(H, F, f, f);
+    char gbs[2][64];
+    /* the merged history warms e<3 of each layer; the decode-only table ranks 4..7:
+     * 40, 30, 20, 10 -- the growth must follow the decode rank, not the merged one */
+    uint32_t hist[L][E], dhist[L][E], *rows[L], *drows[L];
+    for (int l = 0; l < L; l++) {
+        rows[l] = hist[l]; drows[l] = dhist[l];
+        for (int e = 0; e < E; e++) {
+            hist[l][e] = e < 3 ? 100u : 0u;
+            dhist[l][e] = e >= 4 && e < 8 ? 40u - 10u * (uint32_t)(e - 4) : 0u;
+        }
+    }
+    /* --- leg A: the growth comes from free VRAM (no stream: no slots to retire) --- */
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    set_budget(6, f, f);   /* the warm start fills it exactly: no free place to promote into */
+    snprintf(gbs[0], sizeof gbs[0], "%.12f", 2.5 * eb / 1073741824.0);   /* two places */
+    setenv("COLI_VK_TIER_DECODE_GROW", "1", 1);
+    setenv("COLI_VK_TIER_DECODE_GROW_GB", gbs[0], 1);
+    setenv("COLI_VK_TIER_DECODE_GROW_RESERVE_GB", "0.000001", 1);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    vc.decode_heat = drows;
+    CHECK(vkt_init(&vc, rows), "dgrow: the tier did not start");
+    int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+    for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+    vkt_put_done();
+    CHECK(n == 6 && dg_res() == 6, "dgrow A: %d warm of %d planned, budget 6", dg_res(), n);
+    /* a decode sequence that routes the BELOW-cutoff experts first and often: they must
+     * never take a place; the hottest (40) installs in whatever order it arrives */
+    Books bk = {0, 0}; double worst = 0;
+    int curve[8]; int nc = 0;
+    static const int seq[4][K] = {{7, 5, 6}, {6, 5, 7}, {5, 4, 7}, {4, 6, 5}};
+    for (int t = 0; t < 4; t++) {
+        for (int l = 0; l < L; l++) {
+            float w[K] = {0.5f, 0.3f, 0.2f};
+            vkt_begin_forward();
+            double r = step(l, 1, seq[t], w, &bk);
+            if (r > worst) worst = r;
+        }
+        vkt_settle();
+        curve[nc++] = dg_res();
+    }
+    char line[4096]; report_line(line, sizeof line);
+    const char *clause = strstr(line, " | decode grow: ");
+    int mono = 1;
+    for (int i = 1; i < nc; i++) mono &= curve[i] >= curve[i - 1];
+    printf("  decode grow A (free VRAM): residents 6 -> %d over the sequence (curve", dg_res());
+    for (int i = 0; i < nc; i++) printf(" %d", curve[i]);
+    printf("), worst %.2e, report \"%s\"\n", worst, clause ? clause + 3 : "no clause");
+    CHECK(dg_res() == 8, "dgrow A: %d residents, not the warm 6 + 2", dg_res());
+    CHECK(vkt_resident(0, 4) && vkt_resident(1, 4), "dgrow A: the hottest expert of each layer is not resident");
+    CHECK(!vkt_resident(0, 5) && !vkt_resident(1, 5) && !vkt_resident(0, 6) && !vkt_resident(0, 7),
+          "dgrow A: a below-cutoff routed expert installed (5/6/7)");
+    CHECK(mono, "dgrow A: the resident set shrank");
+    CHECK(worst < 2e-3, "dgrow A: rows off the reference (%.3g)", worst);
+    CHECK(clause && strstr(line, "decode grow: 2 installed by decode-only rank (cutoff 40)"), "dgrow A: the report's growth clause");
+    CHECK(strstr(line, "evictions 0"), "dgrow A: growth evicted");
+    vkt_shutdown();
+    /* --- leg B: the free part gone, the slots beyond -- installs retire them --- */
+    snprintf(gbs[1], sizeof gbs[1], "%.12f", 3.5 * eb / 1073741824.0);   /* three places */
+    setenv("COLI_VK_TIER_DECODE_GROW_GB", gbs[1], 1);
+    setenv("COLI_VK_TIER_DECODE_GROW_RESERVE_GB", "99", 1);
+    setenv("COLI_VK_TIER_STREAM_SLOTS", "6", 1);
+    setenv("COLI_VK_TIER_STREAM_ROWS", "3", 1);
+    setenv("COLI_VK_TIER_FILL", "0", 1);
+    vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    vc.load = load_cb; vc.release = release_cb;
+    vc.decode_heat = drows;
+    set_budget(12, f, f);   /* six warm, six slots: the budget exact, no free place */
+    CHECK(vkt_init(&vc, rows), "dgrow: the tier did not start again");
+    n = vkt_plan(pl, pe, L * E);
+    for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+    vkt_put_done();
+    CHECK(n == 6 && dg_res() == 6, "dgrow B: %d warm of %d planned, budget 6", dg_res(), n);
+    int big[64 * K]; float w[64 * K];
+    unsigned long long streamed = 0, kept = 0;
+    for (int l = 0; l < L; l++) {   /* a big step a layer: the slots allocate, the arm sees them */
+        route(64, 0, E, big, w);
+        vkt_begin_forward();
+        stream_step(l, 64, big, w, 0, &bk, &streamed, &kept, 0, NULL);
+    }
+    vkt_settle();
+    CHECK(dg_res() == 6, "dgrow B: the big steps installed something (%d residents)", dg_res());
+    static const int seqB[3][K] = {{7, 6, 5}, {7, 5, 4}, {4, 6, 7}};
+    for (int t = 0; t < 3; t++) {
+        float ww[K] = {0.5f, 0.3f, 0.2f};
+        vkt_begin_forward();
+        double r = step(t < 2 ? t : 0, 1, seqB[t], ww, &bk);   /* layer 0, then 1, then 0 again */
+        if (r > worst) worst = r;
+        vkt_settle();
+    }
+    report_line(line, sizeof line);
+    const char *sl = strstr(line, "(slots ");
+    int s0 = sl ? atoi(sl + 7) : -1, s1 = sl && strstr(sl, " -> ") ? atoi(strstr(sl, " -> ") + 4) : -1;
+    printf("  decode grow B (slots beyond): residents 6 -> %d, slots %d -> %d, the fourth hot refused by the cap, "
+           "worst %.2e\n", dg_res(), s0, s1, worst);
+    CHECK(dg_res() == 9, "dgrow B: %d residents, not the warm 6 + 3", dg_res());
+    CHECK(s0 == 6 && s1 == 3, "dgrow B: the slot pair %d -> %d, not 6 -> 3", s0, s1);
+    CHECK(vkt_resident(0, 5) && vkt_resident(1, 5) && vkt_resident(1, 4), "dgrow B: the hot installs are missing");
+    CHECK(!vkt_resident(0, 4), "dgrow B: the fourth hot expert took a place past the cap");
+    CHECK(!vkt_resident(0, 6) && !vkt_resident(0, 7) && !vkt_resident(1, 6) && !vkt_resident(1, 7),
+          "dgrow B: a below-cutoff expert installed (6/7)");
+    CHECK(strstr(line, "decode grow: 3 installed by decode-only rank (cutoff 30)"), "dgrow B: the report's growth clause");
+    vkt_shutdown();
+    unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS"); unsetenv("COLI_VK_TIER_FILL");
+    /* --- leg C: the default -- the env unset, nothing grows --- */
+    unsetenv("COLI_VK_TIER_DECODE_GROW"); unsetenv("COLI_VK_TIER_DECODE_GROW_GB");
+    unsetenv("COLI_VK_TIER_DECODE_GROW_RESERVE_GB");
+    set_budget(6, f, f);
+    vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    vc.decode_heat = drows;
+    CHECK(vkt_init(&vc, rows), "dgrow C: the tier did not start");
+    n = vkt_plan(pl, pe, L * E);
+    for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+    vkt_put_done();
+    for (int t = 0; t < 2; t++)
+        for (int l = 0; l < L; l++) {
+            float ww[K] = {0.5f, 0.3f, 0.2f};
+            vkt_begin_forward();
+            step(l, 1, seq[t], ww, &bk);
+        }
+    vkt_settle();
+    report_line(line, sizeof line);
+    printf("  decode grow C (default off): residents %d after the same decode sequence, no growth clause\n", dg_res());
+    CHECK(dg_res() == 6, "dgrow C: the default grew (%d residents)", dg_res());
+    CHECK(!strstr(line, "decode grow:"), "dgrow C: the default printed a growth clause");
+    vkt_shutdown();
+    unsetenv("COLI_VK_TIER_SYNC"); unsetenv("COLI_VK_TIER_RATE");
     model_free();
 }
 
@@ -2560,6 +2709,7 @@ int main(int argc, char **argv) {
     printf("pin layer:\n"); pin_layer();
     printf("pool layer:\n"); pool_layer();
     printf("bank layer:\n"); bank_layer_case();
+    printf("decode grow:\n"); decode_grow();
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
     printf("stream batch:\n"); stream_batch();

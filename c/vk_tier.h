@@ -248,6 +248,12 @@ typedef struct {
      * at most VKT_FORMS - 1 distinct pairs, gate_up/down among them or not; NULL = every
      * layer gate_up/down. The arrays are read during vkt_init only. */
     const VktFmt *layer_gate_up, *layer_down;
+    /* Optional, COLI_VK_TIER_DECODE_GROW: the engine's decode-only routing counts,
+     * [layers][experts] like `heat` (the .coli_mfu class -- prefill never counts there),
+     * the rank that decides which experts the tier's decode-time growth installs as
+     * decode runs. NULL = no such table and the growth never arms. Read during vkt_init
+     * only (the tier keeps its own copy). */
+    uint32_t *const *decode_heat;
     /* Optional: 1 = the dense chain copies a prompt chunk's host pool experts into the
      * device's memory a layer at a time (vk_dmoe.h): when the host pool will hold experts,
      * room for a layer's share of them comes out of the budget (vkt_stage_room). */

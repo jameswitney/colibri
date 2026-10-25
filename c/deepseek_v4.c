@@ -9339,6 +9339,8 @@ typedef struct V4HotPolicy {
     int mfu_seeded;     /* the loaded table has at least one count: a seed exists */
     int mfu_dirty;      /* a decode selection was recorded since load: save at destroy */
     char *mfu_path;     /* <model>/.coli_mfu */
+    uint32_t **mfu_rows; /* the table as [layers][experts] rows for the device tier's
+                          * decode growth (coli_v4_expert_store_mfu_history), built once */
     uint64_t repin_interval;
     uint64_t *usage;
     uint64_t *layer_requests;
@@ -10365,6 +10367,26 @@ uint32_t *const *coli_v4_expert_store_history(ColiExpertStore *store) {
     return store && hot_find(store) ? rt_counts_all() : NULL;
 }
 
+/* The decode-only popularity table as [layers][experts] rows over the same store's
+ * flat counts -- the .coli_mfu class the Vulkan tier's decode growth ranks its
+ * installs by (VktConfig.decode_heat, COLI_VK_TIER_DECODE_GROW). NULL unless the
+ * engine's geometry is exactly the table's (256 experts a layer, at most 43 layers).
+ * The rows point into the policy's table and live until the store closes. */
+uint32_t *const *coli_v4_expert_store_mfu_history(ColiExpertStore *store) {
+    V4HotPolicy *policy = store ? hot_find(store) : NULL;
+    V4ExpertStoreState *state = store ? store->state : NULL;
+    if (!policy || !state || state->experts_per_layer != MFU_EXPERTS_PER_LAYER ||
+        state->layers > MFU_NUM_LAYERS || state->layers < 1)
+        return NULL;
+    if (!policy->mfu_rows) {
+        policy->mfu_rows = malloc((size_t)state->layers * sizeof(*policy->mfu_rows));
+        if (policy->mfu_rows)
+            for (int l = 0; l < state->layers; l++)
+                policy->mfu_rows[l] = policy->mfu.counts + (size_t)l * MFU_EXPERTS_PER_LAYER;
+    }
+    return policy->mfu_rows;
+}
+
 int coli_v4_expert_store_in_ram(ColiExpertStore *store, ColiExpertKey key) {
     if (!store || !store->state || !hot_find(store)) return 0;
     V4ExpertStoreState *state = store->state;
@@ -10451,6 +10473,7 @@ static void destroy_hot(ColiExpertStore *store) {
                     &v4_direct_payload_bytes, __ATOMIC_RELAXED));
         free(policy->history_path);
         free(policy->mfu_path);
+        free(policy->mfu_rows);
         free(policy->packed); free(policy->pins);
         free(policy->layer_requests); free(policy->usage); free(policy);
     }
@@ -14299,6 +14322,11 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
                     .in_ram = v4_vkt_in_ram, .ram_ctx = store,
                     .load = v4_vkt_load, .release = v4_vkt_unhold, .load_ctx = store,
                     .load_batch = v4_vkt_bypass ? v4_vkt_load_batch : NULL};
+    /* COLI_VK_TIER_DECODE_GROW's rank: the decode-only counts (.coli_mfu), handed over
+     * as rows only where the engine's geometry is the fork table's own (the check is
+     * the store unit's, which owns the table's macros); the tier keeps its copy and
+     * never asks again */
+    vc.decode_heat = coli_v4_expert_store_mfu_history(store);
     /* The device goes before the drivers unload, after the tier's teardown (atexit runs
      * last-registered first), and whether or not the tier starts: XT(init) makes the
      * expert batch's pipelines before it can refuse (no room). */

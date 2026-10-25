@@ -788,6 +788,10 @@ extern const ColiV4VkTier *coli_v4_vk_tier;
  * in EMAP. */
 void coli_v4_expert_store_note_routed(ColiExpertStore *store, ColiExpertKey key);
 uint32_t *const *coli_v4_expert_store_history(ColiExpertStore *store);
+/* The decode-only popularity table as [layers][experts] rows (the .coli_mfu class):
+ * the rank the Vulkan tier's decode growth installs by. NULL where the engine's
+ * geometry is not the fork table's. */
+uint32_t *const *coli_v4_expert_store_mfu_history(ColiExpertStore *store);
 int coli_v4_expert_store_in_ram(ColiExpertStore *store, ColiExpertKey key);
 uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store);
 /* A GGUF store's experts at `layer` (st_gguf.h): 1 with the ggml types of gate (w1), up

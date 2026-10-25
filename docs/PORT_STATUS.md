@@ -165,3 +165,38 @@ PORT_PLAN below is the 2026-10-19/22 decision record; its F-number statuses are 
 ## Session 2026-10-25 III (PW-D — the UE8M0 u8-scale packing, the parity wave's first slice, lane pw-d)
 
 - **PW-D landed on `port/pw-d`** (from `0c847722`): the tier's MXFP4 experts (`VKT_SRC_MXFP4_E8M0` — DeepSeek V4/V4.1, Kimi K3, MiMo) keep their group scales on the device **as the packed ue8m0 bytes** (new **fmt 15**: e2m1 nibbles + 1 byte a 32-input group, 4 to a word) instead of the f32 expansion fmt 7 held — the audits' slab mechanism, reconciled first: **15.0 MiB** was the per-expert device payload (12 MiB codes + 3 MiB f32 scales), the placement census's **28.8 MiB "effective"** divided the whole tier pool (7.81 GiB = 277 residents + 256 stream slots × 15.0 MiB) by the resident count — a tenure ratio, not a format property (and "fmt 7 fp8" there a mislabel; the codes were already 4-bit). The on-disk form is ue8m0 and the old expansion wrote the byte into the float's exponent field — so the packed decode (`floatBitsToUint(word)` → byte extract → `e<<23`) is the **identity round trip**: lossless, landed **unconditionally, no env**. One DeepSeek V4 expert **15.0 → 12.75 MiB (−17.6 %, the fork's own class)** — every stream/promote/upload byte for MXFP4 experts drops with it and the same budget holds 1.1765× the experts (residents and slots both shrink: 277→~374 beside 256 slots at the census rig's 7.85 GiB; the pre-registered ~326 scaled the residents alone). Consumers taught the byte read: `qmatmul_grp_mx`(+gate_up, the format per expert from the table's [10]), `chain_moe_gv` (cgv slot 5), `chain_moe` (block_15), `qmatmul`/`qmatmul_gate_up` (per-expert GEMV), `qmatmul_gemm`, `qmatmul_coop`, `qmatmul_grp_gemv`, and the CPU host-rows path (`host_rows`/`dev_dequant`); the generic dense APIs (float* scales) refuse the form. **CUDA keeps fmt 7** (no packed form in cu_xb.cu, no CUDA rig to prove one; `#ifdef COLI_CUDA` pins it — behaviour unchanged there). Proof: `run_xbatch_mx_pack` (new, VK_TEST harness) — **fmt 15's rows bit-identical to fmt 7's** over the same codes/scales across the GEMV/cgv/GEMM routes (worst 1.77e-05 vs the double reference); `packed_scales` (new unit in test_vk_tier) — the ue8m0⇄f32 identity over all 256 bytes + the byte arithmetic ("ue8m0-packed 12.75 MiB, f32 scales 15.00 MiB (x 1.1765)"); tiny oracles token-exact with the tier booting `fmt 15 gs 32` (23 + 63 PASS lines, dmoe legs driving the chain's rows path on packed scales). Gates all green run 1: tier (both modes, incl. a new MXFP4-ue8m0 mode-4 stream case), chain (11,966 frames), strict ×3, tiny ×2 variants, serve-framing, cu_tier syntax, the VK_TEST harness staged==mapped digests (`e71dff75c0df60cb`/`34df89280461294a`); `vulkan_engines.sh shader` env-blocked (no Lavapipe ICD — pre-existing). Two harness fixes folded in: the bank scenario's whole-table expectation was rand-stream luck (reseed + the queued trio forced routed — deterministic now), and a byte-count precedence bug in the harness's fmt-15 fill (`O*(I+gs-1)/gs` → `O*⌈I/gs⌉`, found by the equivalence case itself). The audits committed as `docs/research/AD-audit-series-2026-10-25/`. **No bench arms** (the window is the manager's; the −15…−16 s TTFT expectation reads at W1). Report: `docs/research/AE-pw-d-ue8m0-u8-scale-packing-2026-10-25.md`.
+
+## Session 2026-10-25 IV (PW-A1 — demand-growing decode residency, lane pw-a1, resumed)
+
+- **PW-A1 landed on `port/pw-a1`** (from `2c57868e`, the PW-D merge; the lane was resumed after a
+  usage-limit kill at the tier-check run, its uncommitted cut inherited and finished):
+  `COLI_VK_TIER_DECODE_GROW` — the census's decode-residency asymmetry answered as a default-off
+  policy lever. The tier's resident set stops being the warm start's fixed one: at the **first
+  decode-class step** the tier probes what the device really has free (`VK_EXT_memory_budget` less
+  `COLI_VK_TIER_DECODE_GROW_RESERVE_GB`, 0.5 default — the boot budget could only guess at what the
+  chain/KV/head take) and grows its budget into that first, then retires **stream slots one place at
+  a time** beyond it (floor of two, the bytes moved to the residents' budget), `COLI_VK_TIER_DECODE_GROW_GB`
+  bounding both. Installs rank by the engine's **decode-only** counts (S7's `.coli_mfu`, handed over
+  as `VktConfig.decode_heat` via `coli_v4_expert_store_mfu_history`, geometry-gated to the fork
+  table's own): cutoff = K-th largest over the experts the device does not hold (the fork's
+  `cache_reorder` rule); at-or-above installs into a grown place **never a victim's** (the warm set
+  stands, `evictions 0` stays 0), below installs not at all at a decode step — and the same gate in
+  `vkt_wants` and `promote` so the merged-history warm cannot spend the growth. **The resume fixed
+  three defects in the inherited cut**: a slot-tensor double free in the retire (the `ColiVkExpert`
+  owns the slot's tensors), the rank gate covering only the dg branch (below-cutoff ordinary
+  free-room installs were taking the grown places), and `MFU_*` macros referenced outside the store
+  unit that owns `mfu_table.h` (every `COLI_V4_UNIT_*` + Vulkan compile broke; the geometry check
+  was already inside the store's export). **Unit proof** (`test_vk_tier` `decode_grow`, RX 6900 XT):
+  free-VRAM leg 6 -> 8 residents by decode-only rank, curve 6 6 8 8, below-cutoff routed experts
+  never installed, evictions 0 (cutoff 40); slots-beyond leg 6 -> 9 with slots 6 -> 3 and the cap
+  refusing the fourth (cutoff 30); default leg grows nothing, no clause. **Default-off/armed-inert**:
+  tiny ×2 token-exact at defaults; `COLI_VK_TIER_DECODE_GROW=1` at tiny declines on geometry (4
+  experts, not the fork's 256) with the recorded line and stays token-exact — the armed path cannot
+  touch a non-fork-geometry model; the D11 count-band class stands for the armed path at fork
+  geometry. **Gates all green run-1**: tier (both modes), chain (12,039 frames), strict, tiny ×2
+  (torch absent on the box — the shared banked fixture, byte-identical config/ref/tokenizer, used
+  in place of the regeneration step), tiny-dmoe (all 8 legs), serve-framing, cu_tier syntax;
+  `vulkan_engines.sh deepseek` env-blocked pre-existing. No bench arms — the model-scale probe (the
+  arm line's own `decode grow armed: <free> -> <K> places` print at fork geometry) and the
+  `promo_cap`-vs-fork-install-rate question are left to the manager's W1/W2 windows. Report:
+  `docs/research/AH-pw-a1-decode-grow-2026-10-25.md`.
