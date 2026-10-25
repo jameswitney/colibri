@@ -18,7 +18,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   `COLI_VK_TIER_SYNC=1`'s deterministic drain includes the ring, and the teardown cancels
   between reads. Unset: the ring's reader is never called, the inline prefetch byte-identical
   (proven by a base-vs-arm tiny A/B). Evidence:
-  `docs/research/AN-pw-b-stream-ring-2026-10-26.md`.
+  `docs/research/AN-pw-b-stream-ring-2026-10-26.md`; measured at the campaign shape by the W2
+  bench window (STAGE 106.3 → 1.1 s but TTFT +50.6 s — empty plans strand the fills on the
+  inline path: `docs/research/AO-pw-w2-2026-10-26.md`).
 
 ### Fixed
 

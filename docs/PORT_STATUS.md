@@ -378,3 +378,40 @@ PORT_PLAN below is the 2026-10-19/22 decision record; its F-number statuses are 
   the follow-up the bench lane should pre-register beside the arm. Owed to the arm: the chunk-1 join
   tail, the prediction overlap at S=2048, the in-RAM exclusion's inline remainder.
   Report: `docs/research/AN-pw-b-stream-ring-2026-10-26.md`.
+
+## Session 2026-10-26 III (bench-W2 — the full landed stack against the fork, lane bench-W2)
+
+- **The window** (`port/up-2276` @ `d5991060`, the binary rebuilt at open): C0/GF/FULL/RING ×3
+  same-day strict round-robin + DPROF reps of FULL and RING + two window-tail reference DPROF legs
+  (C0, GF — the bucket attribution needs same-window baselines at the fmt-15 flip); the W1 settle
+  discipline held (baseline 592 031 744 B ±16 MiB, no holders; 12 legs at floor +2.0 MiB, then the
+  idle floor **dropped to 538 959 872 B** — below the historical floor — and the window closed there;
+  nothing leaked across 18 legs). **C0** the ttft-set defaults (fmt 15 default again);
+  **GF** +DECODE_GROW+ATTN_FA; **FULL** +MHC_S1+STREAM_RING; **RING** +STREAM_RING alone;
+  RINGCOLD skipped (no env exists; AN §5 pre-registered it as a one-rule *code* change — recorded
+  verbatim, none improvised).
+- **Medians**: C0 **153.171 s / 0.5751 tok/s** (W1: 155.317/0.5492) · GF **154.208/0.6608**
+  (143.424/0.6779) · FULL **165.038/0.6768** · RING **203.808/0.5687**. Versus the fork
+  (107.8/1.135): the port's best decode is 0.60× the fork's, best TTFT 1.43× — no arm holds both.
+- **C0 (D's read)**: capacity **PASS** — fmt 15 lifts the ttft-shape tier 273×15.0 → **367×12.8 MiB**
+  (+34 %; the 559 class is the no-bypass smoke shape), decode share 13.1→18.4 %, C0 decode +4.7 %;
+  the **−15…−16 s TTFT byte-economy: MISS** (−2.1 s; the staging span is unchanged at ~108 s —
+  the fills' count, not their bytes, owns the wall).
+- **GF**: same-day continuity PASS in band, adverse both ways (decode −2.5 %, TTFT +7.5 % — fmt 15
+  cost GF its W1 TTFT edge; the levers overlap on the same 367-resident tier). GROW at fmt 15 is
+  slots-only (`budget 367 -> 367`, 0 free places; 150/154 installs from the retired slots; 517/521
+  grown). FA engagement exact (+2 795 ops, the dispatch doubling).
+- **RING — the window's finding**: the STAGE bucket target **PASS 100× over** (staging-upload
+  106.3 → **1.1 s**) but **TTFT MISS adverse (+50.6 s)**: the ring's jobs engaged (42 = chunk 1's
+  predicted transitions) with **empty plans — 8 experts filled, 0 used** (the pred-scaled estimate at
+  S=467 and the in-RAM exclusion both gate the plan; the books cannot split them), so the fills fell
+  to the step's inline path inside the MoE block (host-MoE 44.9 → 131.0 s) and the engine idled at
+  A1's fence (2.1 → 70.6 s exposed). Off-thread placement without plan coverage is a strict
+  pessimization at this shape; the fork's ring wins by *unconditional* whole-layer coverage. RING ≡
+  C0 in decode/share/ops/loads/text (timing never bytes, held at model scale).
+- **FULL**: the stack ≥ GF's decode **PASS** (+2.4 %; MHC_S1 engagement exact: −27 090 ops, the
+  PW-C3 signature); the absolute targets **MISS** (decode 0.6768 < 0.70; TTFT 165.0 > 120 — the
+  ring's +10.8 s tax over GF).
+- Report: `docs/research/AO-pw-w2-2026-10-26.md` (the DPROF 4-leg bucket table, the verbatim
+  engagement clauses, the D11 counts, the owed list: the ring's plan-coverage split, RINGCOLD's one
+  rule + the coverage question, the GROW headroom note, the fmt-7 GF isolation pair).
