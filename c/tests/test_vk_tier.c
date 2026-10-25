@@ -2636,6 +2636,9 @@ static void host_plan(void) {
  * (vk_tier.c's expansion, the shaders' decode) -- and the packed form holds 3/4 less
  * scale bytes, the fork's 12.75 MiB expert against the f32 form's 15.0. */
 static void packed_scales(void) {
+    /* the packed form is opt-in since the W1 hotfix (COLI_VK_TIER_FMT15, d73b82e1):
+     * arm it -- this tests fmt 15's own byte accounting, not the standing default */
+    setenv("COLI_VK_TIER_FMT15", "1", 1);
     int ident = 1;
     for (int e = 0; e < 256; e++) {   /* byte -> f32 -> byte, both directions the code takes */
         uint32_t u = (uint32_t)e << 23; float f; memcpy(&f, &u, 4);
@@ -2668,6 +2671,7 @@ static void packed_scales(void) {
     /* the same budget holds the same GiB in more experts: fit scales with the bytes */
     double more = (double)bf / bp;
     CHECK(more * bp >= bf - 4096, "packed scales: the capacity multiplier does not hold the budget");
+    unsetenv("COLI_VK_TIER_FMT15");
 }
 
 int main(int argc, char **argv) {
