@@ -3233,6 +3233,14 @@ tests/bench_matmul_f32$(EXE): tests/bench_matmul_f32.c
 tests/bench_attn_f32$(EXE): tests/bench_attn_f32.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# bench_chain_attn_fa: microbenchmark (DeepSeek V4's sparse attention on the flash tile
+# COLI_VK_CHAIN_ATTN_FA vs mode 0, AG §4's decode geometry and the S 256 chunk), NOT a
+# test gate -- test_vk_chain's test_ds_attn_fa gates the tile's bits. Needs VK=1.
+# Build on demand: make tests/bench_chain_attn_fa VK=1
+tests/bench_chain_attn_fa$(EXE): tests/bench_chain_attn_fa.c $(VK_OBJ) $(VK_SPV)
+	@[ "$(VK)" = 1 ] || { echo "tests/bench_chain_attn_fa needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
 tests/test_matmul_f32$(EXE): tests/test_matmul_f32.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

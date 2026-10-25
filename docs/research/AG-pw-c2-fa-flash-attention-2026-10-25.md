@@ -85,7 +85,10 @@ once dispatched 7/8 dead workgroups).
   over fp32 rows (the fork's `KV_F16=0` A/B arm). A shape the tile cannot take (hd ≠ 512,
   heads % 8, or a q/o/w/c offset or stride not a multiple of 4 floats) or a missing
   pipeline falls back to mode 0 — never a misread (the fork's own refuse rule; the split
-  path `vkc_kvs_ds` is untouched, so spilling layers keep today's kernel). `VkcStats.attn_fa`
+  path `vkc_kvs_ds` is untouched, so spilling layers keep today's kernel). Arm 1's mirror
+  failing (no scratch room, a missing gather pipeline, a failed gather record) degrades
+  one rung only — the tile over the fp32 rows — mode 0 still just the tile's own refusals.
+  `VkcStats.attn_fa`
   counts engagements.
 - **`c/Makefile`** — the five `.spv` rules (the tile builds MUST carry the `-D` set; the
   fork's own comment warns a plain build silently bakes the `#ifndef` defaults and the
@@ -132,7 +135,8 @@ fork's standing arm.
 
 ## 4. Unit-scale engagement (the model-scale DPROF bucket is the window's read)
 
-Throwaway timing harness (not committed), the decode geometry S 1 / H 64 / hd 512 /
+Throwaway timing harness (the PW-fix1 lane landed it as `c/tests/bench_chain_attn_fa.c` + its
+make rule — §8 re-ran the numbers through the in-tree copy), the decode geometry S 1 / H 64 / hd 512 /
 window 128 / pool 640 / cnt 768, 200 dispatches, this box's RX 6900 XT:
 
 | arm | µs/dispatch | × |
@@ -191,3 +195,37 @@ builds and the tile table), `c/backend_vulkan.c:4747` (KV_F16 retired ON), `:523
 (`test_ds_attn_fa`). Campaign: `audits/shader-census.md` §2 row 6 / §3 lead 4 / §4 rank 2
 (read at `/root/colibri-upstream-port/audits/`), `docs/research/P-optionB-dossier-2026-10-22.md`
 §5 L6, V-g1 (the 63.8 bucket), X (the prefill hiding).
+
+## 8. Addendum (PW-fix1 lane, 2026-10-25): §4 made repo-reproducible
+
+§4's harness is in the tree now — `c/tests/bench_chain_attn_fa.c` (build on demand:
+`make tests/bench_chain_attn_fa VK=1`, run from `c/`) — same methodology (§4: one arm
+per lever, a one-dispatch warm-up frame that also grows arm 1's mirror scratch, then the
+best of 3 frames of N recorded `vkc_dsv4_attn` dispatches timed at the submit; the
+`attn_fa` engagement counter checked per arm), the review's P2 "the 8.4×/51× are not
+repo-reproducible" closed.
+
+One rig fact the throwaway had skirted: the chunk arm records mode-0 dispatches of
+~0.3 s, and the first S 256 run (10 a frame, ~3 s one submission) hit this box's amdgpu
+hard recovery — the exact K1/P1 boundary class `COLI_VK_DMOE_ROWS_MAX` documents. The
+in-tree default keeps a frame of the chunk arms at 3 dispatches (~0.9 s of GPU work,
+comfortably under the ~2–4 s boundary; `COLI_VK_BENCH_N` overrides, the boundary is a
+rig fact, not a number to tune to).
+
+Re-measured through the in-tree copy (same box, RX 6900 XT):
+
+| case | arm | this doc (§4) | re-measured | Δ |
+|---|---|---|---|---|
+| S 1 H 64 cnt 768 | mode 0 | 1,920 µs | 1,811 µs | −5.7% |
+| S 1 H 64 cnt 768 | FA + f16 | 228 µs, 8.4× | 191 µs, 9.5× | −16% / +13% on the ratio |
+| S 1 H 64 cnt 768 | FA fp32 | 239 µs, 8.0× | 199 µs, 9.1× | −17% |
+| S 256 chunk | mode 0 | 304 ms | 305.4 ms | +0.4% |
+| S 256 chunk | FA + f16 | 6.0 ms, 51× | 6.17 ms, 49.5× | +2.8% |
+| S 256 chunk | FA fp32 | 6.3 ms | 6.57 ms, 46.5× | +4.3% |
+
+Everything inside the ±20% band the review asked to flag loudly about — nothing to
+flag. The decode rows are a little faster than §4's (same direction, both arms, so the
+ratios drift up ~13%, not down): §4's throwaway and this re-run are different sessions
+on the same box, and a best-of-3 over 200 ~2 ms dispatches carries run-to-run scatter of
+exactly this size (the chunk row's per-dispatch work dominates and it reproduces §4
+almost exactly, which is the same story).
