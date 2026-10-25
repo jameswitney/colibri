@@ -7,6 +7,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Notes
 
+- The parity wave's decode-disk lane (PW-A2, "zero-disk decode") closed **premise-falsified,
+  no code change** — the fork's `bytes=0` decode line is its *store lease counter only*: beside it
+  the same log reads `v4_direct … payload_bytes=199.82 GB`, and net of the 11,008-record prefill
+  ring pass (147.2 GB) the fork reads **52.7 GB at decode** — at parity with the port's measured
+  decode window (53.9–59.3 GB, 59–63 % of its ~92–98 GB run total; the split is derived exactly
+  from the landed decode-only `hit_rate_d` counters). "Zero-disk decode" was never the fork's
+  property — this is the placement census's second counter-class error (its §4 caught the same
+  population error in the hit-rate row and kept it in the bytes row; §1.2 row 8 stands corrected).
+  The mechanism is dead twice over on the tree's own evidence: the decode working set is
+  **~4,000–4,440 distinct experts (~102/layer) against the store's 48 slots/layer** (25.70 GiB
+  exactly spent — a perfect-oracle preload saves ≤ 2,064 of the ~4,400 loads), and the S7 arms
+  already measured the mandated `.coli_mfu` rank: the full-store seeded prewarm moved
+  decode-window misses 4,435 → 4,534 (worse), pin tenure worse still (`hit_rate_d` 68.1 → 62.9) —
+  the boot prewarm's real, kept win is TTFT −5.4 s via page-cache warming, which a prompt-end
+  preload cannot get. Where the lever actually is: the fork *hides* the same ~53 GB behind six
+  async MoE read+compute lanes (census row 7, never-tested on the port, fork-priced +23 % decode)
+  — handed to the campaign as the re-briefed PW-E. Evidence and arithmetic:
+  `docs/research/AK-pw-a2-zero-disk-decode-2026-10-25.md`.
+
 - The parity wave's first kernel slice (PW-C1, "move the LM head matmul to the
   device") closed **premise-falsified, no code change**: the head matmul already
   runs on the Vulkan device at the standing config — the prompt tail and every

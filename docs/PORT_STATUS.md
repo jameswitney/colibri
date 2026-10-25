@@ -229,3 +229,38 @@ PORT_PLAN below is the 2026-10-19/22 decision record; its F-number statuses are 
   138–142 s expectation was D-contingent and is withdrawn). D11 text counts: C0 3/3 stable, 9/9 armed reps
   diverge (G mid-text — the residency class; F/GF from token 1 — the FA numerics class; GF ≠ F: the
   levers are additive in time, not in tokens). Full record: `docs/research/AI-pw-w1-2026-10-25.md`.
+## Session 2026-10-25 VI (PW-A2 — zero-disk decode: closed premise-falsified, lane pw-a2)
+
+- **PW-A2 closed on `port/pw-a2` without a lever** (from `d30df627`, the W1 harvest; docs-only —
+  the manager confirmed the close on the Step-0 evidence). The lane's pre-registered frame was the
+  census's decode-disk asymmetry (fork `expert_requests=0 bytes=0` at decode vs the port's ~92 GB
+  run bytes): *cover the decode hot set in the store's RAM at prompt-end, ranked by `.coli_mfu`*.
+  **Step 0 split the ~92 GB first**: the decode window owns **4,030–4,534 loads / 53.9–60.6 GB
+  (59–63 % of run bytes, ~64 misses/token sustained)**; boot-warm + prefill-window owns the other
+  ~2,800–3,100 / 37–41 GB — the magnitude premise held (the <5 GB stop rule did not fire). **But
+  the asymmetry premise is false**: the fork's `bytes=0` counts its store lease path only; beside
+  it the same log reads `v4_direct reads=15880 payload_bytes=199.82 GB`, and net of the 11,008-record
+  prefill ring pass the fork reads **52.7 GB at decode** (its noexperts arm: 5,113 store misses =
+  exactly 5,113 direct reads, 55.7 GB) — **parity** with the port. Census §1.2 row 8 stands
+  corrected (the same counter-population error §4 caught in the hit-rate row). **And the mechanism
+  is dead on the tree's own measurements**: the decode working set is ~4,000–4,440 distinct experts
+  (~102/layer) against the store's 48 slots/layer (25.70 GiB exactly spent) — 2.1× over capacity,
+  so even a perfect-oracle preload saves ≤ 2,064 of the ~4,400 loads; the S7 arms already measured
+  the mandated rank (full-store `.coli_mfu` prewarm: decode misses 4,435 → 4,534 *worse*;
+  F32/F48 pin tenure worse still, `hit_rate_d` 68.1 → 62.9), and the prewarm's kept win — TTFT
+  −5.4 s via page-cache warming of prefill's stream — is exactly what a prompt-end preload cannot
+  get. **The redirect the close hands the campaign**: the fork hides the same ~53 GB behind its six
+  async MoE read+compute lanes (census row 7, never-tested on the port, fork-priced +23 % decode;
+  the port computes non-device experts inline — 821.9 ms/tok of its 1,619.5 ms/tok decode wall,
+  V-g1) — re-briefed as PW-E, "the lanes design against the measured 54–59 GB decode-window read
+  mass". **The gate run found and repaired the W1 hotfix's own debt, test-only**: `d73b82e1`
+  made fmt 15 opt-in without updating PW-D's `packed_scales` case, so `vk-tier-check` (and
+  `vk-strict-check`'s unset leg, which re-runs that binary) were red at the branch point — the
+  repair keeps the env-independent identity/scale-word checks in the default leg, moves the
+  byte-shrink half to a new armed `fmt15` leg (`COLI_VK_TIER_FMT15=1 … fmt15`, the host-pairs
+  pattern; asserts 12.75 vs 15.00 MiB ×1.1765 verbatim, and holds whichever way the default
+  later lands). Gates green at the close head: tier ×3 legs, chain 12,039 frames, strict (one
+  timing-jitter flake between its comparison legs, green on re-run and byte-identical by hand),
+  tiny ×2 (torch absent — the banked fixture, weights borrowed read-only), tiny-dmoe 8 legs,
+  serve-framing, cu_tier syntax; no ENVIRONMENT row (no knob landed).
+  Report: `docs/research/AK-pw-a2-zero-disk-decode-2026-10-25.md`.
