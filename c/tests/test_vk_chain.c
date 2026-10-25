@@ -36,7 +36,8 @@
  *            and its window, the recurrence and its state over two submissions, the
  *            decay, beta, output norm and gate
  *   mhc      hyper_connections.h's split, collapse and write back, the mean, and the
- *            clamped SwiGLU
+ *            clamped SwiGLU; the S=1 fused pair (COLI_VK_CHAIN_MHC_S1) against the
+ *            standing chain the engine records at one row
  *   kda k3   Kimi K3's KDA layer (kimi_k3.c's kda_forward): exp(A_log) as the engine
  *            keeps it, its order of the l2 norms and the update, over two submissions
  *   ares     Kimi K3's attention residuals (res_mix) over 0 to 15 block snapshots, and
@@ -1426,6 +1427,92 @@ static void test_mhc(int H, int D, int iters) {
     vkc_free(gab); vkc_free(uab); vkc_free(yb); coli_vk_tensor_free(t);
     free(x); free(fn); free(br); free(prm); free(rpre); free(rpost); free(rcomb); free(rout); free(rmean);
     free(hp); free(col); free(out); free(mean); free(ga); free(ua); free(rr); free(yy);
+}
+
+/* the S=1 single-dispatch mHC pair (chain_mhc_dec.comp, COLI_VK_CHAIN_MHC_S1) against
+ * the standing chain the engine records at one row (the fn matmul, SPLIT, COLLAPSE,
+ * the bf16 round, the norm, the round, then POST and its round) -- the mission's oracle:
+ * the fused pair is a thresholded class against it (the fork's bodies: the affine and
+ * collapse products single-rounding fmas, fma reduction trees, (x*inv)*w). The hp layout
+ * and the CPU's sinkhorn (over the device's own mixes) guard the port against a layout
+ * slip both device paths could share. */
+static void test_mhc_dec(int H, int D, int iters) {
+    int S = 1, HD = H * D, nm = (2 + H) * H, hrow = 2 * H + H * H, noff = 3 + nm + 5;
+    float eps = 1e-6f, hce = 1e-6f;
+    float *x = fvec((size_t)S * HD, 1.f), *fn = fvec((size_t)nm * HD, 0.05f), *br = fvec((size_t)S * D, 1.f);
+    float *prm = malloc(((size_t)noff + D) * 4);
+    for (int i = 0; i < 3; i++) prm[i] = 0.5f + (rnd() % 100) / 100.f;
+    for (int i = 0; i < nm; i++) prm[3 + i] = frnd() * 0.5f;
+    for (int i = 0; i < D; i++) prm[noff + i] = 1.f + frnd() * 0.5f;   /* the branch norm's weight */
+    ColiVkTensor *t = NULL;
+    if (!coli_vk_tensor_ensure(&t, fn, NULL, 10, HD, nm, 0)) { CHECK(0, "mhc dec: upload"); return; }
+    VkcBuf *xb = up(x, (size_t)S * HD), *bb = up(br, (size_t)S * D), *pb = up(prm, (size_t)noff + D);
+    VkcBuf *mb = vkc_buf((size_t)S * nm * 4, VKC_DEV);
+    VkcBuf *hb = vkc_buf((size_t)S * hrow * 4, VKC_DEV), *cb = vkc_buf((size_t)S * D * 4, VKC_DEV);
+    VkcBuf *nb = vkc_buf((size_t)S * D * 4, VKC_DEV), *ob = vkc_buf((size_t)S * HD * 4, VKC_DEV);
+    VkcBuf *hb2 = vkc_buf((size_t)S * hrow * 4, VKC_DEV), *nb2 = vkc_buf((size_t)S * D * 4, VKC_DEV);
+    VkcBuf *ob2 = vkc_buf((size_t)S * HD * 4, VKC_DEV), *ob3 = vkc_buf((size_t)S * HD * 4, VKC_DEV);
+    VkcMhc sp = {S, H, D, iters, 0, HD, 0, nm, 0, hrow, 0, D, 0, 0, eps, hce, 0.f};
+    VkcMhc po = {S, H, D, iters, 0, HD, 0, D, 0, hrow, 0, HD, 0, 0, eps, hce, 0.f};
+    VkcNorm np = {S, D, 1, 0, D, D, 0, D, D, noff, 0, 0, eps, 1.f};
+    VkcDsRound rp = {VKC_DS_BF16, S, 1, D, 0, 0, 0, 0, 0, 0, 0, 0, 0.f};
+    VkcDsRound rpo = {VKC_DS_BF16, S, 1, HD, 0, 0, 0, 0, 0, 0, 0, 0, 0.f};
+    /* the standing chain, exactly v4c_pre / v4c_post's dispatches at one row */
+    int ok = vkc_begin() && vkc_matmul(t, xb, 0, mb, 0, S) && vkc_mhc(VKC_MHC_SPLIT, xb, mb, hb, pb, NULL, &sp) &&
+             vkc_mhc(VKC_MHC_COLLAPSE, xb, NULL, hb, NULL, cb, &sp) && vkc_dsv4_round(cb, cb, &rp) &&
+             vkc_norm(cb, pb, nb, &np) && vkc_dsv4_round(nb, nb, &rp) &&
+             vkc_mhc(VKC_MHC_POST, xb, bb, hb, NULL, ob, &po) && vkc_dsv4_round(ob, ob, &rpo) && vkc_submit(1);
+    /* the fused pair, the lever armed: the same mix row, then the two dispatches */
+    VkcMhcDec dp = {H, D, iters, 0, 0, 0, 0, 0, noff, eps, hce, eps};
+    setenv("COLI_VK_CHAIN_MHC_S1", "1", 1);
+    VkcStats s0; vkc_stats(&s0);
+    int ok2 = vkc_begin() && vkc_matmul(t, xb, 0, mb, 0, S) && vkc_mhc_dec(0, xb, mb, hb2, pb, nb2, &dp) &&
+              vkc_mhc_dec(1, xb, bb, hb2, NULL, ob2, &dp) && vkc_mhc_dec(1, xb, bb, hb2, NULL, ob3, &dp) && vkc_submit(1);
+    VkcStats s1; vkc_stats(&s1);
+    unsetenv("COLI_VK_CHAIN_MHC_S1");
+    float *hp = down(hb, 0, hrow), *nrm = down(nb, 0, D), *out = down(ob, 0, HD);
+    float *hp2 = down(hb2, 0, hrow), *nrm2 = down(nb2, 0, D), *out2 = down(ob2, 0, HD), *out3 = down(ob3, 0, HD);
+    /* hp against the CPU's sinkhorn over the device's own mixes (the layout guard) */
+    float *mix = down(mb, 0, nm), *cpu = malloc((size_t)hrow * 4);
+    {
+        float ms = 0; for (int i = 0; i < HD; i++) ms += x[i] * x[i];
+        float ir = 1.f / sqrtf(ms / HD + eps), *mx = malloc((size_t)nm * 4);
+        for (int r = 0; r < nm; r++) mx[r] = mix[r] * ir;
+        coli_hc_split_sinkhorn(cpu, cpu + H, cpu + 2 * H, mx, prm, prm + 3, H, iters, hce);
+        free(mx);
+    }
+    double ehp = 0, ecpu = 0, enrm = 0, eout = 0, mn = 1e-6, mo = 1e-6; int bn = 1, bo = 1;
+    for (int i = 0; i < hrow; i++) {
+        double d = fabs((double)hp2[i] - hp[i]), dc = fabs((double)hp2[i] - cpu[i]);
+        if (d > ehp) ehp = d; if (dc > ecpu) ecpu = dc;
+    }
+    for (int i = 0; i < D; i++) { double d = fabs((double)nrm2[i] - nrm[i]); if (d > enrm) enrm = d;
+        double a = fabs((double)nrm[i]); if (a > mn) mn = a; bn &= nrm2[i] == nrm[i]; }
+    for (int i = 0; i < HD; i++) { double d = fabs((double)out2[i] - out[i]); if (d > eout) eout = d;
+        double a = fabs((double)out[i]); if (a > mo) mo = a; bo &= out2[i] == out[i]; }
+    int bits2 = 1;
+    for (int i = 0; i < HD; i++) bits2 &= out2[i] == out3[i];   /* the same bits a second run */
+    CHECK(ok && ok2 && ehp < 2e-5 && ecpu < 5e-6 && enrm / mn < 8e-3 && eout / mo < 8e-3 && bits2 &&
+          !bad(nrm2, D) && !bad(out2, HD) && s1.mhc_dec - s0.mhc_dec == 3,
+          "mhc dec H %d D %d iters %d: ok %d/%d hp %.2e (cpu %.2e) nrm %.2e out %.2e%s",
+          H, D, iters, ok, ok2, ehp, ecpu, enrm / mn, eout / mo, bits2 ? "" : ", UNSTABLE BITS");
+    printf("  mhc dec H %d D %d iters %d: hp %.2e (cpu %.2e) nrm %.2e (%d/%d bits) out %.2e (%d/%d bits), engaged %llu\n",
+           H, D, iters, ehp, ecpu, enrm / mn, bn, D, eout / mo, bo, HD, s1.mhc_dec - s0.mhc_dec);
+    /* the refusals: a D past the shader's cap declines under the armed lever, and the
+     * lever unset never engages */
+    setenv("COLI_VK_CHAIN_MHC_S1", "1", 1);
+    VkcMhcDec badp = dp; badp.D = 4097;
+    int took = vkc_mhc_dec(0, xb, mb, hb2, pb, nb2, &badp);
+    vkc_stats(&s0);
+    unsetenv("COLI_VK_CHAIN_MHC_S1");
+    took = took || vkc_mhc_dec(0, xb, mb, hb2, pb, nb2, &dp);
+    vkc_stats(&s1);
+    CHECK(!took && s1.mhc_dec == s0.mhc_dec,
+          "mhc dec refuse: D past the cap declines armed, the lever off never records");
+    vkc_free(xb); vkc_free(bb); vkc_free(pb); vkc_free(mb); vkc_free(hb); vkc_free(cb); vkc_free(nb); vkc_free(ob);
+    vkc_free(hb2); vkc_free(nb2); vkc_free(ob2); vkc_free(ob3); coli_vk_tensor_free(t);
+    free(x); free(fn); free(br); free(prm); free(hp); free(nrm); free(out); free(hp2); free(nrm2);
+    free(out2); free(out3); free(mix); free(cpu);
 }
 
 /* k-pooling against sparse_index.h. Equal gates and no bias make each pooled key the
@@ -4681,6 +4768,10 @@ int main(int argc, char **argv) {
         printf("kda done\n");
         test_mhc(2, 64, 3); test_mhc(4, 96, 20); test_mhc(3, 40, 1);
         printf("mhc done\n");
+        /* the S=1 fused pair against the standing chain (COLI_VK_CHAIN_MHC_S1): the
+         * model's geometry, the tiny's, the widest streams */
+        test_mhc_dec(4, 4096, 20); test_mhc_dec(2, 128, 3); test_mhc_dec(8, 2048, 1);
+        printf("mhc dec done\n");
         test_kda_k3(2, 16, 4, 1.f); test_kda_k3(3, 32, 4, 1.f); test_kda_k3(2, 128, 4, 1.f); test_kda_k3(1, 64, 2, 1.f);
         test_kda_k3(2, 16, 4, 0.002f);
         printf("kda k3 done\n");

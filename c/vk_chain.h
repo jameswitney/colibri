@@ -389,6 +389,17 @@ int vkc_mhc_ready(void);
 typedef struct { int S, H, D, iters, x_off, x_row, m_off, m_row, hp_off, hp_row, y_off, y_row, prm_off, n;
                  float eps, hc_eps, lim; } VkcMhc;
 int vkc_mhc(int mode, VkcBuf *x, VkcBuf *m, VkcBuf *hp, VkcBuf *prm, VkcBuf *y, const VkcMhc *p);
+/* the S=1 single-dispatch pair of the same op (chain_mhc_dec.comp, COLI_VK_CHAIN_MHC_S1;
+ * the fork's mhc_dec_{pre,post}.comp on chain_mhc's buffers): one row of H streams of D
+ * floats at x_off -- mode 0 the whole pre tail (RMS-inverse, Sinkhorn, collapse, branch
+ * RMSNorm, the bf16 rounds folded) of the mixes m at m_off with the hc scale/base at
+ * hc_off and the branch norm weight at n_off in prm, into hp (chain_mhc's layout, a
+ * standing POST can read it) and the normed row y at y_off; mode 1 the post of the
+ * branch m at m_off, y[j*D+d] = sum_i hp's comb * x + post[j]*m[d], bf16-rounded.
+ * Refuses (and the caller's standing chain runs) unless the lever is on and H <= 8,
+ * D <= 4096, iters >= 1 (mode 0); thresholded numerics, D11's class */
+typedef struct { int H, D, iters, x_off, m_off, hp_off, y_off, hc_off, n_off; float eps, hc_eps, n_eps; } VkcMhcDec;
+int vkc_mhc_dec(int mode, VkcBuf *x, VkcBuf *m, VkcBuf *hp, VkcBuf *prm, VkcBuf *y, const VkcMhcDec *p);
 /* Inkling's ops, their pipelines made on first use (an engine checks *_ready at setup:
  * a build without the shader keeps every other op, and that engine's chain off).
  * chain_sconv.comp (mode 0: the depthwise causal short convolution, residual inside, in
@@ -872,6 +883,7 @@ typedef struct {
     unsigned long long mm8;            /* fmt-12 matmuls on the tiled GEMM (qmatmul_mm8.comp, COLI_VK_MM8) */
     unsigned long long mm8_split;      /* of those, the split-K ones (partial planes + the ascending-k reduce) */
     unsigned long long attn_fa;        /* DeepSeek V4 attentions on the flash tile (chain_dsv4_fa.comp, COLI_VK_CHAIN_ATTN_FA) */
+    unsigned long long mhc_dec;        /* single-row mHC sites on the fused pair (chain_mhc_dec.comp, COLI_VK_CHAIN_MHC_S1) */
     /* COLI_VK_CHAIN_DPROF=1 (vkc_dwin/vkc_role): the decode window -- the forwards of one
      * row and the frames submitted in them, by role: the host's fence waits on those
      * frames, their device time (COLI_VK_CHAIN_PROF's timestamps; 0 without it) and the

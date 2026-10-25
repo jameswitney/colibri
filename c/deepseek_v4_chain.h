@@ -1091,12 +1091,16 @@ static int v4c_rope(V4Chain *ch, VkcBuf *x, int nseg, int per_row, int x_off, in
     return vkc_dsv4_rope(x, ch->cs, &p);
 }
 /* mHC's entry for a site (hc_pre with its own mix): the mix, the split into hp, the
- * collapse, bf16, the norm, bf16, into nrm */
+ * collapse, bf16, the norm, bf16, into nrm; at one row COLI_VK_CHAIN_MHC_S1 takes the
+ * fork's single-dispatch tail instead (the whole chain after the mix in one workgroup) */
 static int v4c_pre(V4Chain *ch, ColiVkTensor *fn, size_t hco, VkcBuf *hp, size_t lno, int n) {
     const ColiDeepSeekV4Config *c = &ch->engine->config;
     int H = ch->H, D = ch->D, HD = ch->HD;
     VkcMhc sp = {n, H, D, c->hc_sinkhorn_iters, 0, HD, 0, ch->nm, 0, ch->hr, 0, D, (int)hco, 0, c->rms_norm_eps, c->hc_eps, 0.f};
-    return vkc_matmul(fn, ch->xs, 0, ch->mix, 0, n) && vkc_mhc(VKC_MHC_SPLIT, ch->xs, ch->mix, hp, ch->prm, NULL, &sp) &&
+    VkcMhcDec dp = {H, D, c->hc_sinkhorn_iters, 0, 0, 0, 0, (int)hco, (int)lno, c->rms_norm_eps, c->hc_eps, c->rms_norm_eps};
+    if (!vkc_matmul(fn, ch->xs, 0, ch->mix, 0, n)) return 0;
+    if (n == 1 && vkc_mhc_dec(0, ch->xs, ch->mix, hp, ch->prm, ch->nrm, &dp)) return 1;
+    return vkc_mhc(VKC_MHC_SPLIT, ch->xs, ch->mix, hp, ch->prm, NULL, &sp) &&
            vkc_mhc(VKC_MHC_COLLAPSE, ch->xs, NULL, hp, NULL, ch->col, &sp) && v4c_bf16(ch->col, n, D, 0, D) &&
            v4c_norm(ch, ch->col, 0, D, lno, ch->nrm, 0, D, n, D, 0) && v4c_bf16(ch->nrm, n, D, 0, D);
 }
@@ -1104,8 +1108,14 @@ static int v4c_pre(V4Chain *ch, ColiVkTensor *fn, size_t hco, VkcBuf *hp, size_t
 static int v4c_post(V4Chain *ch, VkcBuf *hp, int n) {
     const ColiDeepSeekV4Config *c = &ch->engine->config;
     VkcMhc po = {n, ch->H, ch->D, c->hc_sinkhorn_iters, 0, ch->HD, 0, ch->D, 0, ch->hr, 0, ch->HD, 0, 0, c->rms_norm_eps, c->hc_eps, 0.f};
+    VkcBuf *t;
+    VkcMhcDec dp = {ch->H, ch->D, 0, 0, 0, 0, 0, 0, 0, 0.f, 0.f, 0.f};
+    if (n == 1 && vkc_mhc_dec(1, ch->xs, ch->br, hp, NULL, ch->xn, &dp)) {
+        t = ch->xs; ch->xs = ch->xn; ch->xn = t;
+        return 1;
+    }
     if (!vkc_mhc(VKC_MHC_POST, ch->xs, ch->br, hp, NULL, ch->xn, &po) || !v4c_bf16(ch->xn, n, ch->HD, 0, ch->HD)) return 0;
-    VkcBuf *t = ch->xs; ch->xs = ch->xn; ch->xn = t;
+    t = ch->xs; ch->xs = ch->xn; ch->xn = t;
     return 1;
 }
 

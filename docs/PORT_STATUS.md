@@ -229,3 +229,27 @@ PORT_PLAN below is the 2026-10-19/22 decision record; its F-number statuses are 
   138–142 s expectation was D-contingent and is withdrawn). D11 text counts: C0 3/3 stable, 9/9 armed reps
   diverge (G mid-text — the residency class; F/GF from token 1 — the FA numerics class; GF ≠ F: the
   levers are additive in time, not in tokens). Full record: `docs/research/AI-pw-w1-2026-10-25.md`.
+## Session 2026-10-25 VI (PW-C3 — the S=1 mHC fusion slice, manager-run parity wave 2)
+
+- **PW-C3 landed on `port/pw-c3`** (from `d30df627`, sole writer): `COLI_VK_CHAIN_MHC_S1`
+  (default off, byte-identical unset) — the fork's single-dispatch decode mHC pair
+  (`mhc_dec_{pre,post}.comp`, its Level-1 fusion) as `chain_mhc_dec.comp` on `chain_mhc`'s
+  buffers, offsets and hp layout. A one-row mHC site drops 8 dispatches → 3 (the fn matmul +
+  one 256-thread workgroup for the whole pre tail + one thread-an-output post, the bf16
+  rounds folded); any refusal (streams > 8, hidden > 4096, a missing pipeline) records the
+  standing chain. The premise held (the port's S=1 path was 6+2 dispatches a site, not
+  single-dispatch — no C1 recurrence); the fork's own record for the pair is an op-tick wash
+  (0.317–0.321 vs 0.306–0.311 ms/call) with its +19 % decode win in the serialized host
+  path the port's in-frame chain never had — this is the in-frame consolidation slice.
+  Unit oracle vs the standing path at S=1: hp 5.8e-11 (fma class) and **bit-identical bf16
+  outputs at the model geometry** (one flip in 16384 at H=8); the tiny oracle **token-exact
+  with the lever on** (it engages there — tiny hc_mult 2/128/3); model-scale smoke rc=0,
+  coherent, engagement exact (mhc −5418, norm −5418, rounds −16254 = 63 fwd × 43 layers × 2
+  sites; GEMV/dsa/mm8 +0), the three buckets' device time −422 ms whole-run ≈ −6.7 ms/tok —
+  the wash-to-small class the dossier's L5 pre-registered, not the census' −20…−30 (which
+  priced the host-loop class). Gates: chain/tier/strict/tiny ×3 arms all PASS — after the
+  lane re-armed `test_vk_tier`'s `packed_scales` around `COLI_VK_TIER_FMT15` (**the gates
+  were red at the branch point** through the W1 hotfix's missed test update, proven on a
+  clean `git archive d30df627` tree; PW-D's debt, test-only, two lines). No bench arms (one
+  confounded first smoke kept as evidence of the boot-time VRAM co-tenancy hazard; the clean
+  pair is `pw-c3-mhc-smoke-{off,on2}`). Report: `docs/research/AL-pw-c3-mhc-s1-fusion-2026-10-25.md`.

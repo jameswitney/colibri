@@ -741,6 +741,9 @@ VK_SPV   += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv
 VK_SPV   += shaders/chain_mla.spv shaders/chain_hgemv.spv shaders/chain_dsa.spv
 # Kimi Delta Attention and manifold-constrained hyper-connections (vk_chain.h)
 VK_SPV   += shaders/chain_kda.spv shaders/chain_kda_rows.spv shaders/chain_mhc.spv
+# the single-row mHC pair (COLI_VK_CHAIN_MHC_S1; the fork's mhc_dec_{pre,post}.comp on
+# chain_mhc's contract), optional at run time -- the lever off never loads it
+VK_SPV   += shaders/chain_mhc_dec.spv
 # the int8 decode GEMV with per-matrix rows per workgroup (optional at run time)
 VK_SPV   += shaders/chain_gemv2.spv
 # DeepSeek V4.1 Flash and DeepSeek V4 attention (vk_chain.h: vkc_dsv4_*)
@@ -1060,6 +1063,12 @@ shaders/qmatmul_grp_gate_up_qc.spv: shaders/qmatmul_grp_qc.comp
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
+# the single-row mHC pair takes no defines (its caps are runtime refusals); same glslc
+# fallback as the flash tile: a deployment without glslc keeps the committed .spv
+shaders/chain_mhc_dec.spv: shaders/chain_mhc_dec.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
 shaders/chain_qsa.spv: shaders/chain_qsa.h
 # chain_attn_flash.comp needs the same glslc as qmatmul_coop.comp below, with the same
 # fallback; without its .spv the chain keeps chain_attn.comp.
