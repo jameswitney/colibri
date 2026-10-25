@@ -2382,6 +2382,10 @@ void coli_vk_host_buffer_free(void *buf, void *mem, size_t bytes) {
 int coli_vk_tensor_import(ColiVkTensor **tensor, const void *weights, size_t alloc_bytes, const float *scales,
                           int fmt, int I, int O, int gs) {
     if (*tensor) return (*tensor)->fmt == fmt && (*tensor)->I == I && (*tensor)->O == O;
+    /* fmt 15 (MXFP4 with packed ue8m0 scales) is the tier's form, uploaded by vk_tier.c's
+     * convert (upload_tensor_pool's refusal): the import would stamp gs 0 and hand the
+     * shaders the scale bytes as floats */
+    if (fmt == 15) return 0;
 #ifdef VK_EXT_external_memory_host
     size_t al = coli_vk_import_alignment();
     if (!al || !fmt_uploadable(fmt, gs) || O < 1 || I < 1) return 0;
@@ -2505,11 +2509,14 @@ static void vk_prof_paths(void) {
 }
 
 /* Formats the cooperative-matrix GEMM takes: decoded weights exact in fp16, and group
- * boundaries on its staged steps (one group scale per step). */
+ * boundaries on its staged steps (one group scale per step). Not fmt 15: tier tensors
+ * never carry scales_wide's f16-range flag (their scales are bytes, not the floats it
+ * reads), so a packed scale past fp16's range would reach this GEMM unguarded -- the
+ * fp32 GEMM takes the form until a cooperative-matrix rig proves the packed decode. */
 static int coop_fmt(const ColiVkTensor *t) {
     int gs = t->fmt == 5 ? 64 : t->gs;
     return !t->wide && (t->fmt == 1 || t->fmt == 2 ||
-           ((t->fmt == 4 || t->fmt == 5 || t->fmt == 7 || t->fmt == 12 || t->fmt == 15) && gs % G.coop_t[0].bk == 0));
+           ((t->fmt == 4 || t->fmt == 5 || t->fmt == 7 || t->fmt == 12) && gs % G.coop_t[0].bk == 0));
 }
 /* Its x upload: the rows, then their powers of two rs[s] = 2^(15-e) with
  * max|x[s,:]| < 2^e, so a scaled row stays under 2^15 (fp16 max 65504) and its hi/lo
@@ -4527,7 +4534,7 @@ static void xb_coop_init(XbCtx *X) {
 static int xb_coop_slot(XbCtx *X, const ColiVkTensor *t, int rows, int gemm) {
     int k = t->fmt == 1 || t->fmt == 2 || t->fmt == 4 || t->fmt == 5 ? 0 : coop_slot(rows);
     if (!X->coop_rows || rows < X->coop_rows || !X->p_coop[k] || !coop_fmt(t)) return -1;
-    if (t->fmt == 7 || t->fmt == 12 || t->fmt == 15) {
+    if (t->fmt == 7 || t->fmt == 12) {
         int cbn = G.coop_t[k].bn, fbn = X->gemm_t[gemm].bn;
         if ((rows + cbn - 1) / cbn * cbn > (rows + fbn - 1) / fbn * fbn) return -1;
     }
@@ -7273,6 +7280,28 @@ static int run_late_cases(void) {
     bad |= run_import_case(10, 3, 1024, 100);
     bad |= run_import_case(14, 1, 4096, 257);
     bad |= run_import_case(14, 96, 4096, 257);
+    {   /* fmt 15 is the tier's form (its scales ue8m0 bytes, uploaded by vk_tier.c's
+         * convert): the plain upload and the import both refuse it -- either would hand
+         * the shaders the bytes as float scales, the import also a tensor of gs 0 */
+        float *x, *sc; uint8_t *w; case_fill(15, 1, 512, 512, &x, &w, &sc);
+        ColiVkTensor *t = NULL;
+        int up = coli_vk_tensor_ensure(&t, w, sc, 15, 512, 512, 32);
+        if (up) { coli_vk_tensor_free(t); t = NULL; }
+        int im = 0;
+        size_t al = coli_vk_import_alignment();
+        if (al) {   /* a device that can import: the refusal is fmt 15's, not the gate's */
+            size_t bytes = ref_rowbytes(15, 512) * 512, sz = (bytes + al - 1) / al * al;
+            void *host = NULL;
+            if (!posix_memalign(&host, al, sz)) {
+                t = NULL;
+                im = coli_vk_tensor_import(&t, host, sz, sc, 15, 512, 512, 32);
+                free(host);
+            }
+        }
+        if (up || im) { printf("fmt 15: upload %d, import %d -- the tier's form must be refused\n", up, im); bad = 1; }
+        coli_vk_tensor_free(t);
+        free(x); free(w); free(sc);
+    }
     printf("f16 and import digest %016llx\n", (unsigned long long)g_digest);
     g_digest = keep;
     return bad;
