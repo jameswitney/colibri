@@ -11,7 +11,8 @@
 # What it runs: DeepSeek V4 Flash (MODEL, default the rig's path) on a ~100-token
 # prompt for 16 tokens, and checks:
 #   rc = 0;
-#   a non-empty generated_text of real words (not just whitespace or one token);
+#   a non-empty generated_text of real words (not just whitespace, one token, or a
+#     degenerate repetition like "the the the" -- at least 2 distinct words);
 #   no failure lines in the log ("chained block failed", "device is lost", a
 #     non-finite router class, a submit that failed).
 # SKIPS cleanly (exit 0, a SKIP line) when the model directory, the Vulkan
@@ -55,16 +56,25 @@ VRAM0=""
 [ -z "$HOLDERS" ] || fail "the GPU has holders ($HOLDERS); settle the card and retry"
 
 LOG=${DEEPSEEK_V4_SMOKE_LOG:-$(mktemp -t dsv4-smoke-XXXXXX.log)}
+KEEP=$(mktemp -d -t dsv4-smoke-state-XXXXXX)   # the off-rig hold: the model's own state, aside for the run
 
 # The rig's frozen expert-history snapshots, where they exist (the bench arms'
 # protocol): copied in before the run so the warm start plans by the same counts
 # every run, and back in after it (the engine writes its own counts at exit) so
-# the gate leaves the shared model's history exactly as it found it
+# the gate leaves the shared model's history exactly as it found it. Off the rig
+# (no bench/*.fixed) the model's own counts are held aside in $KEEP and returned
+# after -- the gate must not leave its own exit-time counts in any host's model.
 for s in coli_usage coli_mfu; do
-    [ -f "/root/Projects/colibri-upstream/bench/$s.fixed" ] && \
+    if [ -f "/root/Projects/colibri-upstream/bench/$s.fixed" ]; then
         cp "/root/Projects/colibri-upstream/bench/$s.fixed" "$MODEL/.$s"
+    elif [ -f "$MODEL/.$s" ]; then
+        cp "$MODEL/.$s" "$KEEP/$s"
+    fi
 done
-rm -f "$MODEL/.coli_ckpt"   # no cold-KV restore in a smoke leg
+# the cold-KV checkpoint must not steer a smoke leg, but it is the model's own
+# state: held aside, not deleted, and returned after the run
+CKPT_OWN=0
+if [ -f "$MODEL/.coli_ckpt" ]; then mv "$MODEL/.coli_ckpt" "$KEEP/coli_ckpt"; CKPT_OWN=1; fi
 
 echo "deepseek-v4-smoke: model $MODEL, prompt ~100 tokens, $TOKENS tokens out, vram0=${VRAM0:-?}B ($VRAM_SYSFS), tier fmt ${COLI_VK_TIER_FMT15:-default}"
 
@@ -76,11 +86,22 @@ timeout "$TIMEOUT_S" env COLI_VULKAN=1 COLI_TEMP=0 KVSAVE=0 V4_PREFIX_CKPT=0 COL
 rc=$?
 set -e
 # and back out: the engine writes its own counts at exit, so the frozen snapshots
-# return (every rig consumer copies them in fresh anyway -- the arms' protocol)
+# return (every rig consumer copies them in fresh anyway -- the arms' protocol);
+# off the rig the model's own held-aside counts return (or their absence does,
+# where the model never had any), and the checkpoint comes back -- the gate
+# leaves the model's directory exactly as it found it on any host
 for s in coli_usage coli_mfu; do
-    [ -f "/root/Projects/colibri-upstream/bench/$s.fixed" ] && \
+    if [ -f "/root/Projects/colibri-upstream/bench/$s.fixed" ]; then
         cp "/root/Projects/colibri-upstream/bench/$s.fixed" "$MODEL/.$s"
+    elif [ -f "$KEEP/$s" ]; then
+        cp "$KEEP/$s" "$MODEL/.$s"
+    else
+        rm -f "$MODEL/.$s"
+    fi
 done
+rm -f "$MODEL/.coli_ckpt"   # whatever the run left; the pre-run one returns below
+[ "$CKPT_OWN" = 1 ] && mv "$KEEP/coli_ckpt" "$MODEL/.coli_ckpt"
+rm -rf "$KEEP"
 echo "deepseek-v4-smoke: rc=$rc, log $LOG"
 
 # absent environment is a skip, not a failure
@@ -95,10 +116,14 @@ grep -qi "device is lost" "$LOG" && fail "device is lost (log $LOG)"
 grep -q "submit failed" "$LOG" && fail "a submit failed (log $LOG)"
 grep -Eq "\[VK\][^(]*failed [1-9][0-9]*" "$LOG" && fail "a [VK] failed counter is nonzero (log $LOG)"
 
-# a real generation: the line exists and carries words
-TXT=$(grep -m1 "^generated_text=" "$LOG" | cut -d= -f2-)
+# a real generation: the line exists and carries words. The || true inside the
+# substitution keeps set -e from aborting on the missing line -- the fail below
+# owns that verdict, with its message.
+TXT=$(grep -m1 "^generated_text=" "$LOG" | cut -d= -f2- || true)
 [ -n "$TXT" ] || fail "no generated_text line (log $LOG)"
 WORDS=$(echo "$TXT" | wc -w)
-[ "$WORDS" -ge 3 ] || fail "generated_text is not coherent text ($WORDS words: '$TXT')"
+UNIQUE=$(echo "$TXT" | tr -s '[:space:]' '\n' | sort -u | grep -c . || true)
+[ "$WORDS" -ge 3 ] && [ "$UNIQUE" -ge 2 ] || \
+    fail "generated_text is not coherent text ($WORDS words, $UNIQUE distinct: '$TXT')"
 echo "deepseek-v4-smoke: PASS (${WORDS} words: $(echo "$TXT" | cut -c1-72)...)"
 exit 0
