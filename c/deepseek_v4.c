@@ -14082,7 +14082,7 @@ static void v4_vkt_note(const ColiExpertView *view) {
  * load_batch and every fill leases exactly as before. Only BC_STREAM fills ever come
  * through here: residents are never loaded, the warm start goes through vkt_put, and
  * the CPU path leases on its own. */
-typedef struct { ColiExpertView view; unsigned char *buffer; int stage; } V4VkHold;
+typedef struct { ColiExpertView view; unsigned char *buffer; int stage; int ring; } V4VkHold;
 enum { V4_VKT_STAGE_N = 8, V4_VKT_STAGE_CAP = 16u << 20 };
 static unsigned char *v4_vkt_stage[V4_VKT_STAGE_N];
 static unsigned char v4_vkt_stage_busy[V4_VKT_STAGE_N];
@@ -14115,10 +14115,17 @@ static int v4_vkt_stage_take(void) {
         if (!v4_vkt_stage_busy[i]) { v4_vkt_stage_busy[i] = 1; return i; }
     return -1;
 }
+static void v4_vkt_ring_stage_back(int stage);   /* the ring's own pool, below: a ring hold's release frees it (PW-B2) */
 static void v4_vkt_unhold(void *ctx, void *h) {
     V4VkHold *hold = h;
     if (!hold) return;
-    if (hold->stage >= 0) v4_vkt_stage_busy[hold->stage] = 0;   /* the pool's buffer back */
+    /* A hold's stage indexes the pool that handed it out, and the two pools are never
+     * shared (the engine's is handed out on the engine thread alone, the ring's on the
+     * worker alone). Freeing the wrong one leaks the ring's pool after its first job --
+     * every job after filled nothing -- and falsely frees an engine stage a concurrent
+     * engine fill may be reading into. */
+    if (hold->ring) v4_vkt_ring_stage_back(hold->stage);
+    else if (hold->stage >= 0) v4_vkt_stage_busy[hold->stage] = 0;   /* the engine pool's buffer back */
     else coli_expert_release((ColiExpertStore *)ctx, &hold->view);
     free(hold->buffer); free(hold);
 }
@@ -14221,6 +14228,9 @@ static int v4_vkt_load_batch(void *ctx, int layer, const int *eids, int n,
  * made once and kept for the process, like the engine's own. */
 static unsigned char *v4_vkt_ring_stage[V4_VKT_STAGE_N];
 static unsigned char v4_vkt_ring_stage_busy[V4_VKT_STAGE_N];
+static void v4_vkt_ring_stage_back(int stage) {
+    if (stage >= 0 && stage < V4_VKT_STAGE_N) v4_vkt_ring_stage_busy[stage] = 0;
+}
 static int v4_vkt_ring_stage_state;
 static int v4_vkt_ring_stage_init(ColiExpertStore *store) {
     if (v4_vkt_ring_stage_state) return v4_vkt_ring_stage_state > 0;
@@ -14271,6 +14281,7 @@ static int v4_vkt_ring_batch(void *ctx, int layer, const int *eids, int n,
                                                v4_vkt_ring_stage[st[i]], &hold->view) &&
             !v4_vkt_rows(&hold->view, &srcs[i], &hold->buffer)) {
             hold->stage = st[i];
+            hold->ring = 1;   /* its release frees the ring's pool, not the engine's (v4_vkt_unhold) */
             hh[i] = hold;
             ok[i] = 1;
         } else {
