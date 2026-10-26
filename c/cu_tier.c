@@ -97,6 +97,7 @@ static const CuTierOps *cut_ops(void) {
 
 /* the tier's names */
 #define vkt_begin_forward cut_begin_forward
+#define vkt_cs_armed cut_cs_armed
 #define vkt_bank_fill cut_bank_fill
 #define vkt_bank_switch cut_bank_switch
 #define vkt_dev_changes cut_dev_changes
@@ -115,6 +116,7 @@ static const CuTierOps *cut_ops(void) {
 #define vkt_init cut_init
 #define vkt_issue cut_issue
 #define vkt_issue_w cut_issue_w
+#define vkt_issue_group cut_issue_group
 #define vkt_join cut_join
 #define vkt_join_sum cut_join_sum
 #define vkt_layers cut_layers
@@ -140,6 +142,13 @@ static const CuTierOps *cut_ops(void) {
 /* the Vulkan strict gate (COLI_VK_STRICT, backend_vulkan.c) has no CUDA side: the
  * tier's refusal lines above keep their own fprintf, behaviour unchanged */
 #define coli_vk_degrade(cls, op, reason) ((void)0)
+/* CS-1b's slab-alias capability is the Vulkan backend's own (VK_EXT_external_memory_host
+ * imports of the store's host pages); a CUDA backend has no such import, so the calls
+ * refuse and the compute site's group degrades its aliased experts to the CPU -- the
+ * lever's refusal ladder, never a drop */
+#define coli_vk_slab_import(...) (0)
+#define coli_vk_tensor_alias(...) (0)
+#define coli_vk_slab_unref(...) ((void)0)
 #define VKT_TAG "[CUDA]"
 #ifndef COLI_VULKAN
 #define COLI_VULKAN 1   /* vk_tier.c's body */

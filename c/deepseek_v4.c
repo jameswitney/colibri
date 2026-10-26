@@ -5602,6 +5602,10 @@ static float *v4_vk_round_rows(const float *x, int rows, int d) {
 typedef struct {
     int on;              /* the tier saw this step: the CPU's experts go to it as notes */
     int n, full, joined; /* n: how many the device took */
+    int cs;              /* COLI_VK_TIER_EXPERTS: the tier deferred the whole selection --
+                         * the ONE group (residents' handles + aliased slabs) issues at the
+                         * finish site, after the loader's slide-join settled the bytes */
+    float *xq;           /* the E4M3-rounded row the group computes from (cs: kept until the join) */
     int *ids;            /* the full selection, ascending, and its weights */
     float *w;
     uint8_t *taken;
@@ -5629,12 +5633,16 @@ static void v4_vk_token_issue(V4VkToken *vk, ColiExpertStore *store, int layer,
     uint8_t *taken = malloc((size_t)full);
     if (!xq || !ids || !w || !taken) { free(xq); free(ids); free(w); free(taken); return; }
     int n = tier->issue(layer, xq, 1, full, expert_ids, expert_weights, taken);
-    free(xq);
+    int cs = tier->issue_group && n > 0;   /* the deferral: the whole selection is the finish-site group's */
+    if (!cs) free(xq);
     memcpy(ids, expert_ids, (size_t)full * sizeof(*ids));
     memcpy(w, expert_weights, (size_t)full * sizeof(*w));
     int cpu = 0;
     for (int k = 0; k < full; k++) {
         if (taken[k]) {
+            /* a routing the device served is counted as a store lookup counts one --
+             * there no loader read of it happens; the deferred group's other selections
+             * are all loader reads below, and the read itself counts them */
             if (tier->routed) tier->routed((ColiExpertKey){layer, ids[k]});
             continue;
         }
@@ -5644,6 +5652,42 @@ static void v4_vk_token_issue(V4VkToken *vk, ColiExpertStore *store, int layer,
     }
     *selected = cpu;
     vk->on = 1; vk->n = n > 0 ? n : 0; vk->full = full; vk->ids = ids; vk->w = w; vk->taken = taken;
+    vk->cs = cs;
+    if (cs) vk->xq = xq;
+}
+
+/* One selection's alias source (COLI_VK_TIER_EXPERTS): the view's three matrices as
+ * byte offsets into the store slot's slab, geometry beside them. slab stays NULL when
+ * the view cannot alias -- a packed (rows16) or foreign-layout record, or a lease the
+ * store will not name -- and that expert computes on the CPU, the refusal ladder. */
+static void v4_vk_alias_src(ColiExpertStore *store, const ColiExpertView *view, VktAliasSrc *s) {
+    memset(s, 0, sizeof(*s));
+    if (!view || !view->lease) return;
+    const ColiTensorView *m[3] = {&view->gate, &view->up, &view->down};
+    for (int t = 0; t < 3; t++)
+        if (m[t]->block_rows != 1 || m[t]->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
+            (m[t]->scale_format != COLI_SCALE_UE8M0 && m[t]->scale_format != COLI_SCALE_F32) ||
+            !m[t]->data || !m[t]->scales || m[t]->rows < 1 || m[t]->columns < 1) return;
+    for (int t = 1; t < 3; t++)
+        if (m[t]->block_columns != m[0]->block_columns ||
+            m[t]->scale_format != m[0]->scale_format) return;
+    size_t bytes = 0;
+    const unsigned char *slab = coli_v4_expert_store_view_slab(store, view, &bytes);
+    if (!slab || !bytes || !m[0]->block_columns) return;
+    for (int t = 0; t < 3; t++) {
+        const unsigned char *wd = m[t]->data, *sd = m[t]->scales;
+        if (wd < slab || sd < slab) return;
+        size_t wo = (size_t)(wd - slab), so = (size_t)(sd - slab);
+        if (wo >= bytes || so >= bytes) return;
+        s->woff[t] = wo;
+        s->soff[t] = so;
+        s->I[t] = (int)m[t]->columns;
+        s->O[t] = (int)m[t]->rows;
+    }
+    s->slab = slab;
+    s->bytes = bytes;
+    s->fmt = m[0]->scale_format == COLI_SCALE_UE8M0 ? 15 : 7;
+    s->gs = (int)m[0]->block_columns;
 }
 
 /* The CPU's experts (views[0..cpu), weights beside them), the device's join, and
@@ -5658,13 +5702,55 @@ static int v4_vk_token_finish(V4VkToken *vk, float *output, ColiExpertStore *sto
     const float **dev = malloc((size_t)vk->full * sizeof(*dev));
     int result = rows && dev ? 0 : moe_fail("layer %d: out of memory for the device's experts", layer);
     v4_eprobe_loop_entry();   /* CS-0: the read tail ends where the serial loop begins */
-    for (int c = 0; !result && c < cpu; c++) {
+    /* CS-1b: `read` names the selections the loader read (the ones the deferral left
+     * the CPU at the issue: every expert whose bytes the group's aliases need); the
+     * group below rewrites taken[] to the real sites and `read` keeps the views' map */
+    uint8_t *read = NULL;
+    if (!result && vk->cs) {
+        read = malloc((size_t)vk->full);
+        if (!read)
+            result = moe_fail("layer %d: out of memory for the device expert group", layer);
+        else
+            for (int k = 0; k < vk->full; k++) read[k] = !vk->taken[k];
+    }
+    if (!result && vk->cs && tier && tier->issue_group) {
+        /* the compute site is HERE -- ONE expert-batch group for every routed selection
+         * of the layer-token: the tier's residents from their cached handles, everyone
+         * else as zero-copy aliases of the store slot's imported slab (the bytes the
+         * loader just settled). taken[] comes back naming the sites; a refused alias
+         * degrades that expert to the CPU loop below (never dropped), and a group that
+         * flew not at all does the same for the whole selection. */
+        VktAliasSrc *src = malloc((size_t)vk->full * sizeof(*src));
+        if (!src)
+            result = moe_fail("layer %d: out of memory for the device expert group", layer);
+        else {
+            for (int k = 0, c = 0; k < vk->full; k++)
+                if (read[k]) v4_vk_alias_src(store, &views[c++], &src[k]);
+                else memset(&src[k], 0, sizeof(src[k]));   /* a resident: its handle serves it */
+            int took = tier->issue_group(layer, vk->xq, 1, vk->full, vk->ids, vk->w,
+                                         src, vk->taken);
+            free(src);
+            if (took > 0) vk->n = took;
+            else {
+                /* nothing flew: the issue's marking back (the residents stay the
+                 * device's in name), so the join below finds nothing in flight, fails,
+                 * and its redo loop recomputes them from the store -- the standing
+                 * degrade path, nothing dropped */
+                for (int k = 0; k < vk->full; k++) vk->taken[k] = !read[k];
+                vk->n = vk->full;
+            }
+        }
+    }
+    for (int c = 0, k = 0; !result && (vk->cs ? k < vk->full : c < cpu); k++) {
+        if (vk->cs && (!read || !read[k] || vk->taken[k])) continue;   /* the group has it (resident or aliased) */
         double e0 = v4_eprobe_t0();   /* CS-0: the serial loop's per-expert cost */
         result = coli_v4_expert_forward_ref(rows + (size_t)c * d, &views[c], input,
                                             weights_cpu[c], limit);
         v4_eprobe_call(e0, &views[c], layer, c);
         if (!result && tier && tier->note) tier->note(&views[c]);
+        c++;
     }
+    free(read);
     int joined = !vk->n || (dev && tier && tier->join(dev));
     vk->joined = 1;
     float *redo = joined ? NULL : malloc((size_t)d * sizeof(*redo));
@@ -5704,7 +5790,7 @@ static void v4_vk_token_free(V4VkToken *vk) {
         if (dev) coli_v4_vk_tier->join(dev);
         free(dev);
     }
-    free(vk->ids); free(vk->w); free(vk->taken);
+    free(vk->ids); free(vk->w); free(vk->taken); free(vk->xq);
     memset(vk, 0, sizeof(*vk));
 }
 #endif
@@ -9935,6 +10021,13 @@ static int hot_rows16_wanted(void) {
     if (rows16 < 0) {
         const char *env = getenv("COLI_V4_ROWS16");
         rows16 = !(env && *env == '0');
+        /* CS-1b: while the compute-site arm is on, the store never packs -- an aliased
+         * view of a repacked slab would read garbage (the alias-layout hazard), so the
+         * arm carries the COLI_V4_ROWS16=0 valve's rule at launch; the armed leg loses
+         * the rows16 kernel's speed on the CPU fallback and the prefill host-MoE, a
+         * priced cost, not a silent one */
+        const char *cs = getenv("COLI_VK_TIER_EXPERTS");
+        if (cs && *cs && atoi(cs) > 0) rows16 = 0;
     }
     return rows16;
 }
@@ -10532,6 +10625,19 @@ int coli_v4_expert_store_in_ram(ColiExpertStore *store, ColiExpertKey key) {
 uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store) {
     return store && store->state && hot_find(store)
         ? ((V4ExpertStoreState *)store->state)->record_bytes : 0;
+}
+
+const void *coli_v4_expert_store_view_slab(ColiExpertStore *store, const ColiExpertView *view,
+                                           size_t *bytes) {
+    if (bytes) *bytes = 0;
+    if (!store || !store->state || !view || !view->lease || !hot_find(store)) return NULL;
+    V4ExpertStoreState *state = store->state;
+    V4ExpertSlot *slot = view->lease;
+    /* the slot this lease names holds the view's own expert: a stale or foreign lease
+     * would alias the wrong pages, so only an exact match serves */
+    if (!slot->slab || !state->record_bytes || slot->expert != view->key.expert) return NULL;
+    *bytes = (size_t)state->record_bytes;
+    return slot->slab;
 }
 
 int coli_v4_expert_store_gguf_form(ColiExpertStore *store, int layer, int types[3], int *mx) {
@@ -14113,6 +14219,15 @@ static int v4_vkt_issue(int layer, const float *x, int S, int K, const int *idx,
     if (!v4_vkt_thread()) { memset(taken, 0, (size_t)S * K); return 0; }
     return XT(issue_w)(layer, x, S, K, idx, w, taken);
 }
+#ifdef COLI_VULKAN
+/* COLI_VK_TIER_EXPERTS (CS-1b): the finish-site group, the engine-thread seam -- the
+ * Vulkan tier's own lever; the CUDA tier keeps the issue/join path it has. */
+static int v4_vkt_issue_group(int layer, const float *x, int S, int K, const int *idx,
+                              const float *w, const VktAliasSrc *src, uint8_t *taken) {
+    if (g_xt_cuda || !v4_vkt_thread()) return 0;
+    return vkt_issue_group(layer, x, S, K, idx, w, src, taken);
+}
+#endif
 static int v4_vkt_join(const float **rows) { return XT(join)(rows); }
 static void v4_vkt_routed(ColiExpertKey key) { coli_v4_expert_store_note_routed(g_v4_vkt.store, key); }
 /* The VRAM bank's refill (COLI_VK_TIER_BANK_LAYER), the engine-thread seam: the routed
@@ -14563,7 +14678,11 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
         fprintf(stderr, "%s tier deepseek_v4: the stream's fills read past the expert cache "
                 "(%d stages of %d MiB, groups of %d in parallel; COLI_VK_TIER_STREAM_BYPASS)\n",
                 XT_TAG, V4_VKT_STAGE_N, V4_VKT_STAGE_CAP >> 20, V4_VKT_STAGE_N);
-    g_v4_vkt = (ColiV4VkTier){store, v4_vkt_issue, v4_vkt_join, v4_vkt_note, v4_vkt_routed, v4_vkt_bank};
+    g_v4_vkt = (ColiV4VkTier){store, v4_vkt_issue, v4_vkt_join, v4_vkt_note, v4_vkt_routed, v4_vkt_bank, NULL};
+#ifdef COLI_VULKAN
+    if (!xt_cuda() && vkt_cs_armed())
+        g_v4_vkt.issue_group = v4_vkt_issue_group;   /* CS-1b: only an armed Vulkan tier defers; every other link keeps today's path whole */
+#endif
     int all = c->num_hidden_layers * c->n_routed_experts;
     int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
     const char *warm = getenv("COLI_VK_TIER_WARM");   /* 0: no warm start, the tier fills as experts pass by */

@@ -200,6 +200,23 @@ typedef struct {
     const void *gs, *us, *ds;
 } VktExpertSrc;
 
+/* One aliased selection for the compute-site group (COLI_VK_TIER_EXPERTS, CS-1b): the
+ * store slot's own slab (imported whole, refcounted by pointer: one
+ * VK_EXT_external_memory_host import serves every record it holds) and the three
+ * matrices' records in it -- code and scale byte offsets, input and output widths,
+ * the format (15 the MXFP4 codes with packed ue8m0 scales, 7 their f32-scale twin)
+ * and its group size. The engine fills it at the token's finish site from the view
+ * the loader just read; rows are the native layout (a rows16-packed or foreign-layout
+ * view never reaches the tier -- the engine refuses it and that expert computes on
+ * the CPU, the refusal ladder). */
+typedef struct {
+    const void *slab;
+    size_t bytes;
+    size_t woff[3], soff[3];   /* gate, up, down */
+    int I[3], O[3];
+    int fmt, gs;
+} VktAliasSrc;
+
 typedef struct {
     const char *engine;            /* names the [VK] tier lines */
     int layers, experts, hidden, inter, topk;
@@ -301,6 +318,10 @@ int  vkt_wanted(void);
 /* 1 = the tier is on. heat: [layers][experts] routing counts, or NULL. */
 int  vkt_init(const VktConfig *cfg, uint32_t *const *heat);
 int  vkt_ready(void);
+/* 1 = the compute site's arm (COLI_VK_TIER_EXPERTS) is on and this tier serves it:
+ * the engine wires its finish-site group seam only then, so an unarmed run keeps
+ * today's issue/join path whole. */
+int  vkt_cs_armed(void);
 void vkt_shutdown(void);
 int  vkt_plan(int *layers, int *eids, int max);
 /* The warm start's line ("[VK] tier <engine>: warm start, N experts in Xs (...)"): what
@@ -318,6 +339,15 @@ int  vkt_issue_w(int layer, const float *x, int S, int K, const int *idx, const 
  * whose RAM form must be converted before vkt_note can read it, so it converts only
  * the experts the tier will take. No side effects. */
 int  vkt_wants(int layer, int eid);
+/* COLI_VK_TIER_EXPERTS (CS-1b): the compute site at the token's finish. After a
+ * vkt_issue that deferred the step (every valid selection marked taken, nothing
+ * submitted), builds ONE expert-batch group -- the residents' cached handles beside
+ * aliased store slabs (VktAliasSrc) -- and submits it on the tier's xb queue, outside
+ * the chain's frame ring. On return taken[i] names the sites (1 the device computed
+ * it); a selection whose alias or the batch itself refused keeps taken 0 and computes
+ * on the CPU -- degrade, never drop. 0: nothing flew, every selection the CPU's. */
+int  vkt_issue_group(int layer, const float *x, int S, int K, const int *idx, const float *w,
+                     const VktAliasSrc *src, uint8_t *taken);
 int  vkt_join(const float **rows);
 /* vkt_join; for a big step that ran wholly on the device, *sum = its S routed rows (the
  * rank-order sum of w[s*K+k] * expert(s, k) as an fma chain from 0, the engines' loop),

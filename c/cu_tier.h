@@ -23,6 +23,12 @@ void cut_put_done(void);
 void cut_note(int layer, int eid, const VktExpertSrc *src);
 int  cut_issue(int layer, const float *x, int S, int K, const int *idx, uint8_t *taken);
 int  cut_issue_w(int layer, const float *x, int S, int K, const int *idx, const float *w, uint8_t *taken);
+/* CS-1b's finish-site group: vk_tier.h's vkt_issue_group, the same tier compiled here;
+ * its slab-alias path refuses on this backend (cu_tier.c's coli_vk_slab_import shim), so
+ * an armed run degrades its non-resident experts to the CPU. */
+int  cut_issue_group(int layer, const float *x, int S, int K, const int *idx, const float *w,
+                     const VktAliasSrc *src, uint8_t *taken);
+int  cut_cs_armed(void);
 int  cut_wants(int layer, int eid);
 int  cut_join(const float **rows);
 int cut_join_sum(const float **rows, const float *w, const float **sum);
@@ -76,6 +82,8 @@ static inline void cut_put_done(void){}
 static inline void cut_note(int l,int e,const VktExpertSrc *s){(void)l;(void)e;(void)s;}
 static inline int  cut_issue(int l,const float *x,int S,int K,const int *i,uint8_t *t){(void)l;(void)x;(void)S;(void)K;(void)i;(void)t;return 0;}
 static inline int  cut_issue_w(int l,const float *x,int S,int K,const int *i,const float *w,uint8_t *t){(void)l;(void)x;(void)S;(void)K;(void)i;(void)w;(void)t;return 0;}
+static inline int  cut_issue_group(int l,const float *x,int S,int K,const int *i,const float *w,const VktAliasSrc *s,uint8_t *t){(void)l;(void)x;(void)S;(void)K;(void)i;(void)w;(void)s;(void)t;return 0;}
+static inline int  cut_cs_armed(void){return 0;}
 static inline int  cut_wants(int l,int e){(void)l;(void)e;return 0;}
 static inline int  cut_join(const float **r){(void)r;return 0;}
 static inline int  cut_join_sum(const float **r, const float *w, const float **s){(void)r;(void)w;*s=0;return 0;}

@@ -248,6 +248,16 @@ static struct {
     int dgrow_head, dgrow_target;        /* the headroom lever armed, its resident-count target */
     double dgrow_reserve;                /* the probe's safety reserve, read once (env bytes) */
     double dg_hfree; unsigned dg_hprobe; /* the live guard's free-VRAM reading and its probe counter */
+    /* the compute site (COLI_VK_TIER_EXPERTS, CS-1b): csx the arm (1 the finish-site
+     * group, 2 the growth composition), a decode walk that defers -- cs_pending the
+     * step owes vkt_issue_group at the token's finish site (layer cs_layer, nothing
+     * submitted yet, the flight slot held), cs_ex/csn the transient aliased experts of
+     * the in-flight group (freed at its join: not while a batch is in flight), the
+     * counters the run line's own segment (resident and aliased entries, the selections
+     * that fell back to the CPU, and of those how many the alias itself refused) */
+    int csx, cs_pending, cs_layer;
+    ColiVkExpert **cs_ex; int cs_nex, cs_cex;
+    unsigned long long cs_groups, cs_res, cs_alias, cs_fallback, cs_refuse;
     double dev_ms, cpu_ms, wait_ms;
     unsigned long long rep_routed, rep_served;
     /* streaming (big prefill steps; see "streaming" below) */
@@ -2658,6 +2668,42 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
     if (T.st_ok && S >= T.gemm_rows && layer < T.main_layers) return issue_big(layer, x, S, K, idx, w, taken);
     int E = T.c.experts, H = T.c.hidden, n = S * K;
     if (!grow_map(n)) return 0;
+    if (T.csx && S == 1) {
+        /* COLI_VK_TIER_EXPERTS: the compute site moves to the finish site. The walk's
+         * bookkeeping runs as always (heat, the routing guard, the forward's tick, the
+         * host pool's promote) but nothing is submitted: the return says the whole
+         * selection is the deferred group's, and taken[] marks only the experts whose
+         * cached handles need no read -- the loader reads the rest exactly as before
+         * (they are the alias views' bytes, k - taken of them), a pure feeder. ONE
+         * group goes out at vkt_issue_group, after the engine's loader slide-join
+         * settled those bytes. rows == 1 only: prefill keeps the union/batch path, and
+         * the hybrid host-pool classification is skipped (those residents ride the
+         * group through their handles). */
+        int valid = 0;
+        for (int i = 0; i < n; i++) {
+            T.map[i] = -1;
+            int e = idx[i];
+            if (e < 0 || e >= E) continue;
+            T.routed++;
+            if (S <= VKT_UP_ROWS) T.d_routed++;
+            if (layer >= T.main_layers) T.extra_routed++;
+            VSlot *v = slot(layer, e);
+            if (v->heat < 0xFFFFFFFFu) v->heat++;
+            v->last = T.tick;
+            valid++;
+            if (v->state == VS_RESIDENT && v->ex) taken[i] = 1;   /* the handle serves it: no read */
+        }
+        T.can_balance = 0;
+        T.hy_n = T.hy_nx = 0;
+        if (!valid) return 0;
+        for (int i = 0; T.promote_rate && S <= VKT_UP_ROWS && layer < T.main_layers && i < n; i++)
+            if (idx[i] >= 0 && idx[i] < E) promote(layer, idx[i]);
+        T.cs_pending = 1; T.cs_layer = layer;
+        T.d0_inflight = T.d2_inflight = 0;
+        T.inflight = 1; T.S = S; T.K = K; T.steps++;
+        T.t_issued = vkt_now_ms();   /* DPROF: the window opens at the deferral, as at a submit */
+        return valid;
+    }
     /* a hybrid step: the host pool's experts the CPU can compute in place are its, at the join */
     const int hyb = T.hybrid && S <= VKT_UP_ROWS && layer < T.main_layers && grow_hy(n, 0) && grow_hyx(S);
     T.hy_n = T.hy_nx = 0;
@@ -2802,8 +2848,137 @@ int vkt_issue_w(int layer, const float *x, int S, int K, const int *idx, const f
     return issue(layer, x, S, K, idx, w, taken);
 }
 
+/* ---- the compute site's group (COLI_VK_TIER_EXPERTS, CS-1b) ------------------------- */
+static int cs_ex_keep(ColiVkExpert *e) {   /* the transient aliased experts, freed at the join */
+    if (T.cs_nex >= T.cs_cex) {
+        int nc = T.cs_cex ? T.cs_cex * 2 : 8;
+        ColiVkExpert **a = realloc(T.cs_ex, (size_t)nc * sizeof(*a));
+        if (!a) return 0;
+        T.cs_ex = a; T.cs_cex = nc;
+    }
+    T.cs_ex[T.cs_nex++] = e;
+    return 1;
+}
+static void cs_ex_release(void) {
+    for (int i = 0; i < T.cs_nex; i++) coli_vk_xb_expert_free(T.cs_ex[i]);
+    T.cs_nex = 0;
+}
+/* One aliased expert over its imported slab: CS-1a's capability, VktAliasSrc's three
+ * records as ColiVkTensors and an expert of them. The import is refcounted by the
+ * slab's own pages (a slot reused keeps it); this call's own reference goes back once
+ * the tensors hold theirs -- the expert's free at the join releases those. NULL: the
+ * import, a tensor or the sets refused; the selection computes on the CPU. */
+static ColiVkExpert *cs_alias_expert(const VktAliasSrc *s) {
+    if (!s->slab || !s->bytes || (s->fmt != 7 && s->fmt != 15) || !s->gs) { T.cs_refuse++; return NULL; }
+    for (int t = 0; t < 3; t++)
+        if (s->I[t] < 1 || s->O[t] < 1 || s->woff[t] >= s->bytes || s->soff[t] >= s->bytes) {
+            T.cs_refuse++;
+            return NULL;
+        }
+    ColiVkSlab *r;
+    if (!coli_vk_slab_import(s->slab, s->bytes, &r)) { T.cs_refuse++; return NULL; }
+    ColiVkTensor *t[3] = {NULL, NULL, NULL};
+    int ok = 1;
+    for (int k = 0; ok && k < 3; k++)
+        ok = coli_vk_tensor_alias(r, s->woff[k], s->soff[k], s->fmt, s->I[k], s->O[k], s->gs, &t[k]) == 1;
+    ColiVkExpert *ex = ok ? coli_vk_xb_expert(t[0], t[1], t[2]) : NULL;
+    if (!ex) {   /* the sets refused: the tensors (their import references with them) give way here */
+        T.cs_refuse++;
+        for (int k = 0; k < 3; k++) coli_vk_tensor_free(t[k]);
+    }
+    coli_vk_slab_unref(r);   /* the built tensors hold their own; an empty hand returns the pages */
+    return ex;
+}
+
+int vkt_issue_group(int layer, const float *x, int S, int K, const int *idx, const float *w,
+                    const VktAliasSrc *src, uint8_t *taken) {
+    if (!T.on || !T.inflight || !T.cs_pending || !taken) return 0;
+    int n = S * K;
+    if (T.cs_layer != layer || S != 1 || K != T.K || n < 1 || !idx) { T.cs_pending = T.inflight = 0; return 0; }
+#ifdef _OPENMP
+    if (omp_in_parallel()) { T.cs_pending = T.inflight = 0; return 0; }   /* the engine thread alone holds the xb queue */
+#endif
+    if (!coli_vk_xb_ready()) {
+        fprintf(stderr, VKT_TAG " tier %s: the device stopped answering, the deferred group's experts stay on the CPU\n", T.engine);
+        T.on = 0;
+        T.cs_pending = T.inflight = 0;
+        return 0;
+    }
+    if (T.d2 && !coli_vk_xb_ready_dev(1)) d2_stop("the second device stopped answering");
+    int E = T.c.experts;
+    if (!grow_map(n) || !grow_groups(n) || !grow_rows(n)) { T.cs_pending = T.inflight = 0; return 0; }
+    ColiVkExpert **ex = malloc((size_t)n * sizeof(*ex));
+    uint8_t *res = malloc((size_t)n);
+    if (!ex || !res) { free(ex); free(res); T.cs_pending = T.inflight = 0; return 0; }
+    /* the entries: a resident's cached handle, else the aliased expert; a refusal (no
+     * source, the import, the batch's cap) leaves the selection the CPU's */
+    int ng = 0, total = 0;
+    for (int i = 0; i < n; i++) {
+        T.map[i] = -1;
+        taken[i] = 0;
+        ex[i] = NULL;
+        res[i] = 0;
+        int e = idx[i];
+        if (e < 0 || e >= E) continue;
+        if (total >= T.max_dev_rows) { T.cs_fallback++; continue; }   /* the batch is as large as it gets */
+        VSlot *v = slot(layer, e);
+        if (v->state == VS_RESIDENT && v->ex) { ex[i] = v->ex; res[i] = 1; }
+        else if (src && src[i].slab && (ex[i] = cs_alias_expert(&src[i])) && !cs_ex_keep(ex[i])) {
+            coli_vk_xb_expert_free(ex[i]);   /* the kept list could not grow: not worth the batch's failure */
+            ex[i] = NULL;
+        }
+        if (!ex[i]) { T.cs_fallback++; continue; }
+        ng++; total++;
+    }
+    int took = 0;
+    if (ng) {
+        /* the primary device's groups first, then the second's, as issue() orders them:
+         * contiguous runs of groups and of rows -- one row an expert here, so rows are
+         * groups and the second's rows start at the primary's count */
+        int at = 0, n0 = 0;
+        for (int pass = 0; pass < 2 && at < ng; pass++)
+            for (int i = 0; i < n; i++) {
+                if (!ex[i] || T.map[i] >= 0) continue;
+                VSlot *v = slot(layer, idx[i]);
+                int dev2 = res[i] ? v->dev : 0;   /* an alias's tensors are the primary device's */
+                if ((pass == 0) != (dev2 == 0)) continue;
+                T.bex[at] = ex[i]; T.brows[at] = 1; T.map[i] = at;
+                T.bx[at] = x; T.bw[at] = w ? w[i] : 1.0f;
+                at++;
+                if (pass == 0) n0 = at;
+            }
+        T.d0_inflight = n0 > 0 && coli_vk_xb_issue_w(T.bex, T.brows, n0, T.bx, w ? T.bw : NULL);
+        T.d2_inflight = 0; T.d2_rows0 = n0;
+        if (n0 < ng) {
+            T.d2_inflight = coli_vk_xb_issue_dev(1, T.bex + n0, T.brows + n0, ng - n0, T.bx + n0, w ? T.bw + n0 : NULL);
+            if (!T.d2_inflight && !coli_vk_xb_ready_dev(1)) d2_stop("the second device's group failed");
+        }
+        for (int i = 0; i < n; i++) {
+            int j = T.map[i];
+            if (j < 0) continue;
+            if (j < n0 ? !T.d0_inflight : !T.d2_inflight) { T.map[i] = -1; T.cs_fallback++; continue; }
+            taken[i] = 1;
+            if (res[i]) T.cs_res++; else T.cs_alias++;
+            took++;
+        }
+    }
+    T.served += (unsigned long long)took;
+    if (S <= VKT_UP_ROWS) T.d_served += (unsigned long long)took;
+    if (layer >= T.main_layers) T.extra_served += (unsigned long long)took;
+    free(ex); free(res);
+    if (!took) {   /* nothing flew: the transient experts give way, every selection the CPU's */
+        cs_ex_release();
+        T.cs_pending = T.inflight = 0;
+        return 0;
+    }
+    T.cs_groups++;   /* one group a layer-token; the join at the finish retires it */
+    T.cs_pending = 0;
+    return took;
+}
+
 int vkt_join(const float **rows) {
     if (!T.inflight) return 0;
+    T.cs_pending = 0;   /* whatever a join retires, no step is owed a group any more */
     if (T.big) {
         int ok = join_big(rows);
         if (T.sy_step) coli_vk_xb_step_end();   /* rows stay readable until the next step */
@@ -2825,6 +3000,7 @@ int vkt_join(const float **rows) {
     int ok = !T.d0_inflight || coli_vk_xb_join(T.by, &dms);
     int ok1 = !T.d2_inflight || coli_vk_xb_join_dev(1, T.by + T.d2_rows0, &dms1);
     T.d0_inflight = T.d2_inflight = 0;
+    if (T.cs_nex) cs_ex_release();   /* the group's aliased experts: the batch is done, never freed in flight */
     double tw = vkt_now_ms() - t0;
     T.wait_ms += tw;
     T.dev_ms += dms + dms1; T.d2_ms += dms1;
@@ -2896,6 +3072,7 @@ int vkt_resident(int layer, int eid) {
            slot(layer, eid)->state == VS_RESIDENT;
 }
 int vkt_ready(void) { return T.on; }
+int vkt_cs_armed(void) { return T.on && T.csx > 0; }
 
 /* ---- budget ---------------------------------------------------------------------- */
 static size_t mem_available(void) { return (size_t)(compat_mem_available_gb() * 1e9); }
@@ -3533,6 +3710,23 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
                 if (T.dgrow_target < 0) T.dgrow_target = 0;
             }
         }
+        /* the compute site (CS-1b): off unless asked. 1 moves decode's routed-expert
+         * compute out of the engine's serial CPU loop into the tier's ONE expert-batch
+         * group, issued at the token's finish site -- the residents' cached handles
+         * beside zero-copy fmt-15 aliases of the store's host slabs (CS-1a's import),
+         * rows16 packing off at store open while armed. 2 is 1 composed with the growth
+         * machinery (the arm needs COLI_VK_TIER_DECODE_GROW_HEADROOM's levers landed and
+         * armed; no second growth mechanism, no second guard). */
+        const char *xe = getenv("COLI_VK_TIER_EXPERTS");
+        T.csx = xe && *xe ? atoi(xe) : 0;
+        if (T.csx != 1 && T.csx != 2) T.csx = 0;
+        if (T.csx == 2 && !(T.dgrow && T.dgrow_head)) {
+            fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_EXPERTS=2 is the growth composition and needs COLI_VK_TIER_DECODE_GROW_HEADROOM armed with it; the compute site stays off\n", eng);
+            T.csx = 0;
+        }
+        if (T.csx)
+            fprintf(stderr, VKT_TAG " tier %s: cs experts armed (%d): decode's routed group -- the residents' handles and zero-copy store-slab aliases -- issues at the token's finish site%s\n",
+                    eng, T.csx, T.csx == 2 ? ", composed with the decode-growth headroom arm" : "");
     }
     {
         ColiVkXbStats xs; coli_vk_xb_stats(&xs);
@@ -3781,6 +3975,9 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     if (dprof && T.d_routed)   /* COLI_VK_CHAIN_DPROF: the decode steps' wait/device/CPU split, promote's bytes */
         fprintf(stderr, " | decode dprof: waited %.1f ms, device %.1f ms, CPU %.1f ms, promoted %.1f MiB",
                 T.d_wait_ms, T.d_dev_ms, T.d_cpu_ms, (double)T.d_up_bytes / 1048576.0);
+    if (T.cs_groups)   /* COLI_VK_TIER_EXPERTS: the finish-site group's own books (one group a layer-token) */
+        fprintf(stderr, " | cs: %llu groups, %llu resident + %llu aliased entries on the device, %llu cpu-fallback (%llu alias refusals)",
+                T.cs_groups, T.cs_res, T.cs_alias, T.cs_fallback, T.cs_refuse);
     if (dprof && T.p_steps)   /* COLI_VK_CHAIN_DPROF: the prompt steps' span (S > VKT_UP_ROWS), issue to join: the host-MoE window's tier half */
         fprintf(stderr, " | prompt dprof: %llu steps, waited %.1f ms, device %.1f ms, host %.1f ms",
                 T.p_steps, T.p_wait_ms, T.p_dev_ms, T.p_cpu_ms);
@@ -4010,6 +4207,7 @@ void vkt_shutdown(void) {
     T.qn = 0;
     if (coli_vk_available()) {
         quiesce();
+        cs_ex_release();   /* a group abandoned mid-step: its transient aliases go with the rest */
         size_t n = (size_t)T.c.layers * T.c.experts;
         for (size_t i = 0; i < n; i++) {
             if (T.s[i].hex && T.s[i].hex != T.s[i].ex) coli_vk_xb_expert_free(T.s[i].hex);

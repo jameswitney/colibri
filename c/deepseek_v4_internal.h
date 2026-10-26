@@ -17,6 +17,7 @@
 #include "native_quant_fp4_rows16.h"
 #define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
+#include "vk_tier.h"   /* the routed-expert tier's own types (VktAliasSrc: the compute-site group's aliased source) */
 
 #include "ggml_view.h"   /* the FP8 and FP4 entries hand a GGUF matrix to coli_ggml_matmul */
 
@@ -747,6 +748,12 @@ void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer);
  * a registered non-hot ExpertStore backend. */
 void coli_v4_expert_store_mfu_record(ColiExpertStore *store, ColiExpertKey key);
 void coli_v4_expert_store_decode_phase(ColiExpertStore *store, int decode);
+/* CS-1b (COLI_VK_TIER_EXPERTS): the slab a leased view reads and its bytes -- the hot
+ * store's own slot buffer, one record wide, the alias import's range. NULL when the
+ * view is not this store's slot lease (a foreign backend's, or the base store a
+ * segment adapter opens): the caller refuses the alias and computes on the CPU. */
+const void *coli_v4_expert_store_view_slab(ColiExpertStore *store, const ColiExpertView *view,
+                                           size_t *bytes);
 
 /* Exclusive RAM/VRAM (vk_tier.h's vkt_ram_first): when set, a full RAM cache gives up
  * first a slot whose expert the device holds, and reports it through ram_gave. The
@@ -767,7 +774,12 @@ extern void (*coli_v4_expert_store_ram_gave)(void);
  *   note   an expert the CPU computed, as the store lent it (rows16 or not);
  *   routed a routing the device served: counted as a store lookup counts one;
  *   bank   the VRAM bank's refill (COLI_VK_TIER_BANK_LAYER), post-router pre-issue:
- *          the routed ids of the banked layer's step, whatever serves them. */
+ *          the routed ids of the banked layer's step, whatever serves them;
+ *   issue_group  COLI_VK_TIER_EXPERTS (CS-1b), NULL unless the Vulkan tier armed it:
+ *          called at the token's finish site after an issue that marked every valid
+ *          selection taken and submitted nothing -- ONE expert-batch group (the
+ *          residents' cached handles beside aliased store slabs) whose taken[] on
+ *          return names the sites; 0 = every selection the CPU's. */
 typedef struct {
     ColiExpertStore *store;
     int (*issue)(int layer, const float *x, int S, int K, const int *idx, const float *w,
@@ -776,6 +788,8 @@ typedef struct {
     void (*note)(const ColiExpertView *view);
     void (*routed)(ColiExpertKey key);
     void (*bank)(int layer, const int *idx, int n);
+    int (*issue_group)(int layer, const float *x, int S, int K, const int *idx, const float *w,
+                       const VktAliasSrc *src, uint8_t *taken);
 } ColiV4VkTier;
 extern const ColiV4VkTier *coli_v4_vk_tier;
 
