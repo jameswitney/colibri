@@ -415,3 +415,53 @@ PORT_PLAN below is the 2026-10-19/22 decision record; its F-number statuses are 
 - Report: `docs/research/AO-pw-w2-2026-10-26.md` (the DPROF 4-leg bucket table, the verbatim
   engagement clauses, the D11 counts, the owed list: the ring's plan-coverage split, RINGCOLD's one
   rule + the coverage question, the GROW headroom note, the fmt-7 GF isolation pair).
+
+## Session 2026-10-26 IV (PW-B2 — the ring's cold branch filled + the stage-pool leak it exposed, parity wave, lane pw-b2)
+
+- **Landed on `port/pw-b2`** (from `6ba3b4d1`; this worktree, sole writer; GPU for gates + the smoke
+  only, no benchmark arms — the campaign pauses after this slice): **`COLI_VK_TIER_STREAM_RING_COLD`**
+  (default off, needs the ring) — W2 §7's one-rule gap closed, AN §5's pre-registered follow-up: the
+  ring's **cold branch fills instead of declining**. A next layer with no prediction behind it (the
+  prompt's first chunk, the layer's first visit) is planned **whole** instead of handed to the inline
+  fill — the fork's literal whole-layer cold shape — and the worker covers it ahead. **The below-rule
+  filter drops in that branch**: with no prediction to scale at the coming step's S there is nothing to
+  hold against `R`, and the measurement is why — at the smoke's shape (S 72, R 16, E 256) the
+  heat-scaled estimate is ~3 rows for a layer's hottest expert, so the filtered plan is *empty again*
+  and the cold jobs arm nothing (an instrumented leg showed exactly that). The resident exclusion, the
+  in-RAM skip, the `st_per` cap, the half-alternating slots, the take/join, the inline fallback for
+  every miss, the SYNC drain and the teardown cancel all stand; where a prediction exists the plan is
+  the prediction's, unchanged. Default off gates one branch and one boot clause.
+- **The bug the cold arm exposed, fixed** (PW-B's own; scope extended by the manager on this evidence):
+  `v4_vkt_unhold`'s hand-back was keyed on the hold's stage index alone, which indexes whichever pool
+  handed it out — a **ring** fill's release cleared an **engine** stage's flag and left the ring's
+  8 × 16 MiB pool busy forever, capping the ring's fills at the pool's whole capacity **per run** and
+  falsely freeing an engine stage a concurrent engine fill could be reading into. `V4VkHold` now
+  carries its pool (`ring`) and the release frees the one it came from. **W2's `the ring 42 jobs
+  (8 experts)` line is re-attributed: two defects compounding** — the empty plans (W2 §4's diagnosis,
+  standing) *and* this leak capping whatever a job did fill; with the cold rule alone the smoke still
+  read `42 jobs (8 experts)` (job 1 filled, the rest nothing).
+- **Unit**: the `ring` case's three new legs — `cold default` (nothing handed over, 4 inline loads),
+  `cold on` (4 experts one layer ahead, **4 and 5 of them below the rule** — the filter-drop's proof —
+  1 inline load, the miss 9 the fallback's own), `cold with a prediction` (the plan is the
+  prediction's, **9,2,3,4** against the heat's **2,3,4,5**, 0 inline loads) — both cold legs' rows
+  `memcmp`-equal the default's. Plus `tests/test_v4_vk_ring_pool_source.py` (4 tests, the
+  `test_v4_moe_batch_lifecycle_source` pattern: the pools are file-static and the leak is silent on
+  output, visible only as fill counts at a 43-layer model's scale), verified both ways — 4/4 fixed,
+  the pre-fix shape fails exactly the hand-back test.
+- **Gates all green on the final tree, run 1**: vk-tier ×3 legs (the 10-leg ring case), vk-chain
+  (12,114 frames), vk-strict, tiny/prefix/brio/serve (23 lines, token-exact), dmoe ×8 (63), the ring
+  tiny target (30; it gained a `RING_COLD` leg, the PW-C2 shape-inert precedent), serve-framing ok,
+  cu_tier/vk_tier CUDA-path syntax clean.
+- **`deepseek-v4-smoke` PASS at defaults, RING, and RING+COLD — the texts byte-identical** (the same
+  `generated_text` md5 on all three legs). The engagement line, verbatim, RING+COLD:
+  **`prefetched 1344 (60 used)`, `the ring 42 jobs (1344 experts)`** — the smoke's single ~100-token
+  chunk is *exactly* the cold case (every layer a first visit; the RING-alone leg arms nothing), and
+  every job fills its whole plan (42 × `st_per` 32). The 2-chunk legs (`COLI_VK_CHAIN_ROWS=32`): RING
+  `10 jobs (11 experts)` (PW-B's own line, unchanged), **RING+COLD `51 jobs (1354 experts)`**.
+- **Not claimed**: no benchmark arm ran (the window's rule) — the cold coverage's *worth* at the
+  campaign shape is W3's to measure. **W3 pre-registered** (AP §6): RINGCOLD / RING / C0 ×3
+  same-day round-robin + one DPROF rep each of RINGCOLD and C0; expectations — host-MoE **back to the
+  ~45 s class**, **STAGE ≤ 10 s held**, **TTFT ≤ C0's** (the falsifiers named: host-MoE not moving
+  means the inline remainder is the in-RAM exclusion's — §4's open coverage question, now the ring's
+  rank-1 unknown — and a TTFT past W2's RING means the chunk-1 join tail is exposed).
+  Report: `docs/research/AP-pw-b2-2026-10-26.md`.

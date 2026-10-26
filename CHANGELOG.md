@@ -21,6 +21,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   `docs/research/AN-pw-b-stream-ring-2026-10-26.md`; measured at the campaign shape by the W2
   bench window (STAGE 106.3 → 1.1 s but TTFT +50.6 s — empty plans strand the fills on the
   inline path: `docs/research/AO-pw-w2-2026-10-26.md`).
+- `COLI_VK_TIER_STREAM_RING_COLD` (default off, needs the ring): the ring's cold branch fills
+  instead of declining — the fork's literal whole-layer cold shape. A next layer with no
+  prediction behind it (the prompt's first chunk, the layer's first visit) is planned whole
+  instead of handed to the inline fill, so the worker covers the next layer's whole
+  non-resident set ahead (the below-rule filter drops in that branch — there is no prediction
+  to scale at the coming step's S; the resident and in-RAM exclusions and the `st_per` cap
+  stand); W2 measured the landed cold branch's decline a strict pessimization (the whole fill
+  back on the engine thread: host-MoE 44.9 → 131.0 s). Where a prediction exists the plan is
+  the prediction's, unchanged. Evidence: `docs/research/AP-pw-b2-2026-10-26.md`.
+- The stream ring's stage pool never freed (PW-B's, found by the cold arm above): the shared
+  release hook `v4_vkt_unhold` keyed its hand-back on the hold's stage index alone, which
+  indexes whichever pool handed it out — a ring fill's release cleared an *engine* stage's
+  flag and left the ring's busy forever, capping the ring's fills at the pool's 8 buffers per
+  run (W2's `the ring 42 jobs (8 experts)` line) and falsely freeing an engine stage a
+  concurrent engine fill could be reading into. `V4VkHold` now carries its pool and the
+  release frees the one it came from; pinned at source level by
+  `tests/test_v4_vk_ring_pool_source.py`. Evidence:
+  `docs/research/AP-pw-b2-2026-10-26.md` §2.
 
 ### Fixed
 
