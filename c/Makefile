@@ -3270,6 +3270,15 @@ tests/bench_i4p_gidot$(EXE): tests/bench_i4p_gidot.c colibri.c $(VK_OBJ)
 tests/bench_gemv_stream$(EXE): tests/bench_gemv_stream.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
+# bench_vk_import_read: CS-0's falsifier leg (specs/CS-expert-compute-site.md §6): a
+# k=6 decode expert group at DeepSeek V4's geometry, its weights imported host slabs
+# (VK_EXT_external_memory_host) vs VRAM copies, one submit a layer-token -- the PCIe
+# read wall against the 2.5 ms bar. NOT a test gate (a real-device probe, run by hand
+# on the rig). Build on demand: make tests/bench_vk_import_read VK=1
+tests/bench_vk_import_read$(EXE): tests/bench_vk_import_read.c $(VK_OBJ) $(VK_SPV)
+	@[ "$(VK)" = 1 ] || { echo "tests/bench_vk_import_read needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
 # bench_matmul_f32: microbenchmark (pre-#442 scalar vs row-blocked fmaf f32 matmul at
 # router shapes), NOT a test gate. Build on demand: make tests/bench_matmul_f32
 tests/bench_matmul_f32$(EXE): tests/bench_matmul_f32.c

@@ -179,8 +179,8 @@ typedef struct {
     int prof, kind; float ts_period; uint32_t ts_mask;
     double prof_ms[PK_N]; unsigned long long prof_n[PK_N];
     int dwin, pwin, drole;                    /* COLI_VK_CHAIN_DPROF: the open window (decode / prompt chunk), the role frames submit under;
-                                               the prompt window charges its wall to the role stamped when it ran (role_t0, vkc_dwin) */
-    double role_t0, pwin_t0;
+                                               each window charges its wall to the role stamped when it ran (role_t0, vkc_dwin) */
+    double role_t0, pwin_t0, dwin_t0;
     /* COLI_VK_CHAIN_PROF=2: the matmuls' time by (fmt, rows of x, O, I), the slots' keys */
     int prof_shapes; uint64_t prof_key[64]; double prof_sh_ms[64]; unsigned long long prof_sh_n[64];
 } VkcCtx;
@@ -3212,7 +3212,12 @@ int vkc_dwin(int on) {
     if (!vkc_dprof()) return 0;
     if (on == 2) {   /* a prompt chunk: its own window, closed by the next call (a chunk's end) */
         if (KC.pwin) return 1;
-        KC.dwin = 0;   /* a prompt closes the decode window, as a forward of more rows always did */
+        if (KC.dwin) {   /* a prompt closes the decode window, as a forward of more rows always did */
+            double now = vkc_now_ms();
+            KC.st.d_host_ms[KC.drole] += now - KC.role_t0;
+            KC.st.d_wall_ms += now - KC.dwin_t0;
+            KC.dwin = 0;
+        }
         KC.pwin = 1; KC.st.p_fwd++;
         KC.role_t0 = KC.pwin_t0 = vkc_now_ms();
         return 1;
@@ -3223,8 +3228,22 @@ int vkc_dwin(int on) {
         KC.st.p_wall_ms += now - KC.pwin_t0;
         KC.pwin = 0;
     }
-    if (on && !KC.dwin) KC.st.d_fwd++;   /* a decode forward opens the window (counted once) */
-    KC.dwin = on != 0;
+    if (on == 1 && KC.dwin) {   /* the next decode forward of the open window: the last role's span */
+        double now = vkc_now_ms();
+        KC.st.d_host_ms[KC.drole] += now - KC.role_t0;
+        KC.st.d_wall_ms += now - KC.dwin_t0;
+        KC.role_t0 = KC.dwin_t0 = now;
+    } else if (on == 1) {       /* the window opens: its first span runs under OTHER until a role is stamped */
+        KC.st.d_fwd++;
+        KC.drole = VKC_R_OTHER;
+        KC.role_t0 = KC.dwin_t0 = vkc_now_ms();
+    }
+    if (on != 1 && KC.dwin) {   /* the window closes: its last span and wall */
+        double now = vkc_now_ms();
+        KC.st.d_host_ms[KC.drole] += now - KC.role_t0;
+        KC.st.d_wall_ms += now - KC.dwin_t0;
+    }
+    KC.dwin = on == 1;
     return 1;
 }
 void vkc_role(int role) {
@@ -3232,6 +3251,10 @@ void vkc_role(int role) {
     if (KC.pwin) {   /* the prompt window's host timeline: the wall since the last stamp is the old role's */
         double now = vkc_now_ms();
         KC.st.p_host_ms[KC.drole] += now - KC.role_t0;
+        KC.role_t0 = now;
+    } else if (KC.dwin) {   /* the decode window's own, the same charge (CS-0's print) */
+        double now = vkc_now_ms();
+        KC.st.d_host_ms[KC.drole] += now - KC.role_t0;
         KC.role_t0 = now;
     }
     KC.drole = role;

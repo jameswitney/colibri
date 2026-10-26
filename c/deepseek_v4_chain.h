@@ -2043,6 +2043,15 @@ static void v4c_report(void) {
                     st.d_dev_ms[VKC_R_A1], st.d_dev_ms[VKC_R_A2], st.d_dev_ms[VKC_R_DMOE], st.d_dev_ms[VKC_R_TAIL],
                     st.d_dev_ms[VKC_R_OTHER], st.d_submit_ms);
         }
+        if (st.d_wall_ms > 0) {   /* DPROF: the decode window's host timeline, the prompt line's shape (CS-0) */
+            double h[VKC_R_N], hsum = 0;
+            for (int r = 0; r < VKC_R_N; r++) { h[r] = st.d_host_ms[r] / 1e3; hsum += h[r]; }
+            fprintf(stderr, "[VK] %s chain decode host: %.1f s wall: host spans A1 %.1f s, A2 %.1f s, dmoe %.1f s, "
+                            "host-MoE %.1f s, staging %.1f s, tail %.1f s, other %.1f s (%.1f s of the wall unnamed)\n",
+                    v4c_name(ch), st.d_wall_ms / 1e3,
+                    h[VKC_R_A1], h[VKC_R_A2], h[VKC_R_DMOE], h[VKC_R_MOEH], h[VKC_R_STAGE], h[VKC_R_TAIL], h[VKC_R_OTHER],
+                    st.d_wall_ms / 1e3 - hsum);
+        }
         if (st.p_fwd) {   /* DPROF: the prompt chunks' split -- the TTFT window S0 measures; the host spans tile the wall, the host-MoE step is the lever */
             double h[VKC_R_N], wsum = 0, dsum = 0;
             for (int r = 0; r < VKC_R_N; r++) { h[r] = st.p_host_ms[r] / 1e3; wsum += st.p_wait_ms[r]; dsum += st.p_dev_ms[r]; }

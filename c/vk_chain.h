@@ -890,6 +890,11 @@ typedef struct {
      * time spent inside vkQueueSubmit. All zero at the default. */
     unsigned long long d_fwd, d_frames, d_wait_n;
     double d_wait_ms[VKC_R_N], d_dev_ms[VKC_R_N], d_submit_ms;
+    /* the decode window's own host timeline, the prompt line's shape: the wall since
+     * the last vkc_role stamp charged to the role it ran under (dwin_t0 opens a span a
+     * decode forward), so the roles sum to d_wall_ms -- the host-MoE step (MOEH) and
+     * the staging uploads (STAGE) at decode, the CS-0 print's numbers. Zero at the default. */
+    double d_host_ms[VKC_R_N], d_wall_ms;
     /* the same for the prompt window (vkc_dwin(2), one per prompt chunk): p_host_ms is
      * that window's own instrument -- the host wall charged to the role stamped when it
      * ran, so the roles sum to p_wall_ms and the prompt's wall splits into dense frames

@@ -5050,11 +5050,128 @@ int coli_v4_route_bf16_logits(float *weights, int *indices, const float *hidden,
                               int topk, float route_scale, const float *logits);
 #endif
 
+/* ---- CS-0: the per-expert CPU-cost probe (specs/CS-expert-compute-site.md §7) --
+ * COLI_V4_EXPERT_PROBE=1, instrument only. The decode window's serial expert
+ * loop costs ~4.4 ms an expert here against the fork's 1-2 ms for byte-identical
+ * kernels (the why-faster audits' anomaly), and the probe decomposes it before
+ * the compute site moves: every coli_v4_expert_forward_ref call of the serial
+ * loops timed and bucketed by the view's layout (the rows16 repack vs the native
+ * block_rows==1 reference matvec) and by its own lookup's cost (a warm RAM hit
+ * fills a view in microseconds, a joined miss spent the page cache or the disk
+ * in milliseconds: 0.5 ms separates the classes), the read-wait tail from the
+ * slide-join's last finish to the loop's entry timed per layer-token beside them.
+ * Default off: nothing runs, nothing prints, the output is unchanged. */
+#ifdef _OPENMP
+#include <omp.h>                                  /* the probe's team-size print */
+#endif
+static double v4_now_mono(void);
+typedef struct { float us; unsigned char rows16, miss, layer; } V4EprobeSample;
+static struct {
+    int on;                  /* 2 armed, 1 read and off, 0 unread */
+    double last_finish;      /* the slide-join's last profiled_expert_load_finish */
+    int have_finish;
+    double tail_s;           /* that finish -> the serial loop's entry, a layer-token's */
+    unsigned long long tails;
+    V4EprobeSample *s;
+    size_t n, cap;
+    double *view_ms;         /* each view's own lookup ms, the slide-join's order */
+    int view_n;
+} g_v4_eprobe;
+static int v4_eprobe_on(void) {
+    if (!g_v4_eprobe.on) {
+        const char *e = getenv("COLI_V4_EXPERT_PROBE");
+        g_v4_eprobe.on = e && *e && *e != '0' ? 2 : 1;
+    }
+    return g_v4_eprobe.on == 2;
+}
+static double v4_eprobe_t0(void) { return g_v4_eprobe.on == 2 ? v4_now_mono() : 0.0; }
+static void v4_eprobe_stamp_finish(void) {   /* the slide-join's last finish of a step */
+    if (g_v4_eprobe.on == 2) { g_v4_eprobe.last_finish = v4_now_mono(); g_v4_eprobe.have_finish = 1; }
+}
+static void v4_eprobe_loop_entry(void) {      /* the serial loop starts: the read tail ends */
+    if (!v4_eprobe_on() || !g_v4_eprobe.have_finish) return;
+    g_v4_eprobe.tail_s += v4_now_mono() - g_v4_eprobe.last_finish;
+    g_v4_eprobe.tails++;
+    g_v4_eprobe.have_finish = 0;
+}
+static void v4_eprobe_view(int i, double lookup_s) {   /* the slide-join fills view i */
+    if (!v4_eprobe_on() || lookup_s <= 0.0) return;
+    if (i >= g_v4_eprobe.view_n) {
+        double *v = realloc(g_v4_eprobe.view_ms, ((size_t)i + 1) * sizeof(*v));
+        if (!v) return;
+        g_v4_eprobe.view_ms = v;
+        g_v4_eprobe.view_n = i + 1;
+    }
+    g_v4_eprobe.view_ms[i] = lookup_s * 1e3;
+}
+static void v4_eprobe_call(double t0, const ColiExpertView *view, int layer, int i) {
+    if (t0 <= 0.0) return;
+    if (g_v4_eprobe.n == g_v4_eprobe.cap) {
+        size_t cap = g_v4_eprobe.cap ? g_v4_eprobe.cap * 2 : 1024;
+        V4EprobeSample *s = realloc(g_v4_eprobe.s, cap * sizeof(*s));
+        if (!s) return;
+        g_v4_eprobe.s = s;
+        g_v4_eprobe.cap = cap;
+    }
+    double ms = i >= 0 && i < g_v4_eprobe.view_n ? g_v4_eprobe.view_ms[i] : 0.0;
+    g_v4_eprobe.s[g_v4_eprobe.n++] = (V4EprobeSample){(float)((v4_now_mono() - t0) * 1e6),
+        (unsigned char)(view->gate.block_rows == 16), (unsigned char)(ms > 0.5), (unsigned char)layer};
+}
+
+static int v4_eprobe_us_cmp(const void *a, const void *b) {
+    float x = ((const V4EprobeSample *)a)->us, y = ((const V4EprobeSample *)b)->us;
+    return x < y ? -1 : x > y;
+}
+
+void coli_v4_expert_probe_report(void) {   /* the tier's run line's neighbour (v4_vk_close); exported across the amalgam's units */
+    if (!v4_eprobe_on() || (!g_v4_eprobe.n && !g_v4_eprobe.tails)) return;
+    double total_us = 0;
+    for (size_t i = 0; i < g_v4_eprobe.n; i++) total_us += g_v4_eprobe.s[i].us;
+    fprintf(stderr, "[VK] deepseek_v4 expert probe: %llu CPU experts in %llu layer-tokens "
+                    "(omp team %d): compute %.0f us an expert, %.1f ms a layer-token, "
+                    "read tail %.1f ms a layer-token (miss: lookup > 0.5 ms)\n",
+            (unsigned long long)g_v4_eprobe.n, g_v4_eprobe.tails, omp_get_max_threads(),
+            g_v4_eprobe.n ? total_us / (double)g_v4_eprobe.n : 0.0,
+            g_v4_eprobe.tails ? total_us / 1e3 / (double)g_v4_eprobe.tails : 0.0,
+            g_v4_eprobe.tails ? g_v4_eprobe.tail_s * 1e3 / (double)g_v4_eprobe.tails : 0.0);
+    V4EprobeSample *t = malloc((g_v4_eprobe.n ? g_v4_eprobe.n : 1) * sizeof(*t));
+    if (!t) return;
+    static const char *names[4] = {"native hit", "native miss", "rows16 hit", "rows16 miss"};
+    for (int b = 0; b < 4; b++) {
+        int m = 0;
+        for (size_t i = 0; i < g_v4_eprobe.n; i++)
+            if ((g_v4_eprobe.s[i].rows16 ? 2 : 0) + g_v4_eprobe.s[i].miss == b) t[m++] = g_v4_eprobe.s[i];
+        if (!m) continue;
+        qsort(t, (size_t)m, sizeof(*t), v4_eprobe_us_cmp);
+        fprintf(stderr, "  %s: n %d, P50 %.0f us, P90 %.0f us, max %.0f us\n", names[b], m,
+                t[m / 2].us, t[(m * 9) / 10].us, (double)t[m - 1].us);
+    }
+    {   /* the slowest layers by mean: the per-layer bucket the spec asks for */
+        double sum[256] = {0};
+        unsigned cnt[256] = {0};
+        for (size_t i = 0; i < g_v4_eprobe.n; i++)
+            if (g_v4_eprobe.s[i].layer < 255) { sum[g_v4_eprobe.s[i].layer] += g_v4_eprobe.s[i].us; cnt[g_v4_eprobe.s[i].layer]++; }
+        for (int pick = 0; pick < 3; pick++) {
+            int worst = -1;
+            double best = 0;
+            for (int l = 0; l < 256; l++)
+                if (cnt[l] >= 8 && sum[l] / cnt[l] > best) { best = sum[l] / cnt[l]; worst = l; }
+            if (worst < 0) break;
+            fprintf(stderr, "  layer %d: %u experts, mean %.0f us\n", worst, cnt[worst], best);
+            cnt[worst] = 0;
+        }
+    }
+    free(t);
+    free(g_v4_eprobe.s); g_v4_eprobe.s = NULL; g_v4_eprobe.n = g_v4_eprobe.cap = 0;
+    free(g_v4_eprobe.view_ms); g_v4_eprobe.view_ms = NULL; g_v4_eprobe.view_n = 0;
+}
+
 typedef struct {
     ColiExpertStore *store;
     ColiExpertKey key;
     ColiExpertView view;
     int result;
+    double probe_s;   /* CS-0: the view's own lookup, the provenance bucket */
 } ExpertLoadJob;
 
 #ifdef COLI_V4_EXPERIMENTAL_PREFETCH
@@ -5071,7 +5188,9 @@ static int expert_prefetch_enabled(void) {
 
 static void *expert_load_worker(void *argument) {
     ExpertLoadJob *job = argument;
+    double p0 = v4_eprobe_t0();   /* CS-0: this view's own lookup cost */
     job->result = coli_expert_lookup(job->store, job->key, &job->view);
+    if (p0 > 0.0) job->probe_s = v4_now_mono() - p0;
     return NULL;
 }
 
@@ -5421,6 +5540,7 @@ static int profiled_expert_load_finish(ExpertLoadHandle *handle) {
     double waited = v4_wait_clock();
     int result = expert_load_finish(handle);
     coli_v4_expert_store_add_wait(handle->wait_store, v4_wait_clock() - waited);
+    v4_eprobe_stamp_finish();   /* CS-0: the slide-join's last finish, the read tail's start */
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_LOADER_WAIT,
                               coli_v4_block_profile_now() - began);
@@ -5537,9 +5657,12 @@ static int v4_vk_token_finish(V4VkToken *vk, float *output, ColiExpertStore *sto
     float *rows = malloc(((size_t)cpu + 1) * d * sizeof(*rows));
     const float **dev = malloc((size_t)vk->full * sizeof(*dev));
     int result = rows && dev ? 0 : moe_fail("layer %d: out of memory for the device's experts", layer);
+    v4_eprobe_loop_entry();   /* CS-0: the read tail ends where the serial loop begins */
     for (int c = 0; !result && c < cpu; c++) {
+        double e0 = v4_eprobe_t0();   /* CS-0: the serial loop's per-expert cost */
         result = coli_v4_expert_forward_ref(rows + (size_t)c * d, &views[c], input,
                                             weights_cpu[c], limit);
+        v4_eprobe_call(e0, &views[c], layer, c);
         if (!result && tier && tier->note) tier->note(&views[c]);
     }
     int joined = !vk->n || (dev && tier && tier->join(dev));
@@ -5793,6 +5916,7 @@ static int moe_token_pipeline(float *output,
                 break;
             }
             views[current] = jobs[slot].view;
+            v4_eprobe_view(current, jobs[slot].probe_s);   /* CS-0: the view's own lookup cost */
 #ifdef COLI_V4_GPU_TIER
             if (store->gpu) {
                 if (coli_v4_hybrid_enabled())
@@ -6049,10 +6173,13 @@ static int moe_token_pipeline(float *output,
                                             shared_output, d, config->swiglu_limit);
         } else {
 #endif
+        v4_eprobe_loop_entry();   /* CS-0: the read tail ends where the serial loop begins */
         for (int current = 0; !result && current < selected; current++) {
+            double e0 = v4_eprobe_t0();   /* CS-0: the serial loop's per-expert cost */
             if (!result) result = coli_v4_expert_forward_ref(
                 expert_output, &views[current], input,
                 expert_weights[current], config->swiglu_limit);
+            v4_eprobe_call(e0, &views[current], weights->plan.layer, current);
             if (!result)
                 for (int i = 0; i < d; i++) output[i] += expert_output[i];
         }
@@ -6077,6 +6204,7 @@ static int moe_token_pipeline(float *output,
     v4_vk_token_free(&vk_step);
 #endif
 #else
+    v4_eprobe_loop_entry();   /* CS-0: the read tail ends where the serial loop begins */
     for (int current = 0; current < selected && loader_active; current++) {
         if (profiled_expert_load_finish(&loader) != 0) {
             result = moe_fail("layer %d: the read of expert %d did not complete",
@@ -6090,6 +6218,7 @@ static int moe_token_pipeline(float *output,
             break;
         }
         ColiExpertView expert = job.view;
+        v4_eprobe_view(current, job.probe_s);   /* CS-0: the view's own lookup cost */
 #ifdef COLI_V4_GPU_TIER
         if (store->gpu) coli_v4_gpu_expert_attach(store, &expert);
 #endif
@@ -6108,10 +6237,12 @@ static int moe_token_pipeline(float *output,
         }
         if (!result) {
             double mm0 = v4_now_mono();
+            double e0 = v4_eprobe_t0();   /* CS-0: the serial loop's per-expert cost */
             result = coli_v4_expert_forward_ref(
                 expert_output, &expert, input, expert_weights[current],
                 config->swiglu_limit);
             coli_v4_expert_store_add_matmul(store, v4_now_mono() - mm0);
+            v4_eprobe_call(e0, &expert, weights->plan.layer, current);
         }
         coli_expert_release(store, &expert);
         if (!result)
@@ -14783,6 +14914,8 @@ static void v4_vk_hooks(void) {
 
 /* Once, at the end: what ran on the device, then the device copies go before the
  * engine frees the weights they mirror. */
+void coli_v4_expert_probe_report(void);   /* CS-0: BLOCK_HYBRID's probe prints at this unit's close */
+
 static void v4_vk_close(void) {
 #ifdef COLI_CUDA
     v4_cu_close();
@@ -14795,6 +14928,7 @@ static void v4_vk_close(void) {
         ColiExpertStore *store = coli_v4_vk_tier->store;
         if (store && store->ops && store->ops->stats) store->ops->stats(store, &st);
         v4_vk_tier_report("run", (unsigned long long)st.hits, (unsigned long long)st.misses);
+        coli_v4_expert_probe_report();   /* CS-0: the per-expert probe's line, beside the tier's (BLOCK_HYBRID's) */
         coli_v4_vk_tier = NULL;
         coli_v4_expert_store_device_tier = NULL;
         coli_v4_expert_store_ram_first = NULL;
