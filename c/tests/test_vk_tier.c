@@ -2275,6 +2275,211 @@ static unsigned long long after(const char *line, const char *key) {
     const char *p = strstr(line, key);
     return p ? strtoull(p + strlen(key), NULL, 10) : ~0ull;
 }
+
+/* ---- the compute site (COLI_VK_TIER_EXPERTS, CS-1b) -----------------------------
+ * One decode token's routed experts as ONE expert-batch group issued at the finish
+ * site: vkt_issue defers the S==1 step, vkt_issue_group submits the residents'
+ * cached handles beside zero-copy aliases of imported store slabs (fmt 15/7), and
+ * the join retires the group. The device rows run against the same double reference
+ * as the ordinary paths -- the v4 MXFP4 class at 2e-2 and the non-fp4 rows at 2e-3,
+ * armed and unarmed (the unarmed control runs the ordinary issue/join path). A
+ * non-finite row is a failure outright: rel()'s NaN-blind `>` never gets to pass it. */
+/* One aliased expert's store slab (fmt 15): the three matrices' packed codes and
+ * ue8m0 scale bytes at 4 KiB-aligned offsets in one imported host range, the store's
+ * record shape the compute-site group aliases. *slab_out is the caller's allocation,
+ * freed after the join; the imported Vk buffer is the tier's. */
+static int cs_alias_slab(int layer, int eid, VktAliasSrc *src, void **slab_out) {
+    if (!coli_vk_import_alignment()) return 0;
+    const Ex *e = &ex[layer][eid];
+    const Mat *m[3] = {&e->g, &e->u, &e->d};
+    size_t woff[3], soff[3], cap = 0;
+    for (int k = 0; k < 3; k++) {
+        size_t rb = row_bytes(m[k]->f.kind, m[k]->I), wb = rb * (size_t)m[k]->O;
+        size_t nb = (size_t)m[k]->O * (((size_t)m[k]->I + 31) / 32);   /* fmt 15: one ue8m0 byte a group */
+        size_t sb = (nb + 3) / 4 * 4;
+        woff[k] = (cap + 4095) / 4096 * 4096; cap = woff[k] + wb;
+        soff[k] = (cap + 4095) / 4096 * 4096; cap = soff[k] + sb;
+    }
+    cap = (cap + 4095) / 4096 * 4096;
+    uint8_t *slab = NULL;
+    if (posix_memalign(slab_out, 4096, cap) != 0 || !(slab = *slab_out)) return 0;
+    memset(slab, 0, cap);
+    for (int k = 0; k < 3; k++) {
+        size_t rb = row_bytes(m[k]->f.kind, m[k]->I);
+        size_t nb = (size_t)m[k]->O * (((size_t)m[k]->I + 31) / 32);
+        memcpy(slab + woff[k], m[k]->codes, rb * (size_t)m[k]->O);
+        memcpy(slab + soff[k], m[k]->scales, nb);
+    }
+    memset(src, 0, sizeof(*src));
+    src->slab = slab; src->bytes = cap; src->fmt = 15; src->gs = 32;
+    for (int k = 0; k < 3; k++) {
+        src->woff[k] = woff[k]; src->soff[k] = soff[k];
+        src->I[k] = m[k]->I; src->O[k] = m[k]->O;
+    }
+    return 1;
+}
+/* One S==1 step through the compute-site group. w is the reference's route weight
+ * (always non-NULL); the device sees it only for the v4 activation, where it is
+ * applied on-device. armed selects the deferral path: on, vkt_issue defers and
+ * vkt_issue_group submits; off, vkt_issue submits the ordinary batch and the group
+ * is never called. *alias_hits, when given, counts taken selections that were not
+ * resident -- the aliased entries of the group. */
+static double cs_group_step(int layer, const int *idx, const float *w, const VktAliasSrc *src,
+                            int v4, float limit, int armed, Books *bk, unsigned long long *alias_hits) {
+    int S = 1;
+    float *x = malloc((size_t)S * H * sizeof(float)), *xq = malloc((size_t)S * H * sizeof(float));
+    float *cpu = calloc((size_t)S * K * H, sizeof(float)), *y = malloc(H * sizeof(float));
+    float *out = calloc((size_t)S * H, sizeof(float)), *ref = calloc((size_t)S * H, sizeof(float));
+    uint8_t taken[K]; const float *rows[K];
+    for (int i = 0; i < S * H; i++) x[i] = frnd() * (v4 ? 4.0f : 1.0f);
+    memcpy(xq, x, sizeof(float) * (size_t)S * H);
+    if (v4) for (int s = 0; s < S; s++) qdq128(xq + (size_t)s * H, H);
+    int n = v4 ? vkt_issue_w(layer, xq, S, K, idx, w, taken)
+               : vkt_issue(layer, xq, S, K, idx, taken);
+    int took = armed ? vkt_issue_group(layer, xq, S, K, idx, v4 ? w : NULL, src, taken) : 0;
+    (void)n;
+    for (int i = 0; i < S * K; i++) {
+        if (taken[i]) continue;
+        if (v4) expert_v4(&ex[layer][idx[i]], xq + (size_t)(i / K) * H, w[i], limit, cpu + (size_t)i * H);
+        else expert_ref(&ex[layer][idx[i]], xq + (size_t)(i / K) * H, cpu + (size_t)i * H);
+        VktExpertSrc s = src_of(&ex[layer][idx[i]]); vkt_note(layer, idx[i], &s);
+    }
+    int joined = (armed ? took : n) ? vkt_join(rows) : 1;
+    CHECK(joined, "cs: join failed");
+    double worst = 0;
+    for (int s = 0; s < S; s++)
+        for (int k = 0; k < K; k++) {
+            int i = s * K + k;
+            if (v4) expert_v4(&ex[layer][idx[i]], xq + (size_t)s * H, w[i], limit, y);
+            else expert_ref(&ex[layer][idx[i]], xq + (size_t)s * H, y);
+            for (int d = 0; d < H; d++) ref[(size_t)s * H + d] += (v4 ? 1.0f : w[i]) * y[d];
+            const float *c = taken[i] && joined ? rows[i] : cpu + (size_t)i * H;
+            if (taken[i] && joined) {
+                float dr[HF_MAX];
+                for (int d = 0; d < H; d++) dr[d] = v4 ? bf16r(rows[i][d]) : rows[i][d];
+                double r = rel(dr, y, H);
+                if (!(r <= worst)) worst = r;   /* a NaN counts as the worst */
+                for (int d = 0; d < H; d++) out[(size_t)s * H + d] += (v4 ? 1.0f : w[i]) * dr[d];
+                if (alias_hits && !vkt_resident(layer, idx[i])) (*alias_hits)++;
+            } else for (int d = 0; d < H; d++) out[(size_t)s * H + d] += (v4 ? 1.0f : w[i]) * c[d];
+            bk->routed++; bk->dev += taken[i] != 0;
+        }
+    double r = rel(out, ref, S * H);
+    if (!(r <= worst)) worst = r;
+    free(x); free(xq); free(cpu); free(out); free(ref); free(y);
+    return worst;
+}
+/* the report's cs: clause, parsed for the engagement assertion */
+static void cs_report(const char *line, unsigned long long *g, unsigned long long *r,
+                      unsigned long long *a, unsigned long long *f, unsigned long long *x) {
+    *g = *r = *a = *f = *x = 0;
+    const char *p = strstr(line, "cs: ");
+    if (!p || sscanf(p, "cs: %llu groups, %llu resident + %llu aliased entries on the device, "
+                     "%llu cpu-fallback (%llu alias refusals)", g, r, a, f, x) != 5)
+        *g = *r = *a = *f = *x = ~0ull;
+}
+static void cs_group_v4(int armed) {
+    rng = 7;
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU_V4; g_limit = 10.0f;
+    uint32_t hist[L][E], *rows[L];
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = 0; }
+    hist[0][0] = 100; hist[0][1] = 90;   /* two resident places: layer 0's experts 0 and 1 */
+    if (armed) setenv("COLI_VK_TIER_EXPERTS", "1", 1); else unsetenv("COLI_VK_TIER_EXPERTS");
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    set_budget(2, f, f);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU_V4, 10.0f);
+    CHECK(vkt_init(&vc, rows), "cs v4: the tier did not start (%s)", armed ? "armed" : "unarmed");
+    int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+    for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+    vkt_put_done();
+    CHECK(n == 2, "cs v4: %d warm of 2 planned (%s)", n, armed ? "armed" : "unarmed");
+    VktAliasSrc asrc[E]; void *slabs[E];
+    for (int e = 0; e < E; e++) slabs[e] = NULL;
+    if (armed) for (int e = 2; e <= 4; e++)
+        CHECK(cs_alias_slab(0, e, &asrc[e], &slabs[e]), "cs v4: alias slab for expert %d", e);
+    static const int routes[][K] = {{0, 1, 2}, {0, 1, 3}, {1, 2, 4}, {0, 2, 3}};
+    float w[K] = {0.5f, 0.3f, 0.2f};
+    Books bk = {0, 0}; double worst = 0; unsigned long long aliased = 0;
+    for (int t = 0; t < 4; t++) {
+        VktAliasSrc src[K];
+        for (int k = 0; k < K; k++) {
+            int e = routes[t][k];
+            src[k] = (armed && e >= 2) ? asrc[e] : (VktAliasSrc){0};
+        }
+        vkt_begin_forward();
+        double r = cs_group_step(0, routes[t], w, src, 1, 10.0f, armed, &bk, &aliased);
+        if (!(r <= worst)) worst = r;
+    }
+    char line[4096]; report_line(line, sizeof line);
+    unsigned long long cg, cr, ca, cf, cx; cs_report(line, &cg, &cr, &ca, &cf, &cx);
+    if (armed)
+        printf("  cs v4 (armed): device %llu of %llu assignments, %llu aliased, worst %.2e, "
+               "cs: %llu groups, %llu resident + %llu aliased, %llu fallback, %llu refusals\n",
+               bk.dev, bk.routed, aliased, no_nan(worst), cg, cr, ca, cf, cx);
+    else
+        printf("  cs v4 (unarmed): device %llu of %llu assignments, %llu aliased, worst %.2e\n",
+               bk.dev, bk.routed, aliased, no_nan(worst));
+    CHECK(bk.dev > 0, "cs v4 (%s): nothing ran on the device", armed ? "armed" : "unarmed");
+    if (armed)
+        CHECK(cg == 4 && cr == 6 && ca == 6 && cf == 0 && cx == 0,
+              "cs v4 armed: the group did not engage (cs: %llu groups, %llu resident + %llu aliased, "
+              "%llu fallback, %llu refusals)", cg, cr, ca, cf, cx);
+    CHECK(no_nan(worst) < 2e-2, "cs v4 (%s): rows off the reference (%.3g)", armed ? "armed" : "unarmed", no_nan(worst));
+    vkt_shutdown();
+    for (int e = 0; e < E; e++) free(slabs[e]);
+    model_free();
+}
+static void cs_group_i8(int armed) {
+    rng = 7;
+    VktFmt f = {VKT_SRC_I8_ROW, 0};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    uint32_t hist[L][E], *rows[L];
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = 0; }
+    hist[0][0] = 100; hist[0][1] = 90; hist[0][2] = 80;   /* three resident places: the whole routed set */
+    if (armed) setenv("COLI_VK_TIER_EXPERTS", "1", 1); else unsetenv("COLI_VK_TIER_EXPERTS");
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    set_budget(3, f, f);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    CHECK(vkt_init(&vc, rows), "cs i8: the tier did not start (%s)", armed ? "armed" : "unarmed");
+    int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+    for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+    vkt_put_done();
+    CHECK(n == 3, "cs i8: %d warm of 3 planned (%s)", n, armed ? "armed" : "unarmed");
+    static const int routes[][K] = {{0, 1, 2}, {2, 0, 1}, {1, 2, 0}};
+    float w[K] = {0.5f, 0.3f, 0.2f};
+    Books bk = {0, 0}; double worst = 0;
+    for (int t = 0; t < 3; t++) {
+        vkt_begin_forward();
+        double r = cs_group_step(0, routes[t], w, NULL, 0, 0, armed, &bk, NULL);
+        if (!(r <= worst)) worst = r;
+    }
+    char line[4096]; report_line(line, sizeof line);
+    unsigned long long cg, cr, ca, cf, cx; cs_report(line, &cg, &cr, &ca, &cf, &cx);
+    if (armed)
+        printf("  cs i8 (armed): device %llu of %llu assignments, worst %.2e, "
+               "cs: %llu groups, %llu resident + %llu aliased, %llu fallback, %llu refusals\n",
+               bk.dev, bk.routed, no_nan(worst), cg, cr, ca, cf, cx);
+    else
+        printf("  cs i8 (unarmed): device %llu of %llu assignments, worst %.2e\n",
+               bk.dev, bk.routed, no_nan(worst));
+    CHECK(bk.dev > 0, "cs i8 (%s): nothing ran on the device", armed ? "armed" : "unarmed");
+    if (armed)
+        CHECK(cg == 3 && cr == 9 && ca == 0 && cf == 0 && cx == 0,
+              "cs i8 armed: the group did not engage (cs: %llu groups, %llu resident + %llu aliased, "
+              "%llu fallback, %llu refusals)", cg, cr, ca, cf, cx);
+    CHECK(no_nan(worst) < 2e-3, "cs i8 (%s): rows off the reference (%.3g)", armed ? "armed" : "unarmed", no_nan(worst));
+    vkt_shutdown(); model_free();
+}
+static void cs_group(void) {
+    cs_group_v4(1);   /* the v4 MXFP4 class: aliased + resident selections in one group, < 2e-2 */
+    cs_group_v4(0);
+    cs_group_i8(1);   /* the non-fp4 rows: the resident selections through the same group, < 2e-3 */
+    cs_group_i8(0);
+    unsetenv("COLI_VK_TIER_SYNC");   /* the suite's next cases (the stream ring) expect it unset */
+}
 /* The hot set overlay (COLI_VK_TIER_HOT): the history's top share of the resident places,
  * ranked on the RAW counts, marked on the slots and skipped by every victim path. The
  * history names layer 0 ten times hotter than layer 1, so the global ranking and the
@@ -3425,6 +3630,7 @@ int main(int argc, char **argv) {
     printf("bank layer:\n"); bank_layer_case();
     printf("decode grow:\n"); decode_grow(dg_leg);
     printf("DeepSeek V4:\n"); v4_act();
+    printf("compute site:\n"); cs_group();
     printf("stream:\n"); stream();
     printf("stream batch:\n"); stream_batch();
     printf("stream ring:\n"); stream_ring();
