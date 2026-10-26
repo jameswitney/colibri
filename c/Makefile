@@ -844,7 +844,7 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 		--fixture ./kimi_k3_tiny
 
 .PHONY: deepseek-v4 deepseek_v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
-	deepseek-v4-tiny-check deepseek-v4-tiny-check-dmoe deepseek-v4-tiny-check-ring deepseek-v4-clean
+	deepseek-v4-tiny-check deepseek-v4-tiny-check-dmoe deepseek-v4-tiny-check-cs deepseek-v4-tiny-check-ring deepseek-v4-clean
 ifeq ($(COLI_V4_SUPPORTED),1)
 # Every shader the other engines build (VK_SPV, empty without VK=1): backend_vulkan.c
 # looks for them at run time and goes without one that is not there, and
@@ -947,6 +947,41 @@ deepseek-v4-tiny-check-dmoe: deepseek-v4-tiny-generate
 		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
 		--fixture $(CURDIR)/deepseek_v4_tiny
 
+# COLI_VK_TIER_EXPERTS's own gate (the compute site, CS-1b): the same three harnesses
+# and the same token-exact oracle, now over the finish-site group -- the tier's
+# residents from their cached handles beside zero-copy store-slab aliases (CS-1a),
+# issued in ONE expert-batch group per layer-token. The base leg arms the compute
+# site alone (COLI_VK_TIER_EXPERTS=1); the growth leg composes it with the headroom
+# growth (COLI_VK_TIER_DECODE_GROW + _HEADROOM + _TARGET, and COLI_VK_TIER_PROMO_CAP=-1
+# uncapping the forward's promotions) -- _TARGET is read only under _HEADROOM
+# (vk_tier.c), so the headroom env is part of the arm, not an extra. VK=1 because
+# the arm is the device's; the same token-exact oracle, exact ids or nothing.
+.PHONY: deepseek-v4-tiny-check-cs
+deepseek-v4-tiny-check-cs: deepseek-v4-tiny-generate
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) VK=1 deepseek-v4
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_TIER_DECODE_GROW=1 COLI_VK_TIER_DECODE_GROW_HEADROOM=1 \
+	COLI_VK_TIER_DECODE_GROW_TARGET=800 COLI_VK_TIER_PROMO_CAP=-1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_TIER_DECODE_GROW=1 COLI_VK_TIER_DECODE_GROW_HEADROOM=1 \
+	COLI_VK_TIER_DECODE_GROW_TARGET=800 COLI_VK_TIER_PROMO_CAP=-1 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_TIER_DECODE_GROW=1 COLI_VK_TIER_DECODE_GROW_HEADROOM=1 \
+	COLI_VK_TIER_DECODE_GROW_TARGET=800 COLI_VK_TIER_PROMO_CAP=-1 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+
 deepseek-v4-oracle: deepseek-v4
 	@test -n "$(MODEL)" || { echo "usage: make deepseek-v4-oracle MODEL=/path/to/checkpoint" >&2; exit 2; }
 
@@ -988,6 +1023,8 @@ deepseek-v4-tiny-check:
 	@echo "SKIP deepseek-v4-tiny-check: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
 deepseek-v4-tiny-check-dmoe:
 	@echo "SKIP deepseek-v4-tiny-check-dmoe: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
+deepseek-v4-tiny-check-cs:
+	@echo "SKIP deepseek-v4-tiny-check-cs: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
 deepseek-v4-tiny-generate:
 	@echo "SKIP deepseek-v4-tiny-generate: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
 endif
@@ -3535,7 +3572,7 @@ clean:
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
 .PHONY: all deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
-	deepseek-v4-tiny-generate deepseek-v4-tiny-check deepseek-v4-tiny-check-dmoe \
+	deepseek-v4-tiny-generate deepseek-v4-tiny-check deepseek-v4-tiny-check-dmoe deepseek-v4-tiny-check-cs \
 	qwen38-tiny-generate qwen38-tiny-check \
 	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench cuda-dll hip-dll portable \
 	test-c test-python test check clean install uninstall bench
