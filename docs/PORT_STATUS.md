@@ -465,3 +465,18 @@ PORT_PLAN below is the 2026-10-19/22 decision record; its F-number statuses are 
   means the inline remainder is the in-RAM exclusion's — §4's open coverage question, now the ring's
   rank-1 unknown — and a TTFT past W2's RING means the chunk-1 join tail is exposed).
   Report: `docs/research/AP-pw-b2-2026-10-26.md`.
+
+## Session 2026-10-26 IV — campaign pause + handover
+
+The parity campaign is **PAUSED at the owner's request**; a fresh agent takes over with
+`docs/HANDOVER-2026-10-26-campaign.md`. State at pause (`port/up-2276` @ the commit below):
+decode 0.549 → **0.678** tok/s and TTFT 154.3 → **143.4 s** at the best same-config arm, with
+fmt-15 default-on delivering 0.575 at plain defaults; the fork remains at 1.135 / 107.8 s
+(1.67× / 1.33×). Landed and reviewed: fmt 15 (ue8m0), DECODE_GROW, ATTN_FA, MHC_S1,
+STREAM_RING(+COLD), the `deepseek-v4-smoke` gate, DPROF. Falsified with mechanism: byte-economy
+2.8×, zero-disk decode, A2 coverage, head-on-host, the pipeline gap, barriers, kernels-as-class,
+MTP, Option-B's fold. The live lever is **PW-E: the fork's async MoE lanes**
+(`docs/campaign/specs/AM-pw-e-lanes.md`, ~540–700 LOC, bar ≥ +10% decode), then the W3 window
+(RINGCOLD/RING/C0) and the lever-overlap rebalance. The PR queue (§7 of the handover) is prepared
+but unsent — the owner sends; no GitHub credentials on this box. Rig notes, traps and the method
+are in §8–§9 of the handover. Nothing unpushed; rig idle; model history restored.
