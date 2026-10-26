@@ -17,12 +17,22 @@
  * copies (coli_vk_tensor_ensure): the 0.381 ms class. Reports both legs' device and
  * wall ms a layer-token and the effective host-read GB/s beside the bar.
  *
+ * The MIXED legs (CS-am1 §3, falsifier 1′): k_imp of the K experts imported, the
+ * rest uploaded VRAM copies, still ONE submit -- the operating point between the
+ * endpoints. K=6 quantises the miss share m = k_imp/K to sixths: 3/6 is the
+ * amendment's m=0.5, 4/6 the PG-class share (s=1/3, inside its 0.30-0.36), 2/6 and
+ * 1/6 bracket its m=0.25. After the legs, the two-point linear model on THIS run's
+ * own endpoints, device(m) = vram + (import − vram)·m -- the amendment's
+ * 0.632 + 2.591·m is CS-0's instance of exactly that line -- with each mixed leg's
+ * delta beside the ±15% linearity bar and the PG-class leg's device beside 2.5 ms.
+ *
  *   make tests/bench_vk_import_read VK=1 && ./tests/bench_vk_import_read [reps]
  * Needs a Vulkan device that imports host memory (RADV: yes); refuses cleanly when
  * it cannot (exit 1 with the reason), the house rig gates' rule. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 #include "../backend_vulkan.h"
 
@@ -68,8 +78,12 @@ int main(int argc, char **argv) {
     for (int i = 0; i < D; i++) x[i] = (float)((i % 7) - 3) * 0.125f;
     for (int k = 0; k < K; k++) { w[k] = 1.0f / (float)K; rows[k] = 1; xrows[k] = x; }
 
-    /* both legs over the same bytes: imported host codes vs uploaded VRAM copies */
-    for (int leg = 0; leg < 2; leg++) {
+    /* the legs, most-imported first: kimp of the K experts read off imported host
+     * pages (k < kimp), the rest uploaded VRAM copies -- the endpoints (K: the
+     * all-import leg, CS-am1's refusal-bound reference; 0: the VRAM control) and
+     * the mixed legs between them, always one submit */
+    double dev_leg[K + 1] = {0}, wall_leg[K + 1] = {0};
+    for (int kimp = K; kimp >= 0; kimp--) {
         Mat gate[K], up[K], down[K];
         ColiVkExpert *ex[K];
         for (int k = 0; k < K; k++) {
@@ -77,7 +91,7 @@ int main(int argc, char **argv) {
             for (int m = 0; ok && m < 3; m++) {   /* 0 gate, 1 up (D inputs, I rows), 2 down (I inputs, D rows) */
                 Mat *a = m == 0 ? &gate[k] : m == 1 ? &up[k] : &down[k];
                 int in = m == 2 ? I : D, rows_ = m == 2 ? D : I;
-                ok = leg == 0
+                ok = k < kimp
                     ? coli_vk_tensor_import(&a->t, a->codes, a->alloc, a->scales, FMT, in, rows_, GS)
                     : coli_vk_tensor_ensure(&a->t, a->codes, a->scales, FMT, in, rows_, GS);
             }
@@ -85,7 +99,7 @@ int main(int argc, char **argv) {
         }
         if (!ex[K - 1]) {
             printf("bench_vk_import_read: %s leg refused (fmt %d unsupported here)\n",
-                   leg == 0 ? "import" : "vram", FMT);
+                   kimp == K ? "import" : kimp ? "mixed" : "vram", FMT);
             return 1;
         }
         /* warm the pipelines, then time whole submits: issue the group, join it */
@@ -105,20 +119,43 @@ int main(int argc, char **argv) {
             wall_sum += ms;
             dev_sum += dms;
         }
-        size_t host_bytes = 0;
-        for (int k = 0; k < K; k++)
-            host_bytes += coli_vk_tensor_bytes(gate[k].t) + coli_vk_tensor_bytes(up[k].t) + coli_vk_tensor_bytes(down[k].t);
         double mean = wall_sum / reps;
-        printf("bench_vk_import_read: %s leg: %d reps, wall %.3f ms (best %.3f) a layer-token, "
-               "device %.3f ms, %.1f MiB a group -> %.1f GB/s effective%s\n",
-               leg == 0 ? "imported-host" : "vram-resident", reps, mean, best, dev_sum / reps,
-               host_bytes / 1048576.0, (host_bytes / 1048576.0 / 1024.0) * 1e3 / mean,
-               leg == 0 ? "  [bar: <= 2.5 ms]" : "  (the 0.381 ms class)");
+        dev_leg[kimp] = dev_sum / reps;
+        wall_leg[kimp] = mean;
+        size_t host_bytes = 0;
+        for (int k = 0; k < kimp; k++)
+            host_bytes += coli_vk_tensor_bytes(gate[k].t) + coli_vk_tensor_bytes(up[k].t) + coli_vk_tensor_bytes(down[k].t);
+        if (kimp == K)
+            printf("bench_vk_import_read: %s leg: %d reps, wall %.3f ms (best %.3f) a layer-token, "
+                   "device %.3f ms, %.1f MiB a group -> %.1f GB/s effective  [bar: <= 2.5 ms]\n",
+                   "imported-host", reps, mean, best, dev_leg[kimp],
+                   host_bytes / 1048576.0, (host_bytes / 1048576.0 / 1024.0) * 1e3 / mean);
+        else if (kimp == 0)
+            printf("bench_vk_import_read: %s leg: %d reps, wall %.3f ms (best %.3f) a layer-token, "
+                   "device %.3f ms  (the 0.381 ms class)\n",
+                   "vram-resident", reps, mean, best, dev_leg[kimp]);
+        else
+            printf("bench_vk_import_read: mixed leg m=%.3f (%d of %d imported): wall %.3f ms (best %.3f), "
+                   "device %.3f ms a layer-token\n",
+                   (double)kimp / K, kimp, K, mean, best, dev_leg[kimp]);
         for (int k = 0; k < K; k++) {   /* xb_expert_free frees the three tensors with it */
             coli_vk_xb_expert_free(ex[k]);
             free(gate[k].codes); free(up[k].codes); free(down[k].codes);
             free(gate[k].scales); free(up[k].scales); free(down[k].scales);
         }
+    }
+    /* falsifier 1′ (CS-am1 §3): the two-point model on this run's own endpoints, each
+     * mixed leg beside it -- device linear in imported bytes, ±15% the linearity bar,
+     * the PG-class leg (m=4/6, share s=1/3) beside the 2.5 ms device bar */
+    printf("bench_vk_import_read: falsifier 1' -- device(m) = %.3f + %.3f·m ms (this run's endpoints; "
+           "CS-am1's 0.632 + 2.591·m is CS-0's instance), wall(m) = %.3f + %.3f·m\n",
+           dev_leg[0], dev_leg[K] - dev_leg[0], wall_leg[0], wall_leg[K] - wall_leg[0]);
+    for (int kimp = K - 1; kimp > 0; kimp--) {
+        double m = (double)kimp / K, pred = dev_leg[0] + (dev_leg[K] - dev_leg[0]) * m, d = dev_leg[kimp] / pred - 1;
+        printf("bench_vk_import_read:   m=%.3f wall %.3f ms, device %.3f ms, predicted %.3f ms, delta %+.1f%%%s%s\n",
+               m, wall_leg[kimp], dev_leg[kimp], pred, d * 100,
+               kimp * 3 == 2 * K ? "  [PG-class share s=0.33: bar device <= 2.5 ms]" : "",
+               fabs(d) > 0.15 ? "  [OFF the model > 15%]" : "");
     }
     return 0;
 }
