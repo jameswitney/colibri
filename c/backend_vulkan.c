@@ -277,6 +277,7 @@ struct ColiVkTensor {
     uint8_t *wmap, *smap;  /* mapped memory: the rows' and the scales' mapping (coli_vk_tensor_refill) */
     VkDeviceMemory imp;    /* coli_vk_tensor_import: the host memory its rows are read from, in place */
     struct ColiVkTensor *imp_next;   /* the live imports, freed at shutdown */
+    struct ColiVkSlab *slab;         /* coli_vk_tensor_alias: the imported slab its two records sit in */
     size_t wcap, scap;     /* the bytes its two ranges hold (tensor_alloc_pad: room for a bigger format) */
     size_t acct;           /* what tensor_alloc added to the pool's counters, taken back at the release */
     uint8_t wide;          /* a scale times the format's largest code passes f16 (scales_wide): off the cooperative-matrix GEMMs, which hold the weights in f16 */
@@ -2446,6 +2447,153 @@ int coli_vk_tensor_import(ColiVkTensor **tensor, const void *weights, size_t all
 #endif
 }
 
+/* ---- slabs imported once, aliased by many tensors (the compute-site lever) --------
+ * The expert store's slabs are the device's to read where they sit: ONE import of the
+ * pages (coli_vk_host_buffer's) serves every expert record a slab holds, and each
+ * record becomes a ColiVkTensor whose two buffers bind straight into the imported
+ * memory at its byte offsets -- fmt 15 included, whose packed ue8m0 scale bytes stay on
+ * the slab (the form coli_vk_tensor_import refuses above: it would hand the shaders
+ * those bytes as floats). Refcounted, so a slot's tensor geometry can come and go
+ * while the import lives; the engine drops the whole slab only at store destroy, with
+ * the device idle (the last unref frees the pages a submission may still be reading
+ * otherwise). The alias keeps the descriptors' whole-buffer bindings honest: each
+ * record is its own VkBuffer into the same VkDeviceMemory, as a pool range is its own. */
+struct ColiVkSlab {
+    const void *base;     /* the pages the import wrapped (offset 0 in its memory) */
+    const void *ptr;      /* the caller's slab, where its records start */
+    size_t bytes,         /* the imported size: whole import-alignment units */
+           user_bytes;    /* the caller's range inside those pages */
+    void *buf, *mem;      /* the import's buffer and memory */
+    long refs;
+    struct ColiVkSlab *next;
+};
+static struct { pthread_mutex_t mx; struct ColiVkSlab *live; int n; } g_slabs = {.mx = PTHREAD_MUTEX_INITIALIZER};
+/* live slab imports bound: past COLI_VK_TIER_EXPERTS_IMPORT_CAP (default 1408, under
+ * the driver's maxMemoryAllocationCount) the import refuses -- the caller's experts
+ * run on the CPU, the lever's refusal ladder */
+static long slab_cap(void) {
+    static long cap;
+    if (!cap) {
+        const char *e = getenv("COLI_VK_TIER_EXPERTS_IMPORT_CAP");
+        cap = e && *e ? atol(e) : 1408;
+        if (cap < 0) cap = 0;
+    }
+    return cap;
+}
+int coli_vk_slab_import(const void *slab, size_t bytes, ColiVkSlab **out) {
+    size_t al = coli_vk_import_alignment();
+    if (!al || !slab || !bytes || !out || !G.ready) return 0;
+    const void *base = (const void *)((uintptr_t)slab / al * al);
+    pthread_mutex_lock(&g_slabs.mx);
+    for (ColiVkSlab *r = g_slabs.live; r; r = r->next)
+        if (r->base == base) {
+            /* the same pages: only the very range they were imported for (a store slot
+             * reused keeps its pointer and size; anything else sharing the page is a
+             * different slab the caller reallocated -- not ours to grow) */
+            int ok = r->ptr == slab && r->user_bytes == bytes;
+            if (ok) { r->refs++; *out = r; }
+            pthread_mutex_unlock(&g_slabs.mx);
+            return ok;
+        }
+    if (g_slabs.n >= slab_cap()) { pthread_mutex_unlock(&g_slabs.mx); return 0; }
+    void *buf, *mem; size_t off;
+    int ok = coli_vk_host_buffer(slab, bytes, &buf, &mem, &off);
+    if (ok) {
+        ColiVkSlab *r = calloc(1, sizeof *r);
+        size_t sz = ((uintptr_t)slab + bytes + al - 1) / al * al - (uintptr_t)base;
+        if (r) {
+            r->base = base; r->ptr = slab; r->bytes = sz; r->user_bytes = bytes;
+            r->buf = buf; r->mem = mem; r->refs = 1;
+            r->next = g_slabs.live; g_slabs.live = r; g_slabs.n++;
+            *out = r;
+        } else {
+            coli_vk_host_buffer_free(buf, mem, sz);
+            ok = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_slabs.mx);
+    return ok;
+}
+void coli_vk_slab_unref(ColiVkSlab *r) {
+    if (!r) return;
+    pthread_mutex_lock(&g_slabs.mx);
+    if (--r->refs > 0) { pthread_mutex_unlock(&g_slabs.mx); return; }
+    for (ColiVkSlab **pp = &g_slabs.live; *pp; pp = &(*pp)->next)
+        if (*pp == r) { *pp = r->next; break; }
+    g_slabs.n--;
+    pthread_mutex_unlock(&g_slabs.mx);
+    if (G.ready) coli_vk_host_buffer_free(r->buf, r->mem, r->bytes);
+    free(r);
+}
+/* one record of the slab as a buffer bound into the imported memory at `off` bytes
+ * into the caller's slab: the descriptor paths bind their buffers whole (offset 0),
+ * so a record needs its own handle into the same pages, as a pool range has its own */
+static int slab_buf(ColiVkSlab *r, size_t off, size_t bytes, VkBuffer *out) {
+#ifdef VK_EXT_external_memory_host
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = bytes,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VkBuffer b;
+    if (vkCreateBuffer(G.dev, &bi, NULL, &b) != VK_SUCCESS) return 0;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(G.dev, b, &req);
+    size_t boff = (size_t)((uintptr_t)r->ptr - (uintptr_t)r->base) + off;
+    if (boff % (req.alignment ? req.alignment : 1) || boff + req.size > r->bytes) {
+        vkDestroyBuffer(G.dev, b, NULL); return 0;
+    }
+    if (vkBindBufferMemory(G.dev, b, (VkDeviceMemory)r->mem, boff) != VK_SUCCESS) {
+        vkDestroyBuffer(G.dev, b, NULL); return 0;
+    }
+    *out = b;
+    return 1;
+#else
+    (void)r; (void)off; (void)bytes; (void)out;
+    return 0;
+#endif
+}
+int coli_vk_tensor_alias(ColiVkSlab *r, size_t woff, size_t soff, int fmt, int I, int O, int gs,
+                         ColiVkTensor **tensor) {
+    if (*tensor) return (*tensor)->fmt == fmt && (*tensor)->I == I && (*tensor)->O == O;
+    /* the store's records: MXFP4 codes with their ue8m0 bytes (15) or f32 scales (7);
+     * the other formats' scale geometry is a pool's, not a slab's -- refused, the
+     * caller uploads a copy or computes on the CPU */
+    if (!r || !(fmt == 7 || fmt == 15) || !fmt_uploadable(fmt, gs) || I < 1 || O < 1) return 0;
+    size_t rb = cpu_row_bytes(fmt, I);
+    if (rb != (size_t)rowwords(fmt, I) * 4) return 0;          /* rows the shaders would read padded */
+    size_t wbytes = rb * (size_t)O, sbytes = scale_floats(fmt, I, O, gs) * sizeof(float);
+    if (wbytes > G.ssbo_range || woff > r->user_bytes || wbytes > r->user_bytes - woff ||
+        soff > r->user_bytes || sbytes > r->user_bytes - soff) return 0;
+    ColiVkTensor *t = calloc(1, sizeof(*t));
+    if (!t) return 0;
+    if (!slab_buf(r, woff, wbytes, &t->wbuf) || !slab_buf(r, soff, sbytes, &t->sbuf)) {
+        if (t->wbuf) vkDestroyBuffer(G.dev, t->wbuf, NULL);
+        free(t); return 0;
+    }
+    t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I);
+    t->gs = (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 || fmt == 15) ? gs : 0;
+    t->dev = 0; t->wbytes = wbytes; t->slab = r;
+    t->pool = NULL;   /* outside every pool: the address-table routes (the grouped GEMV,
+                      * chain_moe's entries) read pool buffers by device address and stay
+                      * off an aliased record; the descriptor routes take it */
+    /* the cooperative-matrix GEMMs hold the dequantised weights in f16: a scale whose
+     * product with the format's largest code passes 65504 keeps the alias off them
+     * (scales_wide's rule, read off the slab itself -- a ue8m0 byte IS an exponent,
+     * and one past 140 is 2^13.4) */
+    const uint8_t *sc = (const uint8_t *)r->ptr + soff;
+    if (fmt == 15) {
+        size_t nb = (size_t)O * (((size_t)I + gs - 1) / gs);
+        for (size_t i = 0; i < nb; i++)
+            if (sc[i] > 140) { t->wide = 1; break; }
+    } else t->wide = scales_wide(fmt, (const float *)sc, sbytes / 4);
+    pthread_mutex_lock(&g_slabs.mx);
+    r->refs++;
+    pthread_mutex_unlock(&g_slabs.mx);
+    __atomic_add_fetch(&g_import_bytes, wbytes, __ATOMIC_RELAXED);
+    *tensor = t;
+    return 1;
+}
+
 /* Sync-path fence wait. A blocked vkWaitForFences pays a scheduler wake on
  * signal (~50-150 us) — and the engine fences ~2 sync submits per layer per
  * token, so the wakes alone cost seconds per run. Spin on vkGetFenceStatus for
@@ -4026,6 +4174,17 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
  * reclaim the host struct and counters only. */
 static void tensor_release(ColiVkTensor *t) {
     VkWPool *P = t->pool;
+    if (t->slab) {   /* an aliased record of an imported slab: its two buffer handles and the slab's reference, no pool's */
+        ColiVkSlab *r = t->slab;
+        if (G.ready) {
+            if (t->wbuf) vkDestroyBuffer(G.dev, t->wbuf, NULL);
+            if (t->sbuf) vkDestroyBuffer(G.dev, t->sbuf, NULL);
+        }
+        __atomic_sub_fetch(&g_import_bytes, t->wbytes, __ATOMIC_RELAXED);
+        free(t);
+        coli_vk_slab_unref(r);
+        return;
+    }
     if (t->imp) {   /* rows imported in place: their memory object, the scales' range */
         pthread_mutex_lock(&g_imports_mx);
         for (ColiVkTensor **pp = &g_imports; *pp; pp = &(*pp)->imp_next) if (*pp == t) { *pp = t->imp_next; break; }
@@ -7755,6 +7914,158 @@ static int run_xbatch_v4(void) {
     return bad;
 }
 
+/* The compute-site lever's aliased expert (specs/CS-expert-compute-site.md §2.2, its
+ * §4.2 unit bar): a host slab imported once (VK_EXT_external_memory_host), every
+ * record a tensor whose codes AND packed ue8m0 scale bytes the expert batch reads in
+ * place -- fmt 15, the form coli_vk_tensor_import refuses. At the MODEL's decode
+ * geometry (DeepSeek V4's 4096/2048, its own activation):
+ *   - bit for bit the f32-scale fmt 7 form of the same codes and scales in the tier
+ *     pool (run_xbatch_mx_pack's class): a wrong scale stride off the imported pages,
+ *     or a record read at another record's offset, cannot pass it -- the fmt-15 P0's
+ *     stride lesson gated at the geometry that reaches it;
+ *   - against the double reference with the CPU kernel's roundings: worst row
+ *     < 2e-2 raw, and most rows bit-identical once BOTH sides are rounded to bf16
+ *     (rows_same*2 > the rows) -- the VKT_ACT_SWIGLU_V4 tolerance class,
+ *     c/tests/test_vk_tier.c's v4 case; at D=4096 the raw f32 row and the double
+ *     reference differ in their last bits, the kernel's roundings are what they share.
+ * Two experts, so the second's records sit at other slab offsets than the first's;
+ * skips (PASS, one line) where the device imports no host memory: a capability the
+ * driver may not have, the refusal the lever's ladder lives with. */
+static int run_xbatch_alias(void) {
+    enum { D = 4096, I = 2048, gsz = 32, K = 2 };
+    static const int rows[K] = {1, 3};
+    const int Iin[3] = {D, D, I}, Ou[3] = {I, I, D};
+    if (!coli_vk_import_alignment()) { printf("xbatch alias: the device imports no host memory (skipped)\n"); return 0; }
+    if (!coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU_V4, 0.f, 0.f, 0.f)) {
+        printf("xbatch alias: no pass (expert_act_v4.spv missing?)\n"); return 1;
+    }
+    int total = 0; for (int c = 0; c < K; c++) total += rows[c];
+    size_t ibefore = coli_vk_imported_bytes();
+    /* the shared data (codes, ue8m0 bytes, their f32 expansion) and the slab's layout:
+     * every record 4 KiB in, so any bind alignment a driver asks of a buffer holds */
+    uint8_t *cw[K][3], *e8[K][3]; float *f32s[K][3];
+    size_t grb = (size_t)(D + 1) / 2, drb = (size_t)(I + 1) / 2, woff[K][3], soff[K][3], cap = 0;
+    for (int c = 0; c < K; c++)
+        for (int k = 0; k < 3; k++) {
+            float *xs, *e8f; uint8_t *w;
+            int keep = g_ref_gs; g_ref_gs = gsz;
+            case_fill(15, 1, Iin[k], Ou[k], &xs, &w, &e8f);
+            g_ref_gs = keep;
+            free(xs);
+            size_t rb = (size_t)(Iin[k] + 1) / 2, wb = rb * (size_t)Ou[k];
+            size_t nb = (size_t)Ou[k] * (((size_t)Iin[k] + gsz - 1) / gsz), sb = (nb + 3) / 4 * 4;
+            cw[c][k] = w; e8[c][k] = (uint8_t *)e8f;
+            f32s[c][k] = malloc(nb * 4);
+            for (size_t j = 0; j < nb; j++) f32s[c][k][j] = ref_scale((const float *)e8[c][k], j, 15);
+            woff[c][k] = (cap + 4095) / 4096 * 4096; cap = woff[c][k] + wb;
+            soff[c][k] = (cap + 4095) / 4096 * 4096; cap = soff[c][k] + sb;
+        }
+    cap = (cap + 4095) / 4096 * 4096;
+    uint8_t *slab = NULL;
+    int bad = posix_memalign((void **)&slab, 4096, cap) != 0 || !slab;
+    if (!bad) {
+        memset(slab, 0, cap);   /* the scale records' word pad past their bytes, as the store's */
+        for (int c = 0; c < K; c++)
+            for (int k = 0; k < 3; k++) {
+                size_t rb = (size_t)(Iin[k] + 1) / 2;
+                size_t nb = (size_t)Ou[k] * (((size_t)Iin[k] + gsz - 1) / gsz);
+                memcpy(slab + woff[c][k], cw[c][k], rb * (size_t)Ou[k]);
+                memcpy(slab + soff[c][k], e8[c][k], nb);
+            }
+    }
+    /* the input rows E4M3-exact (eighths), as the engine rounds x before the group */
+    float *x = malloc((size_t)total * D * 4), wt[] = {1.0f, 0.75f, 1.5f, 0.3f};
+    const float **xr = malloc((size_t)total * sizeof(*xr)), **yr = malloc((size_t)total * sizeof(*yr));
+    for (int i = 0; i < total * D; i++) x[i] = (float)((i % 7) - 3) * 0.125f;
+    for (int j = 0; j < total; j++) xr[j] = x + (size_t)j * D;
+    float *y0 = malloc((size_t)total * D * 4), *ref = malloc((size_t)total * D * 4), *hid = malloc((size_t)I * 4);
+    ColiVkSlab *sr = NULL;
+    double dms = 0;
+    if (!bad && !coli_vk_slab_import(slab, cap, &sr)) { printf("xbatch alias: the slab import refused\n"); bad = 1; }
+    /* the reference once, both forms must agree with it: gate and up in double, the
+     * V4 roundings (bf16, route weight, bf16, E4M3 per 128), down in double */
+    for (int j = 0, c = 0, r = 0; !bad && j < total; j++, r++) {
+        if (r == rows[c]) { c++; r = 0; }
+        const float *xs = x + (size_t)j * D;
+        for (int o = 0; o < I; o++) {
+            double gd = xref_dot(xs, cw[c][0] + (size_t)o * grb, (const float *)e8[c][0], o, 15, D, gsz);
+            double ud = xref_dot(xs, cw[c][1] + (size_t)o * grb, (const float *)e8[c][1], o, 15, D, gsz);
+            float g = v4r_bf16((float)gd), u = v4r_bf16((float)ud);
+            float sg = g >= 0.0f ? 1.0f / (1.0f + expf(-g)) : expf(g) / (1.0f + expf(g));
+            hid[o] = v4r_bf16(g * sg * u * wt[j % 4]);
+        }
+        v4r_qdq(hid, I);
+        for (int d = 0; d < D; d++)
+            ref[(size_t)j * D + d] = (float)xref_dot(hid, cw[c][2] + (size_t)d * drb, (const float *)e8[c][2], d, 15, I, gsz);
+    }
+    /* form 0: the f32-scale fmt 7 in the tier pool; form 1: the fmt 15 records aliased
+     * over the imported slab -- the same codes and scale values, so the same bits */
+    int same = 1;   /* fmt 7's pool form vs the slab alias: the same bits, or a nameable row */
+    for (int form = 0; !bad && form < 2; form++) {
+        int fmt = form ? 15 : 7;
+        ColiVkExpert *ex[K] = {NULL, NULL};
+        for (int c = 0; !bad && c < K; c++) {
+            ColiVkTensor *t[3] = {NULL, NULL, NULL};
+            int ok = 1;
+            for (int k = 0; ok && k < 3; k++) {
+                if (fmt == 7) {
+                    uint8_t *rws; size_t stride; float *sc;
+                    size_t rb = (size_t)(Iin[k] + 1) / 2;
+                    size_t nb = (size_t)Ou[k] * (((size_t)Iin[k] + gsz - 1) / gsz);
+                    ok = coli_vk_tier_tensor(&t[k], 7, Iin[k], Ou[k], gsz, &rws, &stride, &sc) == 1;
+                    for (int o = 0; ok && o < Ou[k]; o++) memcpy(rws + (size_t)o * stride, cw[c][k] + (size_t)o * rb, rb);
+                    if (ok) { memcpy(sc, f32s[c][k], nb * 4); ok = coli_vk_tensor_commit(&t[k], 1) == 1; }
+                } else ok = coli_vk_tensor_alias(sr, woff[c][k], soff[c][k], 15, Iin[k], Ou[k], gsz, &t[k]) == 1;
+            }
+            if (!ok) { printf("xbatch alias: tensor of expert %d failed (fmt %d)\n", c, fmt); bad = 1; }
+            for (int k = 0; k < 3; k++) if (t[k] && !(ex[c] = NULL, 1)) {}
+            if (!bad && !(ex[c] = coli_vk_xb_expert(t[0], t[1], t[2]))) { printf("xbatch alias: no sets\n"); bad = 1; }
+        }
+        if (!bad && (!coli_vk_xb_issue_w(ex, rows, K, xr, wt) || !coli_vk_xb_join(yr, &dms))) {
+            printf("xbatch alias: issue/join failed (fmt %d)\n", fmt); bad = 1;
+        }
+        for (int j = 0; !bad && j < total; j++) digest(yr[j], (size_t)D * 4);
+        if (!bad && form == 0)
+            for (int j = 0; j < total; j++) memcpy(y0 + (size_t)j * D, yr[j], (size_t)D * 4);
+        if (!bad && form == 1)
+            for (int j = 0; j < total; j++)
+                if (memcmp(y0 + (size_t)j * D, yr[j], (size_t)D * 4)) {
+                    printf("xbatch alias: row %d's bits differ between fmt 7's pool form and the slab alias\n", j); bad = 1; same = 0; break;
+                }
+        for (int c = 0; c < K; c++) if (ex[c]) coli_vk_xb_expert_free(ex[c]);   /* the tensors with it */
+    }
+    /* the alias form's own rows against the reference (NaN-safe: a non-finite row is
+     * a failure outright, never a quiet worst). Rows counted bit-identical rounded
+     * to bf16 on BOTH sides, v4r_bf16 the kernel's own rounding: at this depth the
+     * raw f32 row and the double reference differ in their last bits, the V4 class
+     * (test_vk_tier's v4 case) rounds what the two share out of them */
+    unsigned long long rows_same = 0; double worst = 0;
+    for (int j = 0; !bad && j < total; j++) {
+        double scale = 0;
+        int rs = 1;
+        for (int d = 0; d < D; d++) if (fabs(ref[(size_t)j * D + d]) > scale) scale = fabs(ref[(size_t)j * D + d]);
+        for (int d = 0; d < D; d++) {
+            double r = ref[(size_t)j * D + d], e = fabs(yr[j][d] - r);
+            if (!isfinite(yr[j][d])) { bad = 1; break; }
+            if (v4r_bf16(yr[j][d]) != v4r_bf16((float)r)) rs = 0;
+            if (scale == 0) { if (yr[j][d] != 0) bad = 1; continue; }
+            double rel = e / (fabs(r) > 1e-2 * scale ? fabs(r) : 1e-2 * scale);
+            if (rel > worst) worst = rel;
+        }
+        rows_same += rs;
+    }
+    if (!bad && (worst > 2e-2 || rows_same * 2 < (unsigned long long)total)) bad = 1;
+    if (sr) coli_vk_slab_unref(sr);
+    if (!bad && coli_vk_imported_bytes() != ibefore) { printf("xbatch alias: the slab's pages did not return\n"); bad = 1; }
+    printf("xbatch alias: fmt 15 over an imported slab, D=%d I=%d gs=%d, %.2f MiB a group: %s fmt 7's bits, "
+           "%llu of %d rows bit-identical to the reference (bf16-rounded), worst row %.2e, device %.3f ms\n",
+           D, I, gsz, (double)cap / 1048576.0, same ? "identical to" : "DIFFERENT from", rows_same, total, worst, dms);
+    for (int c = 0; c < K; c++) for (int k = 0; k < 3; k++) { free(cw[c][k]); free(e8[c][k]); free(f32s[c][k]); }
+    free(slab); free(x); free(xr); free(yr); free(y0); free(ref); free(hid);
+    xb_shutdown(&g_xb[0]);
+    return bad;
+}
+
 /* Every format through the batch, both routes, the two activations, a hidden size
  * past the gate_up staging array, odd widths and a down format other than gate/up's. */
 static int run_xbatch_all(void) {
@@ -7787,6 +8098,7 @@ static int run_xbatch_all(void) {
     bad |= run_xbatch(4, 4, 64, 6400, 64, COLI_VK_ACT_SWIGLU, 0.f);
     xb_shutdown(&g_xb[0]);
     bad |= run_xbatch_v4();   /* DeepSeek V4's activation, bit for bit */
+    bad |= run_xbatch_alias();   /* the aliased slab records, the compute-site lever's zero-copy experts */
     return bad;
 }
 

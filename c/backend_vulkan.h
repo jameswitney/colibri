@@ -139,6 +139,32 @@ size_t coli_vk_import_alignment(void);
 int    coli_vk_host_buffer(const void *ptr, size_t bytes, void **buf, void **mem, size_t *off);
 void   coli_vk_host_buffer_free(void *buf, void *mem, size_t bytes);
 size_t coli_vk_imported_bytes(void);
+/* A slab of host memory imported once for many zero-copy tensors over it (the
+ * compute-site lever's aliased experts, specs/CS-expert-compute-site.md §2.2): the
+ * pages around [slab, slab + bytes) become one imported buffer (as
+ * coli_vk_host_buffer's) and every expert record in it a tensor at its byte
+ * offsets. Re-importing the same pages at the same address and size returns the
+ * same object with another reference (a store slot reused keeps its import);
+ * the last coli_vk_slab_unref frees the pages, after every submission that read
+ * them. Live slab imports are capped at COLI_VK_TIER_EXPERTS_IMPORT_CAP (default
+ * 1408, the driver's memory-allocation-count headroom class); at the cap, or on
+ * any refusal, the import returns 0 and the caller computes on the CPU. */
+typedef struct ColiVkSlab ColiVkSlab;
+int  coli_vk_slab_import(const void *slab, size_t bytes, ColiVkSlab **out);
+void coli_vk_slab_unref(ColiVkSlab *slab);
+/* A tensor whose weights AND scales are records of an imported slab, read in
+ * place: woff the first weight row's byte in the slab, soff the scales' (fmt 15:
+ * the packed ue8m0 bytes, their word pad past the end never read -- exactly the
+ * store's record; fmt 7: the f32 scales). fmt 15 is the form
+ * coli_vk_tensor_import refuses (it would copy the scale bytes into the pool as
+ * floats): the alias reads them straight off the slab, the layout the fmt-15
+ * device readers already decode. The offsets must satisfy the device's buffer
+ * bind alignment (page-aligned records do) and both records must sit inside the
+ * slab's bytes; the aliased tensor takes a reference on the slab, so the pages
+ * live until coli_vk_tensor_free. 0 = refused: the caller falls back to the CPU
+ * (or uploads a copy). */
+int  coli_vk_tensor_alias(ColiVkSlab *slab, size_t woff, size_t soff, int fmt, int I, int O, int gs,
+                          ColiVkTensor **tensor);
 
 /* SECOND DEVICE (COLI_VK_DEV2): a self-contained context on another Vulkan GPU that
  * hosts ONLY tier experts and runs ONLY the async expert-group path. devidx: -1 =
