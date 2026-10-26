@@ -955,7 +955,9 @@ deepseek-v4-oracle: deepseek-v4
 # the arm's environment on (COLI_VK_TIER_STREAM_BYPASS arms the ring's bypass reader,
 # which the ring requires). The tiny fixture keeps every expert resident, so the ring
 # itself is shape-inert here (the PW-C2 precedent); the mechanics live in test_vk_tier's
-# `ring` case and the engagement in deepseek-v4-smoke with the same two envs.
+# `ring` case and the engagement in deepseek-v4-smoke with the same two envs. PW-B2 adds
+# the cold leg (COLI_VK_TIER_STREAM_RING_COLD): the same inertness over the cold branch's
+# whole-layer plan.
 .PHONY: deepseek-v4-tiny-check-ring
 deepseek-v4-tiny-check-ring: deepseek-v4-tiny-generate
 	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
@@ -966,6 +968,9 @@ deepseek-v4-tiny-check-ring: deepseek-v4-tiny-generate
 	COLI_VULKAN=1 COLI_VK_TIER_STREAM_BYPASS=1 COLI_VK_TIER_STREAM_RING=1 $(PYTHON) tests/test_deepseek_v4_prefix.py \
 		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
 		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_STREAM_BYPASS=1 COLI_VK_TIER_STREAM_RING=1 COLI_VK_TIER_STREAM_RING_COLD=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
 	$(PYTHON) tools/make_deepseek_v4_oracle.py --model "$(MODEL)" \
 		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
 		--output tests/deepseek_v4_oracle.json \

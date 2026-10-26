@@ -265,8 +265,11 @@ static struct {
      * it (the join, not a read, is the handoff), ring_stop the teardown's cancel flag
      * (polled between reads: never wait out a stream the run is discarding), ring_job
      * the job itself, ring_half the half the next job takes. ring_ok drops to 0 for
-     * good when a worker could not be made; the inline fill takes over from there. */
-    int ring_on, ring_ok, ring_run, ring_stop, ring_lo, ring_hi, ring_half;
+     * good when a worker could not be made; the inline fill takes over from there.
+     * ring_cold (COLI_VK_TIER_STREAM_RING_COLD) lifts the cold branch's gate: a next
+     * layer with no prediction is planned by its heat, the fork's whole-layer cold
+     * fill, instead of handed to the inline path. */
+    int ring_on, ring_ok, ring_run, ring_stop, ring_lo, ring_hi, ring_half, ring_cold;
     pthread_t ring_th;
     struct VRing *ring_job;
     unsigned long long ring_jobs, ring_experts;
@@ -2031,8 +2034,12 @@ static int join_big(const float **rows) {
 /* layer's likely streamed experts, best first: the prediction's rows per expert where
  * the layer has a big step behind it (T.pred), else the heat; the resident and the
  * below-rule ones never make the list. cand must hold T.c.experts ints; returns the
- * count, capped at `cap`. Called on the engine thread (the slot table is read). */
-static int st_prefetch_plan(int layer, int S, int *cand, int cap) {
+ * count, capped at `cap`. Called on the engine thread (the slot table is read).
+ * `whole` (the ring's cold branch, COLI_VK_TIER_STREAM_RING_COLD) drops the below-rule
+ * filter: with no prediction to scale at the coming step's S there is nothing to hold
+ * against R, so every non-resident expert makes the list -- the fork's unconditional
+ * whole-layer coverage -- still ranked by the same estimate. */
+static int st_prefetch_plan(int layer, int S, int *cand, int cap, int whole) {
     const int E = T.c.experts, K = T.c.topk;
     int R = stream_min_rows();
     double *est = malloc((size_t)E * sizeof(double));
@@ -2048,10 +2055,10 @@ static int st_prefetch_plan(int layer, int S, int *cand, int cap) {
         for (int e = 0; e < E; e++) est[e] = tot > 0 ? (double)slot(layer, e)->heat * S * K / tot : 0;
     }
     int nc = 0;
-    if (tot > 0)
+    if (tot > 0 || whole)
         for (int e = 0; e < E; e++) {
             VSlot *v = slot(layer, e);
-            if (v->state == VS_RESIDENT || est[e] < R) continue;
+            if (v->state == VS_RESIDENT || (est[e] < R && !whole)) continue;
             int at = nc;
             while (at > 0 && est[cand[at - 1]] < est[e]) { cand[at] = cand[at - 1]; at--; }
             cand[at] = e;
@@ -2072,7 +2079,8 @@ static int st_prefetch_plan(int layer, int S, int *cand, int cap) {
  * never a concurrent read) and hands the worker layer L+1's plan where a prediction
  * exists (a cold layer, the first chunk's walk, keeps the inline fill at the step --
  * the fallback that also covers every miss: an unpredicted expert, a refused read, a
- * worker that could not be made). The engine's scans skip the running job's slot range;
+ * worker that could not be made; COLI_VK_TIER_STREAM_RING_COLD plans those by their
+ * heat instead, the fork's whole-layer cold fill). The engine's scans skip the running job's slot range;
  * an inline fill short of room elsewhere joins the ring rather than race it. */
 struct VRing { int layer, n, lo, hi; int *eids; double ms; int done; unsigned long long got; };
 
@@ -2123,20 +2131,30 @@ static void st_ring_cancel(void) {
 }
 
 /* The prefetch's ring arm: the take of the job that runs, then the next layer's plan to
- * the worker. Returns the experts handed over, 0 when there was nothing to hand (a
- * cold layer, the last one), -1 when the ring cannot this time and the inline fill
- * takes the call. */
+ * the worker. Returns the experts handed over, 0 when there was nothing to hand (the
+ * last layer; a cold layer with COLD unset), -1 when the ring cannot this time and the
+ * inline fill takes the call. */
 static int st_ring_submit(int layer, int S) {
     st_ring_take();
     if (!T.ring_ok) return -1;
     const int next = layer + 1;
-    if (next >= T.main_layers || !T.pred || !T.pred_ok[next]) return 0;
+    if (next >= T.main_layers) return 0;
+    const int cold = !T.pred || !T.pred_ok[next];   /* no big step behind the next layer yet */
+    /* The cold branch: the prompt's first chunk, the layer's first visit. As landed it
+     * hands nothing over, so the whole fill runs inline at the step -- off-thread
+     * placement without plan coverage, which W2 measured a strict pessimization
+     * (42 jobs, 8 experts filled, 0 used; host-MoE 44.9 -> 131.0 s).
+     * COLI_VK_TIER_STREAM_RING_COLD is the fork's literal cold shape: the plan runs
+     * without the prediction too, so the heat ranks the next layer's whole non-resident
+     * set (the same in-RAM exclusion, the same cap) and the job covers it ahead; where a
+     * prediction exists the plan is the prediction's, unchanged. */
+    if (cold && !T.ring_cold) return 0;
     int *cand = malloc((size_t)T.c.experts * sizeof(int));
     if (!cand) return -1;
     /* The half the running step is not reading: one sub-batch's worth (st_per), so the
      * job's set and the step's own fills share the window without meeting. An expert
      * the engine still holds in RAM is left to the inline fill (its read is cheap). */
-    int nc = st_prefetch_plan(next, S, cand, T.st_per);
+    int nc = st_prefetch_plan(next, S, cand, T.st_per, cold);
     for (int i = 0; i < nc; i++)
         if (T.c.in_ram && T.c.in_ram(T.c.ram_ctx, next, cand[i])) { cand[i] = -1; }
     int n = 0;
@@ -2176,7 +2194,7 @@ int vkt_stream_prefetch(int layer, int S) {
     if (!cand) return 0;
     /* the slots a step before left filled are free again */
     for (int i = 0; i < T.st_n; i++) if (T.st[i].state != SS_BUSY) T.st[i].state = SS_FREE;
-    int nc = st_prefetch_plan(layer, S, cand, T.st_n);
+    int nc = st_prefetch_plan(layer, S, cand, T.st_n, 0);
     int got = 0, used = 0;
     while (used < nc) {   /* groups of a sub-batch's worth, into the slots in order */
         int gn = nc - used < T.st_per ? nc - used : T.st_per, gsl[64]; uint8_t gok[64];
@@ -3575,6 +3593,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         pthread_cond_init(&T.cv_done, NULL)) return 0;
     { const char *sy = getenv("COLI_VK_TIER_SYNC"); T.sync = sy && *sy == '1'; }
     { const char *rg = getenv("COLI_VK_TIER_STREAM_RING"); T.ring_on = rg && *rg && atoi(rg) != 0 && !!T.c.ring_batch; }
+    { const char *rc = getenv("COLI_VK_TIER_STREAM_RING_COLD"); T.ring_cold = T.ring_on && rc && *rc && atoi(rc) != 0; }
     T.ring_ok = T.ring_on;
     if (pthread_create(&T.th, NULL, uploader, NULL)) return 0;
     T.th_on = 1;
@@ -3607,6 +3626,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (T.st_ok) {
         fprintf(stderr, ", streaming cold experts of prompt steps through %d slots", T.st_slots);
         if (T.ring_on) fprintf(stderr, ", the stream ring on (COLI_VK_TIER_STREAM_RING)");
+        if (T.ring_cold) fprintf(stderr, ", its cold layers whole-layer (COLI_VK_TIER_STREAM_RING_COLD)");
     }
     if (T.xmax) {
         char hx[32], hp[32];

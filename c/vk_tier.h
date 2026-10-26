@@ -125,9 +125,17 @@
  *    through .ring_batch and uploads them into its half of the streaming slots while the
  *    engine computes layer L, the step joins nothing it does not need, and every miss
  *    (an unpredicted expert, a refused read, a failed worker) takes the inline fill at
- *    the step. COLI_VK_TIER_SYNC=1's deterministic drain includes the ring: every
+ *    the step. COLI_VK_TIER_STREAM_SYNC=1's deterministic drain includes the ring: every
  *    quiescent point joins the worker too, so what is in the slots at a step depends on
  *    the routing alone, never on thread timing.
+ *
+ *    COLI_VK_TIER_STREAM_RING_COLD=1 (needs the ring; default off = the pred-gated rule
+ *    above stands) is the fork's literal cold shape for the cold branch: a next layer
+ *    with no prediction behind it -- the prompt's first chunk, the layer's first visit --
+ *    is planned whole instead of handed to the inline fill, so the job covers the next
+ *    layer's whole non-resident set ahead (the same in-RAM exclusion, the same st_per
+ *    cap; the below-rule filter drops, for there is no prediction to scale at the coming
+ *    step's S). Where a prediction exists the plan is the prediction's, unchanged.
  *
  * Source kinds (VktSrc) and what the device holds -- the conversion runs on the
  * uploader thread, nothing changes in the engine's RAM:

@@ -63,6 +63,12 @@
  *            beside a parked job (the join waits only for what it needs) while the next
  *            prefetch takes it; COLI_VK_TIER_SYNC's quiescent point drains the ring;
  *            the teardown cancels between reads and never waits out the rest;
+ *            COLI_VK_TIER_STREAM_RING_COLD fills the cold branch too: a next layer with
+ *            no prediction behind it is planned by its heat (the whole non-resident set,
+ *            the st_per cap) and the step takes it from the slots -- the routed expert
+ *            below the cap stays the inline fallback's, the default hands nothing over
+ *            and fills all four inline, and where a prediction exists the plan is the
+ *            prediction's, COLD armed or not;
  *   layers   formats that change by layer (VktConfig.layer_gate_up/layer_down, a GGUF typed
  *            by layer): every device row equals the reference with the model resident,
  *            with a budget of four (the smaller form's experts take the rooms the bigger
@@ -1554,6 +1560,20 @@ static void route_ring(int cnt[E]) {
         }
     }
 }
+/* The cold branch's routing: experts 2, 3 and 4 round-robin and 9 on every third slot
+ * (48 rows, the head by count), so the prediction's set (9 in, 5 out) is not the
+ * heat's -- the two plans the cold leg must tell apart. */
+static int g_cold_idx[64 * K]; static float g_cold_w[64 * K];
+static void route_cold(int cnt[E]) {
+    memset(cnt, 0, E * sizeof(int));
+    for (int s = 0; s < 48; s++)
+        for (int k = 0; k < K; k++) {
+            int e = k == 2 ? 9 : 2 + (s / 3 + k) % 3;
+            cnt[e]++;
+            g_cold_idx[s * K + k] = e;
+            g_cold_w[s * K + k] = 0.2f + (float)((s + k) % 5) / 10.0f;
+        }
+}
 static void stream_ring(void) {
     VktFmt f = {VKT_SRC_I4U_PAIRS_GS, 64};
     model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
@@ -1757,7 +1777,121 @@ static void stream_ring(void) {
     CHECK(calls <= 2, "ring teardown: %d reads ran after the cancel", calls);
     printf("  teardown: cancelled, bounded to the read in flight\n");
     model_free();
+
+    /* --- COLI_VK_TIER_STREAM_RING_COLD: the cold branch fills, not the inline --------
+     * A next layer with no prediction behind it (the prompt's first chunk) is the landed
+     * ring's one gap: it hands nothing over and the whole fill runs inline at the step.
+     * COLD plans it by its heat instead -- the next layer's whole non-resident set, the
+     * cap (st_per 4) and the half unchanged -- and where a prediction exists the plan
+     * stays the prediction's. The history gives layer 1's 2 and 3 the only heat above the
+     * rule's rows (4..9 below it, 9 the coldest of the four the routing names) while
+     * layer 0's outranks them all for the warm start's eight places: layer 1 keeps 0,1
+     * resident and 2..9 cold. So the cold plan, whole, is 2,3 then the below-rule tail
+     * 4,5 (the fork's unconditional coverage -- a heat plan under the rule would hand
+     * only 2,3), and the prediction's set is 9,2,3,4 (9 the head by rows). */
+    uint32_t chist[L][E], *crows[L];
+    for (int l = 0; l < L; l++) {
+        crows[l] = chist[l];
+        for (int e = 0; e < E; e++) chist[l][e] = !l ? 100 - e : e < 2 ? 100 - e : (int[]){0, 0, 62, 46, 3, 3, 2, 2, 1, 1}[e];
+    }
+    int ccnt[E];
+    route_cold(ccnt);
+    setenv("COLI_VK_TIER_STREAM_RING", "1", 1);
+    g_ring_cut = 0; g_ring_fail = 0; g_ring_park_ms = 0; __atomic_store_n(&g_ring_go, 1, __ATOMIC_RELAXED);
+    float *cold_ref[2] = {0};   /* the default's rows: COLD changes timing, never bytes */
+    model_make(f, f);   /* one model: the two legs' rows are the same experts' */
+    for (int cold = 0; cold < 2; cold++) {
+        if (cold) setenv("COLI_VK_TIER_STREAM_RING_COLD", "1", 1);
+        else unsetenv("COLI_VK_TIER_STREAM_RING_COLD");
+        rng = 11;
+        { VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+          vc.load = load_cb; vc.release = release_cb; vc.ring_batch = ring_batch_cb;
+          CHECK(vkt_init(&vc, crows), "ring cold %d: the tier did not start", cold); }
+        { int pl[L * E], pe[L * E], np = vkt_plan(pl, pe, L * E);
+          for (int i = 0; i < np; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+          vkt_put_done(); }
+        vkt_begin_forward();
+        Books cbk = {0, 0}; unsigned long long cstreamed = 0, ckept = 0;
+        float *rows[2] = {malloc(sizeof(float) * (size_t)48 * H), malloc(sizeof(float) * (size_t)48 * H)};
+        __atomic_store_n(&g_ring_calls, 0, __ATOMIC_RELAXED);
+        g_ring_layer = 1; g_ring_n = 0; g_loads = 0;
+        CHECK(stream_step(0, 48, g_cold_idx, g_cold_w, 0, &cbk, &cstreamed, &ckept, 1, rows[0]) < 2e-3,
+              "ring cold %d: layer 0's rows are not the reference's", cold);
+        /* layer 1's step takes the job at its own prefetch, so the counts are read after it */
+        g_loads = 0;   /* only the cold step's own fills count */
+        CHECK(stream_step(1, 48, g_cold_idx, g_cold_w, 0, &cbk, &cstreamed, &ckept, 1, rows[1]) < 2e-3,
+              "ring cold %d: layer 1's rows are not the reference's", cold);
+        if (cold) {
+            static const int want[4] = {2, 3, 4, 5};   /* the heat's order, 4 and 5 below the rule */
+            int heat_ok = g_ring_n == 4;
+            for (int i = 0; heat_ok && i < 4; i++) heat_ok &= g_ring_eids[i] == want[i];
+            CHECK(heat_ok, "ring cold: %d experts handed over, the whole non-resident set's four warmest is"
+                  " 2,3,4,5 with 4 and 5 below the rule (first %d)", g_ring_n, g_ring_n > 0 ? g_ring_eids[0] : -1);
+            CHECK(g_loads == 1, "ring cold: %d inline loads (9 is below the cap, the inline fallback's own)", g_loads);
+        } else {
+            CHECK(g_ring_n == 0 && __atomic_load_n(&g_ring_calls, __ATOMIC_RELAXED) == 0,
+                  "ring cold default: the cold branch handed %d experts over (%d reads)", g_ring_n,
+                  __atomic_load_n(&g_ring_calls, __ATOMIC_RELAXED));
+            CHECK(g_loads == 4, "ring cold default: %d inline loads, not the four the cold step routed", g_loads);
+        }
+        if (!cold) cold_ref[0] = rows[0], cold_ref[1] = rows[1];
+        else {
+            CHECK(memcmp(cold_ref[0], rows[0], sizeof(float) * (size_t)48 * H) == 0 &&
+                  memcmp(cold_ref[1], rows[1], sizeof(float) * (size_t)48 * H) == 0,
+                  "ring cold: a step's rows differ from the default's (the ring changes timing, never bytes)");
+            free(rows[0]); free(rows[1]);
+        }
+        vkt_shutdown();
+        if (cold)
+            printf("  cold on: %d experts one layer ahead, 4 and 5 of them below the rule, %d inline load"
+                   " at the cold step\n", g_ring_n, g_loads);
+        else
+            printf("  cold default: nothing handed over, %d inline loads at the cold step\n", g_loads);
+    }
+    model_free();
+    free(cold_ref[0]); free(cold_ref[1]);
+    g_ring_layer = -1;
+
+    /* --- with a prediction the plan is the prediction's, COLD armed or not: 9 in, 5 out,
+     * and the step consumes the job's set without one inline load ------------------- */
+    model_make(f, f);
+    rng = 11;
+    { VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+      vc.load = load_cb; vc.release = release_cb; vc.ring_batch = ring_batch_cb;
+      CHECK(vkt_init(&vc, crows), "ring cold pred: the tier did not start"); }
+    { int pl[L * E], pe[L * E], np = vkt_plan(pl, pe, L * E);
+      for (int i = 0; i < np; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+      vkt_put_done(); }
+    { Books pbk = {0, 0}; unsigned long long ps = 0, pk = 0;
+      vkt_begin_forward();
+      stream_step(1, 48, g_cold_idx, g_cold_w, 0, &pbk, &ps, &pk, 0, NULL);   /* pred[1] established */
+      g_ring_layer = 1; g_ring_n = 0;
+      CHECK(vkt_stream_prefetch(0, 48) == 4, "ring cold pred: the prediction's set is not the four routed");
+      stream_step(0, 48, g_cold_idx, g_cold_w, 0, &pbk, &ps, &pk, 0, NULL);   /* coexists, no join */
+      vkt_stream_prefetch(1, 48);   /* the take; the last layer submits nothing */
+      int porder[E], pn = 0;   /* the plan's own rule: est desc, equals count desc */
+      for (int e = 0; e < E; e++)
+          if (ccnt[e] >= 3 && !vkt_resident(1, e)) {
+              int at = pn++;
+              while (at > 0 && ccnt[porder[at - 1]] < ccnt[e]) { porder[at] = porder[at - 1]; at--; }
+              porder[at] = e;
+          }
+      int pred_ok = g_ring_n == pn && pn == 4;
+      for (int i = 0; pred_ok && i < pn; i++) pred_ok &= g_ring_eids[i] == porder[i];
+      CHECK(pred_ok, "ring cold pred: %d of %d handed, the order is not the prediction's (first %d, want %d)",
+            g_ring_n, pn, g_ring_n > 0 ? g_ring_eids[0] : -1, pn > 0 ? porder[0] : -1);
+      g_loads = 0;
+      CHECK(stream_step(1, 48, g_cold_idx, g_cold_w, 0, &pbk, &ps, &pk, 0, NULL) < 2e-3,
+            "ring cold pred: layer 1's rows are not the reference's");
+      CHECK(g_loads == 0, "ring cold pred: %d inline loads though the ring held the step's set", g_loads);
+      printf("  cold with a prediction: %d experts one layer ahead, the prediction's order", g_ring_n);
+      for (int i = 0; i < g_ring_n; i++) printf(" %d", g_ring_eids[i]);
+      printf("\n"); }
+    vkt_shutdown(); model_free();
+    g_ring_layer = -1;
+
     unsetenv("COLI_VK_TIER_STREAM_RING");
+    unsetenv("COLI_VK_TIER_STREAM_RING_COLD");
     unsetenv("COLI_VK_TIER_RATE"); unsetenv("COLI_VK_TIER_STREAM_SLOTS");
     unsetenv("COLI_VK_TIER_STREAM_ROWS"); unsetenv("COLI_VK_TIER_STREAM_FILL");
     __atomic_store_n(&g_ring_go, 1, __ATOMIC_RELAXED); g_ring_cut = 0; g_ring_park_ms = 0; g_ring_fail = 0;
