@@ -2618,7 +2618,10 @@ tests/test_vk_degrade$(EXE): tests/test_vk_degrade.c $(VK_OBJ)
 # The Vulkan routed-expert tier (vk_tier.c) against a CPU reference: every source
 # format, warm start, eviction, partial batches. It needs VK=1 and a Vulkan device
 # (CI: Lavapipe), so it stays out of `check` (TEST_EXCLUDE) and runs from
-# vk-tier-check.
+# vk-tier-check -- whose fourth invocation (`dgrow`) carries the decode-growth
+# headroom/promo-cap legs: their guard-made places allocate as installs proceed, so
+# block counts, frag and the probe-derived arm counts differ between any two runs,
+# and the strict gate byte-compares the plain invocation's unset-vs-0 pair.
 # The routed-expert tier on a CUDA device (cu_tier.h) against a CPU reference.
 tests/test_cu_tier$(EXE): tests/test_cu_tier.c $(CUDA_OBJ)
 	@case "$(CUDA_OBJ)" in *cu_tier.o*) ;; *) echo "tests/test_cu_tier needs CUDA=1 (or HIP=1)" >&2; exit 1 ;; esac
@@ -2631,6 +2634,7 @@ vk-tier-check: tests/test_vk_tier$(EXE)
 	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv
 	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv host-pairs
 	COLI_VK_TIER_FMT15=1 ./tests/test_vk_tier$(EXE) shaders/qmatmul.spv fmt15
+	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv dgrow
 
 # The dense chain's ops (vk_chain.c, shaders/chain_*.comp) against CPU references, on
 # a Vulkan device (CI: Lavapipe); like test_vk_tier it needs VK=1 and stays out of

@@ -144,7 +144,9 @@ static struct {
     double d2_ms;
     VSlot *s;
     uint32_t tick, decay_at;          /* tokens seen (rows of the forward's first layer) */
-    int last_layer, first_layer, promos[2], promo_cap;   /* promotions this forward, the main layers' and the extra ones', each up to the cap */
+    int last_layer, first_layer, promos[2], promo_cap;   /* promotions this forward, the main layers' and the extra ones', each up to the
+                                                          * cap: the rate's per-token arithmetic, or promo_fix's fixed take */
+    int promo_fix;                      /* COLI_VK_TIER_PROMO_CAP: the forward's cap set outright (negative: none) */
     int begin;                         /* vkt_begin_forward: the next issue starts a forward */
     /* uploader */
     pthread_t th; int th_on, stop;
@@ -229,7 +231,12 @@ static struct {
      * counts (VktConfig.decode_heat) through a K-th-largest cutoff over the experts the
      * device does not hold -- the fork's cache_reorder rule -- and no victim ever gives
      * way: growth only takes free or retired bytes, so the warm set stands (evictions
-     * stay what they were). dgrow armed, dgrow_dec the running step is decode-class
+     * stay what they were). With COLI_VK_TIER_DECODE_GROW_HEADROOM the free part is the
+     * live guard's instead of the one-time probe's: a place is made per install the
+     * card's free VRAM (less the reserve) still holds, re-probed fork-style as installs
+     * proceed, so the growth owns real free room, not only the slots' recycled bytes
+     * (dg_head_room), the target (_TARGET, the fork's gpu_cap class) capping its count.
+     * dgrow armed, dgrow_dec the running step is decode-class
      * (S <= VKT_UP_ROWS; the note/promote gate), dgrow_armed the one-time probe ran,
      * dgrow_cut the count bar (0: room beyond the known-hot set is demand-filled),
      * dgrow_slots0 the live slots before the first retire, dgrow_used the bytes grown
@@ -237,7 +244,10 @@ static struct {
     int dgrow, dgrow_dec, dgrow_armed, dgrow_cut, dgrow_slots0;
     size_t dgrow_cap, dgrow_used;
     uint32_t *dgrow_heat;                /* the tier's copy of decode_heat, flat [layers*experts] */
-    unsigned long long dgrow_installs, dgrow_retires;
+    unsigned long long dgrow_installs, dgrow_retires, dgrow_heads;
+    int dgrow_head, dgrow_target;        /* the headroom lever armed, its resident-count target */
+    double dgrow_reserve;                /* the probe's safety reserve, read once (env bytes) */
+    double dg_hfree; unsigned dg_hprobe; /* the live guard's free-VRAM reading and its probe counter */
     double dev_ms, cpu_ms, wait_ms;
     unsigned long long rep_routed, rep_served;
     /* streaming (big prefill steps; see "streaming" below) */
@@ -877,6 +887,8 @@ static int pick_victim(int layer, uint64_t hs, int *from, int cheap) {
 static void hot_pin(void);
 static void new_forward(void) {
     T.promos[0] = T.promos[1] = 0; T.promo_cap = 0; T.said_fwd = 0; T.upromos = 0;
+    if (T.promo_fix)   /* COLI_VK_TIER_PROMO_CAP: the forward's cap set outright, not the rate's take */
+        T.promo_cap = T.promo_fix < 0 ? 1 << 30 : T.promo_fix;
     if (T.hot_update) hot_pin();   /* COLI_VK_TIER_HOT_UPDATE=1: the pins move with the live counts, before the candidates are built */
     if (T.tick >= T.decay_at) {
         size_t n = (size_t)T.c.layers * T.c.experts;
@@ -890,6 +902,8 @@ static void new_forward(void) {
 static int dgrow_hot(int layer, int e);
 static int dgrow_room1(void);
 static int dgrow_retire(void);
+static int dg_head_room1(void);
+static int dg_head_room(void);
 static void dgrow_arm(void);
 
 /* The bytes of an expert the CPU just computed pass by: promote it when there is
@@ -907,16 +921,16 @@ void vkt_note(int layer, int eid, const VktExpertSrc *src) {
     if (fm->gu_scales && (!src->gs || !src->us || !src->ds)) return;
     int victim = -1, dev = room_dev(layer), vc = vcls_of(layer);
     /* decode growth: a decode-class step's main-layer expert installs by the decode-only
-     * rank alone -- above the cutoff into a grown place (free VRAM, or a stream slot
-     * retired for it), never a victim's; below it not at all, for the grown room is the
-     * rank's (a cold demand would spend it before decode's hot arrive -- the ordinary
-     * free-room path admits by live heat, the growth by rank; cutoff 0, the room-bounded
-     * bar, admits every demand, the standing class) */
+     * rank alone -- above the cutoff into a grown place (the live guard's free VRAM under
+     * HEADROOM, or a stream slot retired for it), never a victim's; below it not at all, for
+     * the grown room is the rank's (a cold demand would spend it before decode's hot arrive
+     * -- the ordinary free-room path admits by live heat, the growth by rank; cutoff 0, the
+     * room-bounded bar, admits every demand, the standing class) */
     const int dg = T.dgrow_armed && T.dgrow_dec && !kd;
     if (dg && !dgrow_hot(layer, eid)) return;
     if (dg) {
-        if (dev < 0 && !dgrow_retire()) return;
-        if (dev < 0) dev = 0;   /* the place the retire made */
+        if (dev < 0 && !dg_head_room() && !dgrow_retire()) return;   /* the guard's free place first, a retired slot's only beyond */
+        if (dev < 0) dev = 0;   /* the place the guard or the retire made */
         T.dgrow_installs++;
     }
     /* T.full: the device's residents give way to promote's, which keeps their host pool copy */
@@ -963,7 +977,7 @@ int vkt_wants(int layer, int eid) {
     int from;
     if (T.dgrow_armed && T.dgrow_dec && !kind_of(layer)) {   /* vkt_note's rank gate, its mirror */
         if (!dgrow_hot(layer, eid)) return 0;
-        return room_dev(layer) >= 0 || dgrow_room1();   /* a grown place, or a slot's */
+        return room_dev(layer) >= 0 || dg_head_room1() || dgrow_room1();   /* a grown place, the guard's or a slot's */
     }
     if (room_dev(layer) < 0 && (T.full || !v->heat || pick_victim(layer, score(v), &from, 0) < 0)) return 0;
     pthread_mutex_lock(&T.mx);
@@ -2632,8 +2646,10 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
     }
     if (layer == T.first_layer) {   /* COLI_VK_TIER_RATE promotions per token of the forward */
         T.tick += (uint32_t)S;
-        long cap = (long)T.promo_cap + (long)T.rate * S;
-        T.promo_cap = cap > (1 << 30) ? 1 << 30 : (int)cap;
+        if (!T.promo_fix) {   /* COLI_VK_TIER_PROMO_CAP holds the forward's cap fixed instead */
+            long cap = (long)T.promo_cap + (long)T.rate * S;
+            T.promo_cap = cap > (1 << 30) ? 1 << 30 : (int)cap;
+        }
     }
     T.last_layer = layer;
     quiesce();
@@ -2887,6 +2903,13 @@ static double env_gb(const char *name, double def) {
     const char *e = getenv(name);
     return e && *e ? atof(e) : def;
 }
+/* the card's free VRAM now: the probe the arm and the live guard share (the budget
+ * books under COLI_VK_DEVICE_CAP_MB, else VK_EXT_memory_budget's budget less its
+ * usage -- every holder's bytes counted). 0 when the backend cannot read it. */
+static double dg_free_now(void) {
+    double used = 0, bud = 0;
+    return coli_vk_mem_budget(&used, &bud) && bud > used ? (bud - used) * 1e9 : 0;
+}
 
 /* ---- decode growth (COLI_VK_TIER_DECODE_GROW) ------------------------------------- */
 /* above the growth's count bar: the decode-only table's rank admits the install.
@@ -2901,7 +2924,8 @@ static int dgrow_hot(int layer, int e) {
  * alive, narrower, for the next prompt. */
 static int dgrow_room1(void) {
     return T.dgrow_armed && !T.big && T.st_ok && T.st && T.st_n > 2 &&
-           (!T.dgrow_cap || T.dgrow_used + T.exp_bytes <= T.dgrow_cap);
+           (!T.dgrow_cap || T.dgrow_used + T.exp_bytes <= T.dgrow_cap) &&
+           (!T.dgrow_target || T.dmax[0] < T.dgrow_target);
 }
 static int dgrow_retire(void) {
     if (!dgrow_room1() || T.st[T.st_n - 1].state == SS_BUSY) return 0;
@@ -2915,6 +2939,34 @@ static int dgrow_retire(void) {
     coli_vk_tier_pool_limit(ps.limit + T.exp_bytes);   /* the freed bytes are the residents' */
     return 1;
 }
+/* COLI_VK_TIER_DECODE_GROW_HEADROOM's live guard, the fork gpu_mfu_cache's cadence:
+ * the free-VRAM reading cached, re-probed every 64th ask and whenever it reads
+ * empty, so a full card costs the one query an ask and a freeing card is caught
+ * within a probe window as installs proceed */
+static double dg_head_free(void) {
+    if (T.dg_hfree <= 0 || (T.dg_hprobe++ & 63) == 63) T.dg_hfree = dg_free_now();
+    return T.dg_hfree;
+}
+/* its question, without side effects (vkt_wants asks it too): could a place be made
+ * now -- the target's count and the operator's byte cap held, the live free VRAM
+ * less the safety reserve big enough for one expert */
+static int dg_head_room1(void) {
+    if (!T.dgrow_armed || !T.dgrow_head) return 0;
+    if (T.dgrow_target && T.dmax[0] >= T.dgrow_target) return 0;
+    if (T.dgrow_cap && T.dgrow_used + T.exp_bytes > T.dgrow_cap) return 0;
+    return dg_head_free() >= T.dgrow_reserve + (double)T.exp_bytes;
+}
+/* the place itself: the residents' count budget, the tier's bytes and the pool's
+ * limit grow one expert, charged to the operator's cap -- real free room the guard
+ * stands behind, never a victim's (the warm set stands, as the growth's rule) */
+static int dg_head_room(void) {
+    if (!dg_head_room1()) return 0;
+    T.dmax[0]++; T.max_resident++;
+    T.budget += T.exp_bytes; T.dgrow_used += T.exp_bytes; T.dgrow_heads++;
+    ColiVkPoolStats ps; coli_vk_pool_stats(1, &ps);
+    coli_vk_tier_pool_limit(ps.limit + T.exp_bytes);
+    return 1;
+}
 static int u32_desc(const void *a, const void *b) {
     uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
     return x < y ? 1 : x > y ? -1 : 0;
@@ -2924,16 +2976,28 @@ static int u32_desc(const void *a, const void *b) {
  * the KV mirror and the head take, and by now they have taken it), then, beyond
  * that, the stream slots the demand may retire. The cutoff over the experts the
  * device does not hold, K-th largest -- the fork's cache_reorder rule -- is the
- * rank the installs must beat while the room lasts. */
+ * rank the installs must beat while the room lasts.
+ * COLI_VK_TIER_DECODE_GROW_HEADROOM: the free part is the live guard's instead of
+ * this probe's -- no place is made here; dg_head_room makes one per install the
+ * card's free VRAM still holds, so the growth owns real free room, not only the
+ * slots' recycled bytes (W2's armed line read `budget 367 -> 367`: 0 free places,
+ * the slots the one source, the tier's budget left unspent beside them). A target
+ * named sizes the rank's K with its count and caps every source's; without one the
+ * probe's reading sizes K, as ever. */
 static void dgrow_arm(void) {
     T.dgrow_armed = 1;
     const double GiB = 1073741824.0;
-    double free_b = 0;
-    { double used = 0, bud = 0; if (coli_vk_mem_budget(&used, &bud) && bud > used) free_b = (bud - used) * 1e9; }
-    double take = free_b - env_gb("COLI_VK_TIER_DECODE_GROW_RESERVE_GB", 0.5) * GiB;
+    T.dgrow_reserve = env_gb("COLI_VK_TIER_DECODE_GROW_RESERVE_GB", 0.5) * GiB;
+    double free_b = dg_free_now();
+    double take = free_b - T.dgrow_reserve;
     if (take < 0) take = 0;
     if (T.dgrow_cap && take > (double)T.dgrow_cap) take = (double)T.dgrow_cap;
-    long long kfree = T.exp_bytes ? (long long)(take / (double)T.exp_bytes) : 0;
+    long long kfree;   /* the free part: places made here, or (headroom) the guard's ceiling */
+    if (T.dgrow_head)
+        kfree = T.dgrow_target > T.dmax[0] ? T.dgrow_target - T.dmax[0]
+                                           : (T.exp_bytes ? (long long)(take / (double)T.exp_bytes) : 0);
+    else
+        kfree = T.exp_bytes ? (long long)(take / (double)T.exp_bytes) : 0;
     long long slots = T.st_ok && T.st && T.st_n > 2 ? T.st_n - 2 : 0;
     if (T.dgrow_cap) {   /* the operator's cap bounds the whole growth, both sources */
         long long left = T.exp_bytes ? (long long)((double)T.dgrow_cap / (double)T.exp_bytes) - kfree : 0;
@@ -2957,7 +3021,7 @@ static void dgrow_arm(void) {
             free(cs);
         }
     }
-    if (kfree > 0) {
+    if (kfree > 0 && !T.dgrow_head) {   /* the headroom's places wait for the guard, an install each */
         T.dmax[0] += (int)kfree; T.max_resident += (int)kfree;
         T.budget += (size_t)kfree * T.exp_bytes; T.dgrow_used += (size_t)kfree * T.exp_bytes;
         ColiVkPoolStats ps; coli_vk_pool_stats(1, &ps);
@@ -2966,13 +3030,18 @@ static void dgrow_arm(void) {
     T.dgrow_cut = (int)(cut > 0x7fffffffu ? 0x7fffffffu : cut);
     T.dgrow_slots0 = T.st ? T.st_n : 0;
     char hf[32], hr[32];
-    if (K > 0)
+    if (T.dgrow_head)
+        fprintf(stderr, VKT_TAG " tier %s: decode grow armed (headroom): %s free less %s reserve at the probe, the guard re-probes as installs proceed -> up to %lld places%s, %lld stream slots beyond, budget %d experts now, cutoff %u (COLI_VK_TIER_DECODE_GROW_HEADROOM%s; installs rank by the engine's decode-only counts)\n",
+                T.engine, human(free_b, hf, sizeof hf), human(T.dgrow_reserve, hr, sizeof hr), kfree,
+                T.dgrow_target ? ", the target's count" : "", slots, T.dmax[0], (unsigned)cut,
+                T.dgrow_target ? " + _TARGET" : "");
+    else if (K > 0)
         fprintf(stderr, VKT_TAG " tier %s: decode grow armed: %s free less %s reserve -> %lld places, %lld stream slots beyond, budget %d -> %d experts, cutoff %u (COLI_VK_TIER_DECODE_GROW; installs rank by the engine's decode-only counts)\n",
-                T.engine, human(free_b, hf, sizeof hf), human(env_gb("COLI_VK_TIER_DECODE_GROW_RESERVE_GB", 0.5) * GiB, hr, sizeof hr),
+                T.engine, human(free_b, hf, sizeof hf), human(T.dgrow_reserve, hr, sizeof hr),
                 kfree, slots, T.dmax[0] - (int)kfree, T.dmax[0], (unsigned)cut);
     else
         fprintf(stderr, VKT_TAG " tier %s: decode grow: %s free less %s reserve and %d retirable slots -- no room to grow into, the warm set stands\n",
-                T.engine, human(free_b, hf, sizeof hf), human(env_gb("COLI_VK_TIER_DECODE_GROW_RESERVE_GB", 0.5) * GiB, hr, sizeof hr), T.st ? (T.st_n > 2 ? T.st_n - 2 : 0) : 0);
+                T.engine, human(free_b, hf, sizeof hf), human(T.dgrow_reserve, hr, sizeof hr), T.st ? (T.st_n > 2 ? T.st_n - 2 : 0) : 0);
 }
 
 int vkt_wanted(void) {
@@ -3452,6 +3521,17 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         if (T.dgrow) {
             const char *ce = getenv("COLI_VK_TIER_DECODE_GROW_GB");
             T.dgrow_cap = ce && *ce && atof(ce) > 0 ? (size_t)(atof(ce) * 1073741824.0) : 0;
+            /* headroom: the growth's free places are the live guard's, not the one-time
+             * probe's; the target (_TARGET, the fork's gpu_cap class) is the residents'
+             * count it may grow to -- W2 grew 0 free places (the budget full at the arm)
+             * and only recycled slots while the card had room the probe never re-read */
+            const char *he = getenv("COLI_VK_TIER_DECODE_GROW_HEADROOM");
+            T.dgrow_head = he && *he && atoi(he) != 0 ? 1 : 0;
+            if (T.dgrow_head) {
+                const char *te = getenv("COLI_VK_TIER_DECODE_GROW_TARGET");
+                T.dgrow_target = te && *te ? atoi(te) : 0;
+                if (T.dgrow_target < 0) T.dgrow_target = 0;
+            }
         }
     }
     {
@@ -3548,6 +3628,14 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     const char *r = getenv("COLI_VK_TIER_RATE");
     T.rate = r && *r ? atoi(r) : 16;
     if (T.rate < 0) T.rate = 0;
+    {   /* COLI_VK_TIER_PROMO_CAP: the promotions cap a forward, set outright -- the
+         * rate's per-token arithmetic replaced (W2's growth was rate-starved, its run
+         * line reading `skipped 312 rate` while the tier's budget stood unspent);
+         * negative: no cap */
+        const char *pc = getenv("COLI_VK_TIER_PROMO_CAP");
+        T.promo_fix = pc && *pc ? atoi(pc) : 0;
+        if (T.promo_fix < 0) T.promo_fix = -1;
+    }
     T.s = calloc((size_t)T.c.layers * T.c.experts, sizeof(VSlot));
     T.grp = malloc((size_t)T.c.experts * sizeof(int));
     if (!T.s || !T.grp) { free(T.s); free(T.grp); return 0; }
@@ -3619,9 +3707,11 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (T.c.chain_bytes) fprintf(stderr, "; %s left for the dense chain's KV mirror and a prompt chunk",
                                  human((double)T.c.chain_bytes, hb, sizeof hb));
     if (T.stage_room) fprintf(stderr, "; %s for a prompt chunk's host pool experts", human((double)T.stage_room, hb, sizeof hb));
-    fprintf(stderr, "), %s, %s queue, up to %d promotions per token%s%s",
+    fprintf(stderr, "), %s, %s queue, up to %d promotions per token%s%s%s",
             T.uma ? (cap && *cap ? "shared RAM (COLI_VK_TIER_GB)" : "shared RAM: a quarter of what the expert cache leaves")
                   : "device memory", coli_vk_xb_queue_shared() ? "shared" : "own", T.rate,
+            T.promo_fix < 0 ? ", promotions uncapped (COLI_VK_TIER_PROMO_CAP)"
+                            : T.promo_fix > 0 ? ", the promotion cap fixed a forward (COLI_VK_TIER_PROMO_CAP)" : "",
             T.balance ? ", balanced against the CPU" : "", T.sync ? ", uploads awaited (COLI_VK_TIER_SYNC)" : "");
     if (T.st_ok) {
         fprintf(stderr, ", streaming cold experts of prompt steps through %d slots", T.st_slots);
@@ -3686,6 +3776,8 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     if (T.dgrow_armed)   /* decode growth: what grew, and by whose bytes */
         fprintf(stderr, " | decode grow: %llu installed by decode-only rank (cutoff %u), %llu of the stream slots' places (slots %d -> %d)",
                 T.dgrow_installs, (unsigned)T.dgrow_cut, T.dgrow_retires, T.dgrow_slots0, T.st ? T.st_n : 0);
+    if (T.dgrow_heads)   /* the headroom lever's own places: real free VRAM, guard-made */
+        fprintf(stderr, ", %llu by the live guard", T.dgrow_heads);
     if (dprof && T.d_routed)   /* COLI_VK_CHAIN_DPROF: the decode steps' wait/device/CPU split, promote's bytes */
         fprintf(stderr, " | decode dprof: waited %.1f ms, device %.1f ms, CPU %.1f ms, promoted %.1f MiB",
                 T.d_wait_ms, T.d_dev_ms, T.d_cpu_ms, (double)T.d_up_bytes / 1048576.0);
@@ -3852,8 +3944,10 @@ void vkt_dev_count(int layer, int S, int K, const int *idx) {
     }
     if (layer == T.first_layer) {
         T.tick += (uint32_t)S;
-        long cap = (long)T.promo_cap + (long)T.rate * S;
-        T.promo_cap = cap > (1 << 30) ? 1 << 30 : (int)cap;
+        if (!T.promo_fix) {   /* COLI_VK_TIER_PROMO_CAP holds the forward's cap fixed instead */
+            long cap = (long)T.promo_cap + (long)T.rate * S;
+            T.promo_cap = cap > (1 << 30) ? 1 << 30 : (int)cap;
+        }
     }
     T.last_layer = layer;
     T.dgrow_dec = S <= VKT_UP_ROWS;   /* decode growth: the chain's decode frames are this seam's too */

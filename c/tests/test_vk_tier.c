@@ -248,6 +248,10 @@ static double rel(const float *a, const float *b, int n) {
     for (int i = 0; i < n; i++) { double d = (double)a[i] - b[i]; num += d * d; den += (double)b[i] * b[i]; }
     return den > 0 ? sqrt(num / den) : sqrt(num);
 }
+/* rel()'s known hole (AJ, the v4 case's compare): a NaN never raises a `>` bar, so a
+ * non-finite row reads as passing it. The new legs take their worst through this -- a
+ * non-finite error becomes infinity and fails any threshold. */
+static double no_nan(double r) { return r <= 1e300 ? r : INFINITY; }
 
 /* One layer step as an engine runs it (vk_tier.h step 3): issue, CPU pairs with a
  * note each, join, rank-order sum. Returns the worst relative error of a device row
@@ -1159,10 +1163,23 @@ static void bank_layer_case(void) {
  * merged history the warm start filled by -- free VRAM first (leg A: a capped probe)
  * and the stream slots only beyond (leg B: the reserve kills the free part, the installs
  * retire slots a place at a time), the budget respected, the below-cutoff routed experts
- * never installed, and the env unset growing nothing (leg C, the default). */
+ * never installed, and the env unset growing nothing (leg C, the default).
+ * COLI_VK_TIER_DECODE_GROW_HEADROOM (legs D-F): the free places are the live guard's --
+ * made one install at a time against the card's free VRAM (re-probed fork-style), the
+ * TARGET env the residents' count it may reach (leg D grows the guard's two, leg E the
+ * target's ceiling biting at one), and with no target the operator's byte cap the bound
+ * (leg F: cutoff 0 admits every demand, the cap stops the second place).
+ * COLI_VK_TIER_PROMO_CAP (leg G): the rate's 1-a-forward starves the same growth (the
+ * W2 class -- installs refused with room standing) until the cap is lifted, a fixed N
+ * or negative (none); both legs end at the target's count.
+ * The headroom legs (D-G) ride their own `dgrow` invocation: their guard-made places
+ * allocate as installs proceed, so the pool's block count and frag, and the no-target
+ * arm line's probe-derived place count, differ between ANY two runs -- and the strict
+ * gate byte-compares the plain invocation's output of its unset-vs-0 pair. Legs A-C
+ * (the standing decode-grow case, deterministic) stay in the plain invocation. */
 static int dg_res(void) { int n = 0; for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) n += vkt_resident(l, e); return n; }
 static void report_line(char *out, size_t n);   /* below: the tier's report line as a string */
-static void decode_grow(void) {
+static void decode_grow(int dg) {
     rng = 7;
     VktFmt f = {VKT_SRC_I8_ROW, 0};
     model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
@@ -1293,6 +1310,154 @@ static void decode_grow(void) {
     CHECK(dg_res() == 6, "dgrow C: the default grew (%d residents)", dg_res());
     CHECK(!strstr(line, "decode grow:"), "dgrow C: the default printed a growth clause");
     vkt_shutdown();
+    if (dg) {   /* the dgrow invocation's own legs -- see the case's comment above */
+        /* --- legs D-F: COLI_VK_TIER_DECODE_GROW_HEADROOM -- the live guard owns the free
+         * places (made one install at a time against the card's free VRAM, less the tiny
+         * reserve), the TARGET env the residents' count it may reach; no stream, so a slot
+         * can never stand in for the guard --- */
+        setenv("COLI_VK_TIER_DECODE_GROW", "1", 1);
+        setenv("COLI_VK_TIER_DECODE_GROW_RESERVE_GB", "0.000001", 1);
+        setenv("COLI_VK_TIER_DECODE_GROW_HEADROOM", "1", 1);
+        for (int leg = 0; leg < 3; leg++) {
+            static const int targets[3] = {8, 7, 99};   /* two guard places, the ceiling at one, the bar past the table */
+            char tg[16]; snprintf(tg, sizeof tg, "%d", targets[leg]);
+            setenv("COLI_VK_TIER_DECODE_GROW_TARGET", tg, 1);
+            if (leg == 2) {   /* F only: the operator's byte cap stops the guard after one place */
+                char gb[64]; snprintf(gb, sizeof gb, "%.12f", 1.5 * eb / 1073741824.0);
+                setenv("COLI_VK_TIER_DECODE_GROW_GB", gb, 1);
+            } else unsetenv("COLI_VK_TIER_DECODE_GROW_GB");
+            set_budget(6, f, f);
+            vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+            vc.decode_heat = drows;
+            CHECK(vkt_init(&vc, rows), "dgrow %c: the tier did not start", 'D' + leg);
+            n = vkt_plan(pl, pe, L * E);
+            for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+            vkt_put_done();
+            CHECK(n == 6 && dg_res() == 6, "dgrow %c: %d warm of %d planned, budget 6", 'D' + leg, dg_res(), n);
+            double worst = 0;
+            int curve[8]; int nc = 0;
+            for (int t = 0; t < 4; t++) {
+                for (int l = 0; l < L; l++) {
+                    float ww[K] = {0.5f, 0.3f, 0.2f};
+                    vkt_begin_forward();
+                    double r = step(l, 1, seq[t], ww, &bk);
+                    if (!(r <= worst)) worst = r;   /* a NaN counts as the worst */
+                }
+                vkt_settle();
+                curve[nc++] = dg_res();
+            }
+            report_line(line, sizeof line);
+            const char *hclause = strstr(line, " | decode grow: ");
+            int grew = 1;
+            for (int i = 1; i < nc; i++) grew &= curve[i] >= curve[i - 1];
+            printf("  decode grow %c (headroom, target %d%s): residents 6 -> %d (curve", 'D' + leg, targets[leg],
+                   leg == 2 ? ", byte cap" : "", dg_res());
+            for (int i = 0; i < nc; i++) printf(" %d", curve[i]);
+            printf("), worst %.2e, report \"%s\"\n", no_nan(worst), hclause ? hclause + 3 : "no clause");
+            if (leg == 0) {
+                CHECK(dg_res() == 8, "dgrow D: %d residents, not the guard's 6 + 2", dg_res());
+                CHECK(vkt_resident(0, 4) && vkt_resident(1, 4), "dgrow D: the hottest expert of each layer is not resident");
+                CHECK(!vkt_resident(0, 5) && !vkt_resident(0, 6) && !vkt_resident(0, 7) && !vkt_resident(1, 5),
+                      "dgrow D: a below-cutoff routed expert installed (5/6/7)");
+                CHECK(grew, "dgrow D: the resident set shrank");
+                CHECK(strstr(line, "decode grow: 2 installed by decode-only rank (cutoff 40)"), "dgrow D: the report's growth clause");
+                CHECK(strstr(line, "2 by the live guard"), "dgrow D: the report's headroom clause");
+                CHECK(strstr(line, "evictions 0"), "dgrow D: growth evicted");
+            } else if (leg == 1) {
+                CHECK(dg_res() == 7, "dgrow E: %d residents, not the target's ceiling of 7", dg_res());
+                CHECK(vkt_resident(0, 4) && !vkt_resident(1, 4), "dgrow E: the target's one place went to both layers");
+                CHECK(strstr(line, "1 by the live guard"), "dgrow E: the report's headroom clause");
+            } else {
+                CHECK(dg_res() == 7, "dgrow F: %d residents, not the byte cap's one place", dg_res());
+                CHECK(vkt_resident(0, 7) && !vkt_resident(0, 4) && !vkt_resident(0, 5),
+                      "dgrow F: cutoff 0 admitted every demand; the cap stopped the second place");
+                CHECK(strstr(line, "decode grow: 1 installed by decode-only rank (cutoff 0)"), "dgrow F: the report's growth clause");
+                CHECK(strstr(line, "1 by the live guard"), "dgrow F: the report's headroom clause");
+            }
+            CHECK(no_nan(worst) < 2e-3, "dgrow %c: rows off the reference (%.3g)", 'D' + leg, no_nan(worst));
+            vkt_shutdown();
+        }
+        /* --- the caps gone (no target, no byte cap): cutoff 0, every routed demand installs
+         * -- the guard's places bounded by the card alone, the fork's demand class --- */
+        unsetenv("COLI_VK_TIER_DECODE_GROW_TARGET"); unsetenv("COLI_VK_TIER_DECODE_GROW_GB");
+        set_budget(6, f, f);
+        vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+        vc.decode_heat = drows;
+        CHECK(vkt_init(&vc, rows), "dgrow F2: the tier did not start");
+        n = vkt_plan(pl, pe, L * E);
+        for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+        vkt_put_done();
+        for (int l = 0; l < L; l++) {
+            float ww[K] = {0.5f, 0.3f, 0.2f};
+            vkt_begin_forward();
+            step(l, 1, seq[0], ww, &bk);   /* {7,5,6}: below leg A's bar, first at the cap-less guard */
+        }
+        vkt_settle();
+        report_line(line, sizeof line);
+        printf("  decode grow F2 (headroom, no target): one round of the below-bar experts installs all six, residents %d\n", dg_res());
+        CHECK(dg_res() == 12, "dgrow F2: %d residents, not every routed demand", dg_res());
+        CHECK(strstr(line, "6 by the live guard"), "dgrow F2: the report's headroom clause");
+        vkt_shutdown();
+        /* --- leg G: COLI_VK_TIER_PROMO_CAP -- the rate's 1-a-forward starves the same
+         * growth (W2's `skipped 312 rate` class: notes refused with the guard's room
+         * standing) until the cap is lifted, a fixed N or negative (none). One
+         * vkt_begin_forward a round here, both layers' notes against the one cap -- the
+         * model's decode-token shape, not the per-step forward of the legs above --- */
+        setenv("COLI_VK_TIER_DECODE_GROW_TARGET", "10", 1);
+        setenv("COLI_VK_TIER_RATE", "1", 1);
+        static const int seqG[2][K] = {{4, 5, 6}, {6, 5, 7}};
+        for (int leg = 0; leg < 3; leg++) {
+            if (leg == 0) unsetenv("COLI_VK_TIER_PROMO_CAP");
+            else {
+                char pc[8]; snprintf(pc, sizeof pc, "%d", leg == 1 ? 6 : -1);
+                setenv("COLI_VK_TIER_PROMO_CAP", pc, 1);
+            }
+            set_budget(6, f, f);
+            vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+            vc.decode_heat = drows;
+            CHECK(vkt_init(&vc, rows), "dgrow G%d: the tier did not start", leg);
+            n = vkt_plan(pl, pe, L * E);
+            for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+            vkt_put_done();
+            double worst = 0;
+            for (int t = 0; t < 2; t++) {
+                vkt_begin_forward();
+                for (int l = 0; l < L; l++) {
+                    float ww[K] = {0.5f, 0.3f, 0.2f};
+                    double r = step(l, 1, seqG[t], ww, &bk);
+                    if (!(r <= worst)) worst = r;   /* a NaN counts as the worst */
+                }
+                vkt_settle();
+            }
+            report_line(line, sizeof line);
+            /* the skip counters cut before the timing span (" | device "): those fields jitter
+             * between any two runs, and the strict gate byte-compares this test's stdout of its
+             * unset-vs-0 pair -- the growth clause beside them carries no timings */
+            char sk[64];
+            const char *s0 = strstr(line, "skipped ");
+            if (s0) {
+                const char *d0 = strstr(s0, " | device ");
+                size_t n = d0 && (size_t)(d0 - s0) < sizeof sk - 1 ? (size_t)(d0 - s0) : sizeof sk - 1;
+                memcpy(sk, s0, n); sk[n] = 0;
+            } else snprintf(sk, sizeof sk, "no skips");
+            const char *gclause = strstr(line, " | decode grow: ");
+            printf("  decode grow G%d (promo cap %s): residents 6 -> %d, %s, %s\n", leg,
+                   leg == 0 ? "unset" : leg == 1 ? "6" : "-1", dg_res(), sk,
+                   gclause ? gclause + 3 : "no clause");
+            if (leg == 0) {
+                CHECK(dg_res() == 8, "dgrow G0: %d residents under the rate's 1-a-forward, not 8", dg_res());
+                CHECK(strstr(line, "skipped 0 queue + 9 rate"), "dgrow G0: the rate-starved run line");
+            } else {
+                CHECK(dg_res() == 10, "dgrow G%d: %d residents, not the target's 10 under the lifted cap", leg, dg_res());
+                CHECK(strstr(line, "skipped 0 queue + 0 rate"), "dgrow G%d: a note still refused by the rate", leg);
+            }
+            CHECK(no_nan(worst) < 2e-3, "dgrow G%d: rows off the reference (%.3g)", leg, no_nan(worst));
+            vkt_shutdown();
+        }
+        unsetenv("COLI_VK_TIER_DECODE_GROW"); unsetenv("COLI_VK_TIER_DECODE_GROW_RESERVE_GB");
+        unsetenv("COLI_VK_TIER_DECODE_GROW_HEADROOM"); unsetenv("COLI_VK_TIER_DECODE_GROW_TARGET");
+        unsetenv("COLI_VK_TIER_PROMO_CAP");
+    }
     unsetenv("COLI_VK_TIER_SYNC"); unsetenv("COLI_VK_TIER_RATE");
     model_free();
 }
@@ -3219,6 +3384,9 @@ int main(int argc, char **argv) {
      * free; it stays at main's top regardless. */
     int fmt15_leg = argc > 2 && !strcmp(argv[2], "fmt15");
     if (fmt15_leg) setenv("COLI_VK_TIER_FMT15", "1", 1);
+    /* the decode-growth headroom legs' own invocation (see decode_grow's comment): their
+     * run-to-run nondeterminism must stay out of the plain one the strict gate compares */
+    int dg_leg = argc > 2 && !strcmp(argv[2], "dgrow");
     if (argc > 2 && !strcmp(argv[2], "host-pairs")) {   /* the CPU's integer form: no device, GQ_EXACT unread */
         unsetenv("GQ_EXACT");
         printf("host pairs, the integer form:\n"); host_pairs_case(5e-2);
@@ -3255,7 +3423,7 @@ int main(int argc, char **argv) {
     printf("pin layer:\n"); pin_layer();
     printf("pool layer:\n"); pool_layer();
     printf("bank layer:\n"); bank_layer_case();
-    printf("decode grow:\n"); decode_grow();
+    printf("decode grow:\n"); decode_grow(dg_leg);
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
     printf("stream batch:\n"); stream_batch();
