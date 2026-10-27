@@ -2572,6 +2572,20 @@ void coli_vk_slab_ref(ColiVkSlab *r) {   /* one more keepalive reference (the ti
     pthread_mutex_unlock(&g_slabs.mx);
 }
 size_t coli_vk_slab_bytes(const ColiVkSlab *r) { return r ? r->bytes : 0; }   /* the imported bytes a reference pins */
+/* The store's slot-free path names the pages that are going away (the tier's alias
+ * cache drops its holds first, vkt_slab_forget): every import still wrapping them is
+ * blinded to the dedup (base cleared), so a future import of the same address -- an
+ * allocator can return it for the same size, the same geometry -- builds a fresh
+ * import of the NEW pages instead of riding the stale record of the old ones. The
+ * record itself lives on until its last unref, as tensors still holding it may be
+ * reading it; only its identity in the dedup dies here. */
+void coli_vk_slab_forget(const void *slab) {
+    if (!slab) return;
+    pthread_mutex_lock(&g_slabs.mx);
+    for (ColiVkSlab *r = g_slabs.live; r; r = r->next)
+        if (r->ptr == slab) { r->ptr = NULL; r->base = NULL; }
+    pthread_mutex_unlock(&g_slabs.mx);
+}
 /* one record of the slab as a buffer bound into the imported memory at `off` bytes
  * into the caller's slab: the descriptor paths bind their buffers whole (offset 0),
  * so a record needs its own handle into the same pages, as a pool range has its own */

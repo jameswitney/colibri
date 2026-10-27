@@ -131,6 +131,7 @@ static const CuTierOps *cut_ops(void) {
 #define vkt_resident cut_resident
 #define vkt_score cut_score
 #define vkt_settle cut_settle
+#define vkt_slab_forget cut_slab_forget
 #define vkt_shutdown cut_shutdown
 #define vkt_stage_room cut_stage_room
 #define vkt_step_rows cut_step_rows
@@ -152,6 +153,7 @@ static const CuTierOps *cut_ops(void) {
 #define coli_vk_slab_ref(...) ((void)0)
 #define coli_vk_slab_bytes(...) (0)
 #define coli_vk_slab_cap() (0)
+#define coli_vk_slab_forget(...) ((void)0)
 /* the Vulkan backend's CS diagnostics (backend_vulkan.h); the CUDA tier has no slab
  * import, so vk_tier.c's report reads an all-zero snapshot */
 #define coli_vk_cs_diag(out) (memset((out), 0, sizeof *(out)))

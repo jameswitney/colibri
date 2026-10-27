@@ -120,6 +120,9 @@
 #include <math.h>
 #include <unistd.h>
 #include <time.h>
+#ifndef _WIN32
+#include <sys/mman.h>   /* the VA-reuse leg's MAP_FIXED remap: a deterministic same-address realloc */
+#endif
 #include "../backend_vulkan.h"
 #include "../vk_tier.h"
 #include "../ggml_quants.h"   /* the block formats' CPU decoders, the reference of section blocks */
@@ -2398,15 +2401,13 @@ static unsigned long long after(const char *line, const char *key) {
  * as the ordinary paths -- the v4 MXFP4 class at 2e-2 and the non-fp4 rows at 2e-3,
  * armed and unarmed (the unarmed control runs the ordinary issue/join path). A
  * non-finite row is a failure outright: rel()'s NaN-blind `>` never gets to pass it. */
-/* One aliased expert's store slab (fmt 15): the three matrices' packed codes and
- * ue8m0 scale bytes at 4 KiB-aligned offsets in one imported host range, the store's
- * record shape the compute-site group aliases. *slab_out is the caller's allocation,
- * freed after the join; the imported Vk buffer is the tier's. */
-static int cs_alias_slab(int layer, int eid, VktAliasSrc *src, void **slab_out) {
-    if (!coli_vk_import_alignment()) return 0;
-    const Ex *e = &ex[layer][eid];
-    const Mat *m[3] = {&e->g, &e->u, &e->d};
-    size_t woff[3], soff[3], cap = 0;
+/* the record layout of one expert's three matrices at 4 KiB offsets: woff/soff and
+ * the buffer's whole cap -- every expert of a layer shares it, so a rewrite of the
+ * same buffer at the same offsets keeps the cache key (the VA-reuse and scan-skip
+ * legs below fill one buffer twice with it) */
+static size_t cs_alias_slab_geometry(int layer, int eid, size_t woff[3], size_t soff[3]) {
+    const Mat *m[3] = {&ex[layer][eid].g, &ex[layer][eid].u, &ex[layer][eid].d};
+    size_t cap = 0;
     for (int k = 0; k < 3; k++) {
         size_t rb = row_bytes(m[k]->f.kind, m[k]->I), wb = rb * (size_t)m[k]->O;
         size_t nb = (size_t)m[k]->O * (((size_t)m[k]->I + 31) / 32);   /* fmt 15: one ue8m0 byte a group */
@@ -2414,22 +2415,38 @@ static int cs_alias_slab(int layer, int eid, VktAliasSrc *src, void **slab_out) 
         woff[k] = (cap + 4095) / 4096 * 4096; cap = woff[k] + wb;
         soff[k] = (cap + 4095) / 4096 * 4096; cap = soff[k] + sb;
     }
-    cap = (cap + 4095) / 4096 * 4096;
-    uint8_t *slab = NULL;
-    if (posix_memalign(slab_out, 4096, cap) != 0 || !(slab = *slab_out)) return 0;
+    return (cap + 4095) / 4096 * 4096;
+}
+/* one expert's records into a buffer at those offsets (the slab a store slot holds
+ * after its read of this expert) */
+static void cs_alias_slab_fill(int layer, int eid, void *slab, size_t cap, const size_t woff[3], const size_t soff[3]) {
+    const Mat *m[3] = {&ex[layer][eid].g, &ex[layer][eid].u, &ex[layer][eid].d};
     memset(slab, 0, cap);
     for (int k = 0; k < 3; k++) {
         size_t rb = row_bytes(m[k]->f.kind, m[k]->I);
         size_t nb = (size_t)m[k]->O * (((size_t)m[k]->I + 31) / 32);
-        memcpy(slab + woff[k], m[k]->codes, rb * (size_t)m[k]->O);
-        memcpy(slab + soff[k], m[k]->scales, nb);
+        memcpy((uint8_t *)slab + woff[k], m[k]->codes, rb * (size_t)m[k]->O);
+        memcpy((uint8_t *)slab + soff[k], m[k]->scales, nb);
     }
+}
+static void cs_alias_src_of(int layer, int eid, const void *slab, size_t cap, const size_t woff[3], const size_t soff[3], VktAliasSrc *src) {
+    const Mat *m[3] = {&ex[layer][eid].g, &ex[layer][eid].u, &ex[layer][eid].d};
     memset(src, 0, sizeof(*src));
     src->slab = slab; src->bytes = cap; src->fmt = 15; src->gs = 32;
     for (int k = 0; k < 3; k++) {
         src->woff[k] = woff[k]; src->soff[k] = soff[k];
         src->I[k] = m[k]->I; src->O[k] = m[k]->O;
     }
+}
+/* One aliased expert's store slab (fmt 15) in its own allocation: *slab_out is the
+ * caller's, freed after the join; the imported Vk buffer is the tier's. */
+static int cs_alias_slab(int layer, int eid, VktAliasSrc *src, void **slab_out) {
+    if (!coli_vk_import_alignment()) return 0;
+    size_t woff[3], soff[3], cap = cs_alias_slab_geometry(layer, eid, woff, soff);
+    uint8_t *slab = NULL;
+    if (posix_memalign(slab_out, 4096, cap) != 0 || !(slab = *slab_out)) return 0;
+    cs_alias_slab_fill(layer, eid, slab, cap, woff, soff);
+    cs_alias_src_of(layer, eid, slab, cap, woff, soff, src);
     return 1;
 }
 /* One S==1 step through the compute-site group. w is the reference's route weight
@@ -2815,6 +2832,89 @@ static void cs_alias_cache(void) {
     unsetenv("COLI_VK_TIER_CS_ALIAS_CACHE_MB");
     unsetenv("COLI_VK_TIER_SYNC");
     unsetenv("COLI_VK_TIER_EXPERTS");
+}
+/* The VA-reuse guard (vkt_slab_forget, gap-wave1's mandatory hardening): the cache's
+ * geometry key cannot tell two generations of one address apart. A slab is aliased
+ * and cached, its pages are freed (the store's slot-free path: vkt_slab_forget first)
+ * and the SAME address comes back for the same size with the SAME geometry and
+ * different content -- the next alias there MUST MISS (the stale entry and the
+ * import dedup under it are gone) and its rows must be the NEW pages' expert, not
+ * the old import's. mmap MAP_FIXED makes the same-address realloc deterministic;
+ * the fixture's experts of a layer share the record layout, so both generations use
+ * one geometry. A POSIX-only leg: the Windows build skips it (no MAP_FIXED). */
+static void cs_alias_va_reuse(void) {
+#ifndef _WIN32
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    rng = 7;
+    model_make(f, f); g_act = VKT_ACT_SWIGLU_V4; g_limit = 10.0f;
+    uint32_t hist[L][E], *rows[L];
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = 0; }
+    hist[0][0] = 100; hist[0][1] = 90;   /* experts 0 and 1 resident: the alias path is the others' */
+    setenv("COLI_VK_TIER_EXPERTS", "1", 1);
+    setenv("COLI_VK_TIER_CS_ALIAS_CACHE", "1", 1);
+    unsetenv("COLI_VK_TIER_CS_ALIAS_CACHE_MB");
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    set_budget(2, f, f);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU_V4, 10.0f);
+    CHECK(vkt_init(&vc, rows), "cs va reuse: the tier did not start");
+    int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+    for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+    vkt_put_done();
+    CHECK(n == 2, "cs va reuse: %d warm of 2 planned", n);
+    size_t woff[3], soff[3], cap = cs_alias_slab_geometry(0, 2, woff, soff);
+    void *pages = mmap(NULL, cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(pages != MAP_FAILED, "cs va reuse: the first generation's pages did not map");
+    if (pages == MAP_FAILED) { vkt_shutdown(); model_free(); goto out; }
+    cs_alias_slab_fill(0, 2, pages, cap, woff, soff);   /* generation 1: expert 2's records */
+    VktAliasSrc a;
+    cs_alias_src_of(0, 2, pages, cap, woff, soff, &a);
+    float w[K] = {0.5f, 0.3f, 0.2f};
+    static const int route2[K] = {0, 1, 2}, route4[K] = {0, 1, 4};
+    VktAliasSrc src[K] = {{0}, {0}, a};
+    Books bk = {0, 0}; double worst = 0;
+    char line[4096]; int cn; size_t cb; unsigned long long ch, cm, cev;
+
+    vkt_begin_forward();
+    double r = cs_group_step(0, route2, w, src, 1, 10.0f, 1, &bk, NULL);
+    if (r > worst) worst = r;
+    report_line(line, sizeof line);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev);
+    CHECK(ch == 0 && cm == 1 && cn == 1, "cs va reuse: the first generation cached %llu hits, %llu misses, %d entries (want 0/1/1)", ch, cm, cn);
+
+    vkt_slab_forget(pages);   /* the store's slot-free path, then the pages go */
+    munmap(pages, cap);
+    void *again = mmap(pages, cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    CHECK(again == pages, "cs va reuse: MAP_FIXED did not return the same address");
+    if (again != pages) { munmap(again, cap); vkt_shutdown(); model_free(); goto out; }
+    cs_alias_slab_fill(0, 4, pages, cap, woff, soff);   /* generation 2: expert 4's records, the SAME geometry */
+    cs_alias_src_of(0, 4, pages, cap, woff, soff, &a);
+    src[2] = a;
+    vkt_begin_forward();
+    r = cs_group_step(0, route4, w, src, 1, 10.0f, 1, &bk, NULL);
+    if (r > worst) worst = r;
+    report_line(line, sizeof line);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev);
+    CHECK(ch == 0 && cm == 2 && cn == 1, "cs va reuse: the re-taken address MUST MISS, not hit the stale entry (%llu hits, %llu misses, %d entries; want 0/2/1)", ch, cm, cn);
+
+    vkt_begin_forward();   /* the fresh entry serves its own generation: a hit now */
+    r = cs_group_step(0, route4, w, src, 1, 10.0f, 1, &bk, NULL);
+    if (r > worst) worst = r;
+    report_line(line, sizeof line);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev);
+    CHECK(ch == 1 && cm == 2, "cs va reuse: the second generation reused %llu hits, %llu misses (want 1/2)", ch, cm);
+    CHECK(no_nan(worst) < 2e-2, "cs va reuse: rows off the reference, the fresh pages must serve (%.3g)", no_nan(worst));
+    vkt_shutdown();
+    munmap(pages, cap);
+    model_free();
+out:
+    unsetenv("COLI_VK_TIER_CS_ALIAS_CACHE");
+    unsetenv("COLI_VK_TIER_CS_ALIAS_CACHE_MB");
+    unsetenv("COLI_VK_TIER_SYNC");
+    unsetenv("COLI_VK_TIER_EXPERTS");
+#else
+    printf("  (skipped on Windows: no MAP_FIXED)\n");
+#endif
 }
 /* The hot set overlay (COLI_VK_TIER_HOT): the history's top share of the resident places,
  * ranked on the RAW counts, marked on the slots and skipped by every victim path. The
@@ -3969,6 +4069,7 @@ int main(int argc, char **argv) {
     printf("DeepSeek V4:\n"); v4_act();
     printf("compute site:\n"); cs_group();
     printf("compute site alias cache:\n"); cs_alias_cache();
+    printf("compute site VA reuse:\n"); cs_alias_va_reuse();
     printf("stream:\n"); stream();
     printf("stream batch:\n"); stream_batch();
     printf("stream ring:\n"); stream_ring();

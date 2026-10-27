@@ -409,6 +409,13 @@ unsigned vkt_epoch(void);
 int  vkt_dev_table(int layer, uint32_t *entries);
 void vkt_dev_count(int layer, int S, int K, const int *idx);
 void vkt_settle(void);
+/* The store's slot-free path (an expert store's destroy, deepseek_v4.c) hands each
+ * slab here before its pages are freed: the CS alias cache's keepalive holds on that
+ * address drop and the backend's import dedup goes blind to it, so a later allocation
+ * at the SAME address -- which the geometry key alone cannot tell apart -- misses and
+ * imports the new pages fresh (the VA-reuse hazard's guard). Cheap and a no-op when
+ * the cache holds nothing for the address. */
+void vkt_slab_forget(const void *slab);
 int  vkt_dev_changes(unsigned since, int *slots, int max);
 /* The VRAM bank's refill (COLI_VK_TIER_BANK_LAYER, vk_tier.c "the VRAM bank"): at the
  * banked layer's routed step, post-router and pre-issue -- the engine's tier seam --
@@ -511,6 +518,7 @@ static inline unsigned vkt_epoch(void){return 0;}
 static inline int  vkt_dev_table(int l,uint32_t *e){(void)l;(void)e;return -1;}
 static inline void vkt_dev_count(int l,int S,int K,const int *i){(void)l;(void)S;(void)K;(void)i;}
 static inline void vkt_settle(void){}
+static inline void vkt_slab_forget(const void *s){(void)s;}
 static inline void vkt_bank_fill(int l,const int *i,int n){(void)l;(void)i;(void)n;}
 static inline void vkt_bank_switch(int l){(void)l;}
 #endif

@@ -155,6 +155,7 @@ void coli_vk_slab_unref(ColiVkSlab *slab);
 void coli_vk_slab_ref(ColiVkSlab *slab);   /* one more keepalive reference (the tier's alias cache) */
 size_t coli_vk_slab_bytes(const ColiVkSlab *slab);   /* the imported bytes the reference pins */
 int  coli_vk_slab_cap(void);               /* the live-import cap (COLI_VK_TIER_EXPERTS_IMPORT_CAP) */
+void coli_vk_slab_forget(const void *slab);   /* the store's slot-free path: blind the dedup to these pages (VA reuse) */
 /* A tensor whose weights AND scales are records of an imported slab, read in
  * place: woff the first weight row's byte in the slab, soff the scales' (fmt 15:
  * the packed ue8m0 bytes, their word pad past the end never read -- exactly the

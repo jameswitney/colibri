@@ -290,7 +290,7 @@ static struct {
     size_t cs_cache_cap;
     VCsAlias *cs_cache_e; int cs_cache_n, cs_cache_capn;
     size_t cs_cache_bytes;
-    unsigned long long cs_cache_seq, cs_cache_hits, cs_cache_misses, cs_cache_evicts;
+    unsigned long long cs_cache_seq, cs_cache_hits, cs_cache_misses, cs_cache_evicts, cs_cache_forgets;
     /* CS diagnostics (COLI_VK_CHAIN_DPROF=1 only): the deferred group's window split,
      * double-ms + counts; all zero and untimed unless the gate is on. They reconcile
      * against the decode dprof line's waited/device/CPU (see vkt_report's cs dprof):
@@ -3061,6 +3061,27 @@ static void cs_cache_clear(void) {
     T.cs_cache_n = 0;
     T.cs_cache_bytes = 0;
 }
+/* Drop every hold keyed on this slab address (its pages are going away, the store's
+ * slot-free path): the drop-index discipline is cs_cache_find_slab's -- a dropped
+ * entry is replaced by the last, so the walk only steps on a match's survivor. */
+static void cs_cache_forget(const void *slab) {
+    for (int i = 0; i < T.cs_cache_n; )
+        if (T.cs_cache_e[i].slab == slab) { cs_cache_drop(i); T.cs_cache_forgets++; }
+        else i++;
+}
+/* The VA-reuse guard (gap-wave1's mandatory hardening): the cache's key is the exact
+ * alias-source geometry, which cannot tell two generations of one address apart -- a
+ * slab freed and its address returned for the same size would hit the stale entry (and
+ * the import dedup under it), a pinned import of pages the allocator has since given
+ * out, and the device would read whatever sits there now, silently. The store's
+ * slot-free path hands the address here before the pages go: the holds drop (never in
+ * flight -- the store frees at destroy, past every lease) and the backend blinds its
+ * dedup, so a later alias at this address is a fresh miss that imports the new pages. */
+void vkt_slab_forget(const void *slab) {
+    if (!slab) return;
+    if (T.cs_cache) cs_cache_forget(slab);
+    coli_vk_slab_forget(slab);
+}
 
 /* One aliased expert over its imported slab: CS-1a's capability, VktAliasSrc's three
  * records as ColiVkTensors and an expert of them. The import is refcounted by the
@@ -4377,11 +4398,11 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     if (T.cs_groups)   /* COLI_VK_TIER_EXPERTS: the finish-site group's own books (one group a layer-token) */
         fprintf(stderr, " | cs: %llu groups, %llu resident + %llu aliased entries on the device, %llu cpu-fallback (%llu alias refusals)",
                 T.cs_groups, T.cs_res, T.cs_alias, T.cs_fallback, T.cs_refuse);
-    if (T.cs_cache) {   /* CS-1c: the alias keepalive cache's standing (entries, pinned bytes, reuse) */
+    if (T.cs_cache) {   /* CS-1c: the alias keepalive cache's standing (entries, pinned bytes, reuse; forgotten = vkt_slab_forget's invalidations, the VA-reuse guard) */
         char hc[32];
-        fprintf(stderr, " | cs alias cache: %d entries, %zu bytes (%s), %llu hits, %llu misses, %llu evictions",
+        fprintf(stderr, " | cs alias cache: %d entries, %zu bytes (%s), %llu hits, %llu misses, %llu evictions, %llu forgotten",
                 T.cs_cache_n, T.cs_cache_bytes, human((double)T.cs_cache_bytes, hc, sizeof hc),
-                T.cs_cache_hits, T.cs_cache_misses, T.cs_cache_evicts);
+                T.cs_cache_hits, T.cs_cache_misses, T.cs_cache_evicts, T.cs_cache_forgets);
     }
     if (dprof && T.cs_groups) {   /* COLI_VK_CHAIN_DPROF: the group's window split. Reconciliation against the
                                    * decode dprof line (all CS decode steps): CPU window = settle + build + issue
