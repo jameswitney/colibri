@@ -2615,6 +2615,19 @@ static int slab_buf(ColiVkSlab *r, size_t off, size_t bytes, VkBuffer *out) {
 }
 int coli_vk_tensor_alias(ColiVkSlab *r, size_t woff, size_t soff, int fmt, int I, int O, int gs,
                          ColiVkTensor **tensor) {
+    return coli_vk_tensor_alias_wide(r, woff, soff, fmt, I, O, gs, -1, tensor);
+}
+/* coli_vk_tensor_alias with the f16-range verdict supplied: wide < 0 the builder
+ * scans the slab's scale bytes itself (scales_wide's rule -- fmt 15: one ue8m0 byte
+ * a 32-group, O x ceil(I/gs) of them, the 786 KB-class pass a DeepSeek V4 expert's
+ * three tensors cost every build); 0/1 is a verdict the CALLER vouches for the exact
+ * bytes at [soff, soff+sbytes) -- the tier's alias cache records one per entry for
+ * the content it names, and skips the scan only when that same content is served
+ * again (same slab generation, same expert: the store's record bytes are fixed per
+ * (layer, expert)). A wrong verdict is silent wrong math, so the caller's bar is
+ * provable sameness, never plausibility. */
+int coli_vk_tensor_alias_wide(ColiVkSlab *r, size_t woff, size_t soff, int fmt, int I, int O, int gs,
+                              int wide, ColiVkTensor **tensor) {
     if (*tensor) return (*tensor)->fmt == fmt && (*tensor)->I == I && (*tensor)->O == O;
     /* the store's records: MXFP4 codes with their ue8m0 bytes (15) or f32 scales (7);
      * the other formats' scale geometry is a pool's, not a slab's -- refused, the
@@ -2641,12 +2654,15 @@ int coli_vk_tensor_alias(ColiVkSlab *r, size_t woff, size_t soff, int fmt, int I
      * product with the format's largest code passes 65504 keeps the alias off them
      * (scales_wide's rule, read off the slab itself -- a ue8m0 byte IS an exponent,
      * and one past 140 is 2^13.4) */
-    const uint8_t *sc = (const uint8_t *)r->ptr + soff;
-    if (fmt == 15) {
-        size_t nb = (size_t)O * (((size_t)I + gs - 1) / gs);
-        for (size_t i = 0; i < nb; i++)
-            if (sc[i] > 140) { t->wide = 1; break; }
-    } else t->wide = scales_wide(fmt, (const float *)sc, sbytes / 4);
+    if (wide >= 0) t->wide = (uint8_t)(wide != 0);   /* the caller's verdict for these exact bytes */
+    else {
+        const uint8_t *sc = (const uint8_t *)r->ptr + soff;
+        if (fmt == 15) {
+            size_t nb = (size_t)O * (((size_t)I + gs - 1) / gs);
+            for (size_t i = 0; i < nb; i++)
+                if (sc[i] > 140) { t->wide = 1; break; }
+        } else t->wide = scales_wide(fmt, (const float *)sc, sbytes / 4);
+    }
     pthread_mutex_lock(&g_slabs.mx);
     r->refs++;
     pthread_mutex_unlock(&g_slabs.mx);

@@ -2719,15 +2719,23 @@ static int cs_alias_slab2(int layer, int eid, VktAliasSrc *a, VktAliasSrc *b, vo
     }
     return 1;
 }
-/* the report's cs alias cache clause, parsed for the keepalive books */
+/* the report's cs alias cache clause, parsed for the keepalive books; skips, when
+ * given, reads the fast path's trailing counter (-1: the arm was off, no text) */
 static void cs_cache_report(const char *line, int *n, size_t *bytes,
                             unsigned long long *hits, unsigned long long *misses,
-                            unsigned long long *evicts) {
+                            unsigned long long *evicts, long long *skips) {
     *n = -1; *bytes = 0; *hits = *misses = *evicts = ~0ull;
+    if (skips) *skips = -1;
     const char *p = strstr(line, "cs alias cache: ");
     if (!p || sscanf(p, "cs alias cache: %d entries, %zu bytes (%*[^)]), %llu hits, %llu misses, %llu evictions",
                      n, bytes, hits, misses, evicts) != 5)
         { *n = -1; *bytes = 0; *hits = *misses = *evicts = ~0ull; }
+    else if (skips) {
+        int cn2; size_t cb2; unsigned long long ch2, cm2, ce2, cf;
+        if (sscanf(p, "cs alias cache: %d entries, %zu bytes (%*[^)]), %llu hits, %llu misses, %llu evictions, %llu forgotten, %lld scans skipped",
+                   &cn2, &cb2, &ch2, &cm2, &ce2, &cf, skips) != 7)
+            *skips = -1;   /* the fast path's arm was off: no trailing counter */
+    }
 }
 /* COLI_VK_TIER_CS_ALIAS_CACHE: the tier-owned keepalive for the compute site's aliased
  * slabs -- a decode expert's store slab is imported once at its exact geometry and reused
@@ -2765,14 +2773,14 @@ static void cs_alias_cache(void) {
     double r = cs_group_step(0, route, w, src, 1, 10.0f, 1, &bk, &aliased);
     if (r > worst) worst = r;
     report_line(line, sizeof line);
-    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev, NULL);
     CHECK(ch == 0 && cm == 1 && cn == 1 && cev == 0, "cs alias cache: first use %llu hits, %llu misses, %d entries, %llu evictions (want 0/1/1/0)", ch, cm, cn, cev);
 
     vkt_begin_forward();
     r = cs_group_step(0, route, w, src, 1, 10.0f, 1, &bk, &aliased);
     if (r > worst) worst = r;
     report_line(line, sizeof line);
-    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev, NULL);
     CHECK(ch == 1 && cm == 1 && cn == 1 && cev == 0, "cs alias cache: the same geometry reused %llu hits, %llu misses, %d entries, %llu evictions (want 1/1/1/0)", ch, cm, cn, cev);
 
     src[2] = b;   /* the slot rewritten in place: same slab, the second copy's geometry */
@@ -2780,14 +2788,14 @@ static void cs_alias_cache(void) {
     r = cs_group_step(0, route, w, src, 1, 10.0f, 1, &bk, &aliased);
     if (r > worst) worst = r;
     report_line(line, sizeof line);
-    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev, NULL);
     CHECK(ch == 1 && cm == 2 && cn == 1 && cev == 1, "cs alias cache: the slot rewrite re-imported %llu hits, %llu misses, %d entries, %llu evictions (want 1/2/1/1)", ch, cm, cn, cev);
 
     vkt_begin_forward();
     r = cs_group_step(0, route, w, src, 1, 10.0f, 1, &bk, &aliased);
     if (r > worst) worst = r;
     report_line(line, sizeof line);
-    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev, NULL);
     CHECK(ch == 2 && cm == 2 && cn == 1 && cev == 1, "cs alias cache: the rewritten geometry reused %llu hits, %llu misses, %d entries, %llu evictions (want 2/2/1/1)", ch, cm, cn, cev);
     CHECK(no_nan(worst) < 2e-2, "cs alias cache: rows off the reference (%.3g)", no_nan(worst));
     CHECK(aliased > 0, "cs alias cache: no aliased selection flew");
@@ -2820,7 +2828,7 @@ static void cs_alias_cache(void) {
         if (rb > worstb) worstb = rb;
     }
     report_line(line, sizeof line);
-    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev, NULL);
     CHECK(cev > 0, "cs alias cache bound: no byte-bound eviction (%d entries, %zu bytes, %llu evictions)", cn, cb, cev);
     CHECK(cb <= 1048576u, "cs alias cache bound: %zu bytes held over the 1 MiB cap", cb);
     CHECK(cn < NB, "cs alias cache bound: %d entries still held of %d", cn, NB);
@@ -2879,7 +2887,7 @@ static void cs_alias_va_reuse(void) {
     double r = cs_group_step(0, route2, w, src, 1, 10.0f, 1, &bk, NULL);
     if (r > worst) worst = r;
     report_line(line, sizeof line);
-    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev, NULL);
     CHECK(ch == 0 && cm == 1 && cn == 1, "cs va reuse: the first generation cached %llu hits, %llu misses, %d entries (want 0/1/1)", ch, cm, cn);
 
     vkt_slab_forget(pages);   /* the store's slot-free path, then the pages go */
@@ -2894,14 +2902,14 @@ static void cs_alias_va_reuse(void) {
     r = cs_group_step(0, route4, w, src, 1, 10.0f, 1, &bk, NULL);
     if (r > worst) worst = r;
     report_line(line, sizeof line);
-    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev, NULL);
     CHECK(ch == 0 && cm == 2 && cn == 1, "cs va reuse: the re-taken address MUST MISS, not hit the stale entry (%llu hits, %llu misses, %d entries; want 0/2/1)", ch, cm, cn);
 
     vkt_begin_forward();   /* the fresh entry serves its own generation: a hit now */
     r = cs_group_step(0, route4, w, src, 1, 10.0f, 1, &bk, NULL);
     if (r > worst) worst = r;
     report_line(line, sizeof line);
-    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev, NULL);
     CHECK(ch == 1 && cm == 2, "cs va reuse: the second generation reused %llu hits, %llu misses (want 1/2)", ch, cm);
     CHECK(no_nan(worst) < 2e-2, "cs va reuse: rows off the reference, the fresh pages must serve (%.3g)", no_nan(worst));
     vkt_shutdown();
@@ -2915,6 +2923,92 @@ out:
 #else
     printf("  (skipped on Windows: no MAP_FIXED)\n");
 #endif
+}
+/* The hit fast path (COLI_VK_TIER_CS_ALIAS_SCAN_SKIP): a cache hit serving the SAME
+ * expert the entry's f16 verdicts were scanned for passes them to the tensor build
+ * and skips the scale scan (a full pass over the slab's scale bytes, three tensors an
+ * alias); any other hit -- the slot rewritten to ANOTHER expert at the same geometry,
+ * the key's blind spot -- must rescan, because the verdicts belong to the content that
+ * earned them and a wrong one is silent wrong math (a wide scale on a coopmat f16
+ * GEMM infs its output column). One slab, two experts, one geometry: the miss records
+ * the first expert's verdicts, its repeat skips, the rewrite to the second expert
+ * rescans (and re-records), and its repeat skips again -- the rows right throughout. */
+static void cs_alias_scan_skip(void) {
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    rng = 7;
+    model_make(f, f); g_act = VKT_ACT_SWIGLU_V4; g_limit = 10.0f;
+    uint32_t hist[L][E], *rows[L];
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = 0; }
+    hist[0][0] = 100; hist[0][1] = 90;
+    setenv("COLI_VK_TIER_EXPERTS", "1", 1);
+    setenv("COLI_VK_TIER_CS_ALIAS_CACHE", "1", 1);
+    setenv("COLI_VK_TIER_CS_ALIAS_SCAN_SKIP", "1", 1);
+    unsetenv("COLI_VK_TIER_CS_ALIAS_CACHE_MB");
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    set_budget(2, f, f);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU_V4, 10.0f);
+    CHECK(vkt_init(&vc, rows), "cs scan skip: the tier did not start");
+    int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+    for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+    vkt_put_done();
+    CHECK(n == 2, "cs scan skip: %d warm of 2 planned", n);
+    void *slab = NULL;
+    CHECK(cs_alias_slab(0, 3, &(VktAliasSrc){0}, &slab), "cs scan skip: the slab did not build");
+    if (!slab) { vkt_shutdown(); model_free(); goto out2; }
+    size_t woff[3], soff[3], cap = cs_alias_slab_geometry(0, 3, woff, soff);
+    VktAliasSrc a;
+    cs_alias_src_of(0, 3, slab, cap, woff, soff, &a);
+    float w[K] = {0.5f, 0.3f, 0.2f};
+    static const int route3[K] = {0, 1, 3}, route4[K] = {0, 1, 4};
+    VktAliasSrc src[K] = {{0}, {0}, a};
+    Books bk = {0, 0}; double worst = 0;
+    char line[4096]; int cn; size_t cb; unsigned long long ch, cm, cev; long long cs;
+
+    vkt_begin_forward();   /* the miss: scanned, verdicts recorded for expert 3 */
+    double r = cs_group_step(0, route3, w, src, 1, 10.0f, 1, &bk, NULL);
+    if (r > worst) worst = r;
+    report_line(line, sizeof line);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev, &cs);
+    CHECK(ch == 0 && cm == 1 && cs == 0, "cs scan skip: the miss scanned (%llu hits, %llu misses, %lld skips; want 0/1/0)", ch, cm, cs);
+
+    vkt_begin_forward();   /* the same expert again: a hit of the recorded content, the scan skipped */
+    r = cs_group_step(0, route3, w, src, 1, 10.0f, 1, &bk, NULL);
+    if (r > worst) worst = r;
+    report_line(line, sizeof line);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev, &cs);
+    CHECK(ch == 1 && cm == 1 && cs == 1, "cs scan skip: the same expert's hit skipped the scan (%llu hits, %llu misses, %lld skips; want 1/1/1)", ch, cm, cs);
+
+    /* the slot rewritten in place to ANOTHER expert at the SAME geometry: the key
+     * hits, the content did not -- the rescan is the correctness gate, and its rows
+     * the second expert's (the falsifier: a stale verdict or a stale import reads the
+     * first expert's weights here) */
+    cs_alias_slab_fill(0, 4, slab, cap, woff, soff);
+    cs_alias_src_of(0, 4, slab, cap, woff, soff, &a);
+    src[2] = a;
+    vkt_begin_forward();
+    r = cs_group_step(0, route4, w, src, 1, 10.0f, 1, &bk, NULL);
+    if (r > worst) worst = r;
+    report_line(line, sizeof line);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev, &cs);
+    CHECK(ch == 2 && cm == 1 && cs == 1, "cs scan skip: the rewritten slot's hit RESCANNED (%llu hits, %llu misses, %lld skips; want 2/1/1)", ch, cm, cs);
+
+    vkt_begin_forward();   /* the second expert's repeat: its own verdicts now, skipped */
+    r = cs_group_step(0, route4, w, src, 1, 10.0f, 1, &bk, NULL);
+    if (r > worst) worst = r;
+    report_line(line, sizeof line);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev, &cs);
+    CHECK(ch == 3 && cm == 1 && cs == 2, "cs scan skip: the second expert's hit skipped (%llu hits, %llu misses, %lld skips; want 3/1/2)", ch, cm, cs);
+    CHECK(no_nan(worst) < 2e-2, "cs scan skip: rows off the reference (%.3g)", no_nan(worst));
+    vkt_shutdown();
+    free(slab);
+    model_free();
+out2:
+    unsetenv("COLI_VK_TIER_CS_ALIAS_CACHE");
+    unsetenv("COLI_VK_TIER_CS_ALIAS_CACHE_MB");
+    unsetenv("COLI_VK_TIER_CS_ALIAS_SCAN_SKIP");
+    unsetenv("COLI_VK_TIER_SYNC");
+    unsetenv("COLI_VK_TIER_EXPERTS");
 }
 /* The hot set overlay (COLI_VK_TIER_HOT): the history's top share of the resident places,
  * ranked on the RAW counts, marked on the slots and skipped by every victim path. The
@@ -4070,6 +4164,7 @@ int main(int argc, char **argv) {
     printf("compute site:\n"); cs_group();
     printf("compute site alias cache:\n"); cs_alias_cache();
     printf("compute site VA reuse:\n"); cs_alias_va_reuse();
+    printf("compute site scan skip:\n"); cs_alias_scan_skip();
     printf("stream:\n"); stream();
     printf("stream batch:\n"); stream_batch();
     printf("stream ring:\n"); stream_ring();

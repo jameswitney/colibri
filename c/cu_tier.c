@@ -149,6 +149,7 @@ static const CuTierOps *cut_ops(void) {
  * lever's refusal ladder, never a drop */
 #define coli_vk_slab_import(...) (0)
 #define coli_vk_tensor_alias(...) (0)
+#define coli_vk_tensor_alias_wide(...) (0)
 #define coli_vk_slab_unref(...) ((void)0)
 #define coli_vk_slab_ref(...) ((void)0)
 #define coli_vk_slab_bytes(...) (0)
