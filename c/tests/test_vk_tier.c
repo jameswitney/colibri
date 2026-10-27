@@ -1462,6 +1462,120 @@ static void decode_grow(int dg) {
     model_free();
 }
 
+/* COLI_VK_TIER_ADAPTIVE: the forward-boundary re-probe (the fork's request-boundary
+ * reorder). Leg A grows dmax[0] into free VRAM above reserve+margin and the routed
+ * demand then installs; leg B sheds the coldest residents and shrinks dmax when free
+ * falls below the reserve (a co-tenant's reclaim), leaving the in-flight group of the
+ * very step untouched -- it still joins and its rows are the reference's; leg C keeps
+ * the env-unset default silent and unchanged. */
+static FILE *cap_begin(int *saved) {
+    FILE *t = tmpfile();
+    if (!t) { *saved = -1; return NULL; }
+    fflush(stderr);
+    *saved = dup(2);
+    if (*saved < 0) { fclose(t); return NULL; }
+    dup2(fileno(t), 2);
+    return t;
+}
+static void cap_end(FILE *t, int saved, char *out, size_t n, const char *needle) {
+    out[0] = 0;
+    if (!t) return;
+    fflush(stderr);
+    dup2(saved, 2); close(saved);
+    rewind(t);
+    char line[4096];
+    while (fgets(line, sizeof line, t)) {
+        fputs(line, stderr);
+        if (!out[0] && strstr(line, needle)) snprintf(out, n, "%s", line);
+    }
+    fclose(t);
+}
+static void tier_adaptive_case(void) {
+    VktFmt f = {VKT_SRC_I8_ROW, 0};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    const double eb = (double)vkt_expert_bytes(H, F, f, f);
+    /* the history warms e<3 of each layer, exactly the six-resident budget */
+    uint32_t hist[L][E], *rows[L];
+    for (int l = 0; l < L; l++) {
+        rows[l] = hist[l];
+        for (int e = 0; e < E; e++) hist[l][e] = e < 3 ? 100u : 0u;
+    }
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    setenv("COLI_VK_TIER_ADAPTIVE", "1", 1);
+    setenv("COLI_VK_TIER_ADAPTIVE_RESERVE_GB", "0.000001", 1);
+    setenv("COLI_VK_TIER_ADAPTIVE_MARGIN_GB", "0", 1);
+    int pl[L * E], pe[L * E];
+    /* --- leg A: free above reserve + margin -> grow, the routed demand installs --- */
+    set_budget(6, f, f);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    CHECK(vkt_init(&vc, rows), "adaptive A: the tier did not start");
+    int n = vkt_plan(pl, pe, L * E);
+    for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+    vkt_put_done();
+    CHECK(n == 6 && dg_res() == 6, "adaptive A: %d warm of %d planned, budget 6", dg_res(), n);
+    char freemb[64]; snprintf(freemb, sizeof freemb, "%.12f", 2.5 * eb / 1048576.0);   /* two places */
+    setenv("COLI_VK_TIER_FREE_MB", freemb, 1);
+    static const int seqA[K] = {6, 7, 2};   /* 2 resident (the device takes it); 6,7 install into the grown places */
+    float w[K] = {0.5f, 0.3f, 0.2f};
+    Books bk = {0, 0};
+    int saved; FILE *t = cap_begin(&saved);
+    vkt_begin_forward();
+    double worst = step(0, 1, seqA, w, &bk);
+    vkt_settle();
+    char said[4096]; cap_end(t, saved, said, sizeof said, "tier adaptive:");
+    printf("  adaptive A (grow on free): residents 6 -> %d, line \"%s\", worst %.2e\n", dg_res(), said, worst);
+    CHECK(strstr(said, "grow 2"), "adaptive A: the grow line (\"%s\")", said);
+    CHECK(dg_res() == 8, "adaptive A: %d residents, not the warm 6 + 2", dg_res());
+    CHECK(vkt_resident(0, 6) && vkt_resident(0, 7), "adaptive A: the routed demand did not install");
+    CHECK(worst < 2e-3, "adaptive A: rows off the reference (%.3g)", worst);
+    vkt_shutdown();
+    /* --- leg B: free below reserve -> shed, dmax shrinks, no in-flight group broken --- */
+    setenv("COLI_VK_TIER_RATE", "0", 1);   /* no re-promotion: the shed's places stay freed */
+    set_budget(6, f, f);
+    vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    CHECK(vkt_init(&vc, rows), "adaptive B: the tier did not start");
+    n = vkt_plan(pl, pe, L * E);
+    for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+    vkt_put_done();
+    CHECK(n == 6 && dg_res() == 6, "adaptive B: %d warm of %d planned, budget 6", dg_res(), n);
+    setenv("COLI_VK_TIER_FREE_MB", "0", 1);
+    static const int seqB[K] = {1, 2, 3};   /* 1,2 resident: the step's group flies after the shed */
+    bk = (Books){0, 0};
+    t = cap_begin(&saved);
+    vkt_begin_forward();
+    worst = step(0, 1, seqB, w, &bk);
+    vkt_settle();
+    cap_end(t, saved, said, sizeof said, "tier adaptive:");
+    printf("  adaptive B (shed under pressure): residents 6 -> %d, line \"%s\", worst %.2e\n", dg_res(), said, worst);
+    CHECK(strstr(said, "shed 1"), "adaptive B: the shed line (\"%s\")", said);
+    CHECK(dg_res() == 5, "adaptive B: %d residents, not the warm 6 - 1", dg_res());
+    CHECK(worst < 2e-3, "adaptive B: rows off the reference (%.3g)", worst);
+    vkt_shutdown();
+    /* --- leg C: the env unset -- no arm, no decision line, the warm set stands --- */
+    unsetenv("COLI_VK_TIER_ADAPTIVE"); unsetenv("COLI_VK_TIER_FREE_MB");
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    set_budget(6, f, f);
+    vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    CHECK(vkt_init(&vc, rows), "adaptive C: the tier did not start");
+    n = vkt_plan(pl, pe, L * E);
+    for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+    vkt_put_done();
+    bk = (Books){0, 0};
+    t = cap_begin(&saved);
+    vkt_begin_forward();
+    worst = step(0, 1, seqA, w, &bk);
+    vkt_settle();
+    cap_end(t, saved, said, sizeof said, "tier adaptive:");
+    printf("  adaptive C (default off): residents %d, no adaptive line\n", dg_res());
+    CHECK(!said[0], "adaptive C: the unset default printed an adaptive line (\"%s\")", said);
+    CHECK(dg_res() == 6, "adaptive C: the default changed the warm set (%d residents)", dg_res());
+    vkt_shutdown();
+    unsetenv("COLI_VK_TIER_ADAPTIVE_RESERVE_GB"); unsetenv("COLI_VK_TIER_ADAPTIVE_MARGIN_GB");
+    unsetenv("COLI_VK_TIER_SYNC"); unsetenv("COLI_VK_TIER_RATE");
+    model_free();
+}
+
 static void stream(void) {
     struct { VktFmt gu, dn; int act; const char *name; } cs[] = {
         {{VKT_SRC_I4U_PLANAR64, 64}, {VKT_SRC_I4U_PLANAR64, 64}, VKT_ACT_SWIGLU, "planar int4-g64"},
@@ -3851,6 +3965,7 @@ int main(int argc, char **argv) {
     printf("pool layer:\n"); pool_layer();
     printf("bank layer:\n"); bank_layer_case();
     printf("decode grow:\n"); decode_grow(dg_leg);
+    printf("tier adaptive:\n"); tier_adaptive_case();
     printf("DeepSeek V4:\n"); v4_act();
     printf("compute site:\n"); cs_group();
     printf("compute site alias cache:\n"); cs_alias_cache();

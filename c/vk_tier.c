@@ -262,6 +262,14 @@ static struct {
     int dgrow_head, dgrow_target;        /* the headroom lever armed, its resident-count target */
     double dgrow_reserve;                /* the probe's safety reserve, read once (env bytes) */
     double dg_hfree; unsigned dg_hprobe; /* the live guard's free-VRAM reading and its probe counter */
+    /* tier adaptive (COLI_VK_TIER_ADAPTIVE, fork-parity): a forward-boundary re-probe
+     * that owns dmax[0]'s free-VRAM changes -- grows into room above adapt_reserve +
+     * adapt_margin and sheds the coldest residents (the LFRU victim order) when free
+     * falls below adapt_reserve, so a co-tenant's reclaim never OOM-kills the process.
+     * adapt_cap is the growth's byte ceiling (0 = none, beyond the free VRAM itself). */
+    int adapt;
+    double adapt_reserve, adapt_margin, adapt_cap;
+    unsigned long long adapt_grows, adapt_sheds;
     /* the compute site (COLI_VK_TIER_EXPERTS, CS-1b): csx the arm (1 the finish-site
      * group, 2 the growth composition), a decode walk that defers -- cs_pending the
      * step owes vkt_issue_group at the token's finish site (layer cs_layer, nothing
@@ -948,6 +956,7 @@ static int pick_victim(int layer, uint64_t hs, int *from, int cheap) {
  * blocks of rows, or rows one by one, is the same forward). The tick counts tokens:
  * the rows of the forward's first layer, every block of them. */
 static void hot_pin(void);
+static void tier_adaptive(void);
 static void new_forward(void) {
     T.promos[0] = T.promos[1] = 0; T.promo_cap = 0; T.said_fwd = 0; T.upromos = 0;
     if (T.promo_fix)   /* COLI_VK_TIER_PROMO_CAP: the forward's cap set outright, not the rate's take */
@@ -959,6 +968,7 @@ static void new_forward(void) {
         T.decay_at = T.tick + VKT_DECAY_TOKENS;
     }
     refresh_candidates();
+    tier_adaptive();   /* the fork-parity request-boundary re-probe: nothing is in flight here */
 }
 
 /* ---- decode growth (COLI_VK_TIER_DECODE_GROW) ------------------------------------- */
@@ -968,6 +978,8 @@ static int dgrow_retire(void);
 static int dg_head_room1(void);
 static int dg_head_room(void);
 static void dgrow_arm(void);
+static double dg_free_now(void);
+static void tier_adaptive(void);
 
 /* The bytes of an expert the CPU just computed pass by: promote it when there is
  * room, or when it is hot enough to displace the coldest resident. The copy is the
@@ -3264,10 +3276,119 @@ static double env_gb(const char *name, double def) {
 }
 /* the card's free VRAM now: the probe the arm and the live guard share (the budget
  * books under COLI_VK_DEVICE_CAP_MB, else VK_EXT_memory_budget's budget less its
- * usage -- every holder's bytes counted). 0 when the backend cannot read it. */
+ * usage -- every holder's bytes counted). 0 when the backend cannot read it.
+ * COLI_VK_TIER_FREE_MB overrides it (tests: a fixed free reading, the grow/shed legs). */
 static double dg_free_now(void) {
+    const char *o = getenv("COLI_VK_TIER_FREE_MB");
+    if (o && *o) return atof(o) * 1048576.0;
     double used = 0, bud = 0;
     return coli_vk_mem_budget(&used, &bud) && bud > used ? (bud - used) * 1e9 : 0;
+}
+
+/* ---- tier adaptive (COLI_VK_TIER_ADAPTIVE) --------------------------------------- */
+/* the free-VRAM reading, fresh each forward (the fork's request-boundary cadence), and
+ * whether it is a reading at all: 0 means the card is full only when the backend says
+ * it read the budget -- an unreadable budget must never shed. */
+static int adapt_probe(double *free) {
+    const char *o = getenv("COLI_VK_TIER_FREE_MB");
+    if (o && *o) { *free = atof(o) * 1048576.0; return 1; }
+    double used = 0, bud = 0;
+    if (coli_vk_mem_budget(&used, &bud)) { *free = bud > used ? (bud - used) * 1e9 : 0; return 1; }
+    *free = 0;
+    return 0;
+}
+/* the coldest shed candidate across the main layers' device classes (0 and 2), or -1:
+ * the LFRU victim order refresh_candidates built, skipping pinned, host-pool and
+ * second-device residents. */
+static int adapt_coldest(void) {
+    int best = -1; uint64_t bs = 0;
+    for (int k = 0; k < 3; k++) {
+        if (k == 1) continue;   /* the extra layers' pool is not dmax[0]'s to shed */
+        while (T.ncand[k]) {
+            int i = T.cand[k][0];
+            VSlot *v = &T.s[i];
+            if (v->state != VS_RESIDENT || v->pin || v->host || v->dev != 0) { drop_victim(k); continue; }
+            uint64_t sc = score(v);
+            if (best < 0 || sc < bs) { best = i; bs = sc; }
+            break;
+        }
+    }
+    if (best >= 0) drop_victim(vcls_of(best / T.c.experts));
+    return best;
+}
+/* grow dmax[0] into free VRAM above reserve + margin: whole experts, bounded by the
+ * expert count, the byte cap and the operator's max_experts. The places are real free
+ * room; the installs ride vkt_note's ordinary promotion (rate/cap and, with DECODE_GROW
+ * armed, its decode-only cutoff). */
+static int adapt_grow(double free) {
+    double head = free - T.adapt_reserve - T.adapt_margin;
+    if (head <= 0 || !T.exp_bytes) return 0;
+    long long n = (long long)(head / (double)T.exp_bytes);
+    if (n < 1) return 0;
+    long long all = (long long)T.main_layers * T.c.experts;
+    if ((long long)T.dmax[0] + n > all) n = all - T.dmax[0];
+    if (T.c.max_experts > 0 && (long long)T.dmax[0] + n > T.c.max_experts) n = T.c.max_experts - T.dmax[0];
+    if (T.adapt_cap > 0) {
+        long long left = T.exp_bytes ? (long long)(((double)T.adapt_cap - (double)T.budget) / (double)T.exp_bytes) : 0;
+        if (n > left) n = left;
+    }
+    if (n < 1) return 0;
+    T.dmax[0] += (int)n; T.max_resident += (int)n;
+    T.budget += (size_t)n * T.exp_bytes; T.adapt_grows += (unsigned long long)n;
+    ColiVkPoolStats ps; coli_vk_pool_stats(1, &ps);
+    coli_vk_tier_pool_limit(ps.limit + (size_t)n * T.exp_bytes);
+    return (int)n;
+}
+/* shed under pressure (free < reserve): evict the coldest primary-device residents and
+ * shrink dmax[0]/budget/pool limit with them, so the freed VRAM is not re-taken on the
+ * next promotion. Pinned and host-pool residents are never touched; nothing is in flight
+ * (the forward boundary). Keeps at least two primary-device places. */
+static int adapt_shed(double free) {
+    if (free >= T.adapt_reserve || !T.exp_bytes) return 0;
+    double deficit = T.adapt_reserve - free;
+    long long want = (long long)((deficit + (double)T.exp_bytes - 1) / (double)T.exp_bytes);
+    if (want < 1) want = 1;
+    long long cap = (long long)T.dmax[0] - 2;
+    if (want > cap) want = cap;
+    if (want < 1) return 0;
+    refresh_candidates();
+    int n = 0;
+    while (n < want) {
+        int victim = adapt_coldest();
+        if (victim < 0) break;
+        VSlot *v = &T.s[victim];
+        if (v->ex) coli_vk_xb_expert_free(v->ex);
+        if (v->hex && v->hex != v->ex) coli_vk_xb_expert_free(v->hex);
+        v->ex = v->hex = NULL;
+        v->state = VS_NONE;
+        T.resident--; T.dres[0]--; T.evictions++;
+        note_change(victim);
+        n++;
+    }
+    if (n) {
+        T.dmax[0] -= n; T.max_resident -= n;
+        T.budget -= (size_t)n * T.exp_bytes; T.adapt_sheds += (unsigned long long)n;
+        ColiVkPoolStats ps; coli_vk_pool_stats(1, &ps);
+        size_t back = (size_t)n * T.exp_bytes;
+        coli_vk_tier_pool_limit(ps.limit > back ? ps.limit - back : 0);
+    }
+    return n;
+}
+/* the forward-boundary re-probe (new_forward): grow, shed, or hold -- one line per
+ * decision; grow/shed always, hold under DPROF (it would repeat every forward). */
+static void tier_adaptive(void) {
+    if (!T.adapt) return;
+    double free;
+    if (!adapt_probe(&free)) {   /* no reading: never shed on an unknown free */
+        if (vkt_cs_dprof()) fprintf(stderr, VKT_TAG " tier %s: tier adaptive: hold (free unknown)\n", T.engine);
+        return;
+    }
+    int grew = 0, shed = 0;
+    if (free > T.adapt_reserve + T.adapt_margin) grew = adapt_grow(free);
+    else if (free < T.adapt_reserve) shed = adapt_shed(free);
+    if (grew) fprintf(stderr, VKT_TAG " tier %s: tier adaptive: grow %d (free %.1f MB)\n", T.engine, grew, free / 1048576.0);
+    else if (shed) fprintf(stderr, VKT_TAG " tier %s: tier adaptive: shed %d (free %.1f MB)\n", T.engine, shed, free / 1048576.0);
+    else if (vkt_cs_dprof()) fprintf(stderr, VKT_TAG " tier %s: tier adaptive: hold (free %.1f MB)\n", T.engine, free / 1048576.0);
 }
 
 /* ---- decode growth (COLI_VK_TIER_DECODE_GROW) ------------------------------------- */
@@ -3310,6 +3431,7 @@ static double dg_head_free(void) {
  * now -- the target's count and the operator's byte cap held, the live free VRAM
  * less the safety reserve big enough for one expert */
 static int dg_head_room1(void) {
+    if (T.adapt) return 0;   /* COLI_VK_TIER_ADAPTIVE owns the free-VRAM probe (precedence) */
     if (!T.dgrow_armed || !T.dgrow_head) return 0;
     if (T.dgrow_target && T.dmax[0] >= T.dgrow_target) return 0;
     if (T.dgrow_cap && T.dgrow_used + T.exp_bytes > T.dgrow_cap) return 0;
@@ -3380,7 +3502,7 @@ static void dgrow_arm(void) {
             free(cs);
         }
     }
-    if (kfree > 0 && !T.dgrow_head) {   /* the headroom's places wait for the guard, an install each */
+    if (kfree > 0 && !T.dgrow_head && !T.adapt) {   /* the headroom's places wait for the guard, an install each */
         T.dmax[0] += (int)kfree; T.max_resident += (int)kfree;
         T.budget += (size_t)kfree * T.exp_bytes; T.dgrow_used += (size_t)kfree * T.exp_bytes;
         ColiVkPoolStats ps; coli_vk_pool_stats(1, &ps);
@@ -3389,7 +3511,10 @@ static void dgrow_arm(void) {
     T.dgrow_cut = (int)(cut > 0x7fffffffu ? 0x7fffffffu : cut);
     T.dgrow_slots0 = T.st ? T.st_n : 0;
     char hf[32], hr[32];
-    if (T.dgrow_head)
+    if (T.adapt)
+        fprintf(stderr, VKT_TAG " tier %s: decode grow armed (adaptive): %s free less %s reserve -- the free places are COLI_VK_TIER_ADAPTIVE's, %lld stream slots beyond, cutoff %u (installs still rank by the engine's decode-only counts)\n",
+                T.engine, human(free_b, hf, sizeof hf), human(T.dgrow_reserve, hr, sizeof hr), slots, (unsigned)cut);
+    else if (T.dgrow_head)
         fprintf(stderr, VKT_TAG " tier %s: decode grow armed (headroom): %s free less %s reserve at the probe, the guard re-probes as installs proceed -> up to %lld places%s, %lld stream slots beyond, budget %d experts now, cutoff %u (COLI_VK_TIER_DECODE_GROW_HEADROOM%s; installs rank by the engine's decode-only counts)\n",
                 T.engine, human(free_b, hf, sizeof hf), human(T.dgrow_reserve, hr, sizeof hr), kfree,
                 T.dgrow_target ? ", the target's count" : "", slots, T.dmax[0], (unsigned)cut,
@@ -3918,6 +4043,26 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
                 if (mb < 0) mb = 0;
                 T.cs_cache_cap = (size_t)mb * 1048576u;
             }
+        }
+        /* tier adaptive (COLI_VK_TIER_ADAPTIVE): the fork-parity live guard, off unless
+         * asked. Its reserve defaults to the boot's (COLI_VK_TIER_RESERVE_GB); the margin
+         * is the hysteresis above it before a grow; _GB caps the grown bytes (0 = none).
+         * With DECODE_GROW also armed, adaptive owns the free-VRAM probe and dgrow keeps
+         * its slot retirement and decode-only cutoff (dg_head_room1 steps aside). */
+        {
+        const char *ae = getenv("COLI_VK_TIER_ADAPTIVE");
+        T.adapt = ae && *ae && atoi(ae) != 0 ? 1 : 0;
+        if (T.adapt) {
+            T.adapt_reserve = env_gb("COLI_VK_TIER_ADAPTIVE_RESERVE_GB", reserve / GiB) * GiB;
+            T.adapt_margin = env_gb("COLI_VK_TIER_ADAPTIVE_MARGIN_GB", 0.25) * GiB;
+            const char *ce = getenv("COLI_VK_TIER_ADAPTIVE_GB");
+            T.adapt_cap = ce && *ce && atof(ce) > 0 ? atof(ce) * GiB : 0;   /* its own cap; the boot's COLI_VK_TIER_GB bounds only the boot fit */
+            char hr[32], hm[32], hg[32];
+            fprintf(stderr, VKT_TAG " tier %s: tier adaptive armed: reserve %s, margin %s, grow above %s free%s\n",
+                    eng, human(T.adapt_reserve, hr, sizeof hr), human(T.adapt_margin, hm, sizeof hm),
+                    human(T.adapt_reserve + T.adapt_margin, hg, sizeof hg), T.adapt_cap ? " (capped)" : "");
+        }
+        }
         }
     }
     {
