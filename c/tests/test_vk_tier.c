@@ -1798,6 +1798,64 @@ static void stream_batch(void) {
     unsetenv("COLI_VK_TIER_RATE"); unsetenv("COLI_VK_TIER_STREAM_SLOTS");
     unsetenv("COLI_VK_TIER_STREAM_ROWS"); unsetenv("COLI_VK_TIER_FILL");
 }
+/* COLI_VK_TIER_STREAM_ROWS_ADAPTIVE: the R rule's floor. The same routing twice --
+ * six cold experts of exactly 1 row, two of 21 -- once with R fixed at 3 (the tests'
+ * usual lever) and once with the adaptive rule armed before any measurement exists
+ * (R=1): the 1-row experts the fixed rule keeps on the CPU stream under the adaptive
+ * one, and every output row is byte-identical either way (the rule picks who computes,
+ * never how). One step, so the measurements the later rule would use never land. */
+static void stream_rows_adaptive(void) {
+    VktFmt f = {VKT_SRC_I4U_PAIRS_GS, 64};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    set_budget(16, f, f);
+    setenv("COLI_VK_TIER_RATE", "0", 1);
+    setenv("COLI_VK_TIER_STREAM_SLOTS", "8", 1);
+    setenv("COLI_VK_TIER_FILL", "0", 1);
+    uint32_t hist[L][E], *rows[L];
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = e < 2 ? 100 - e : 0; }
+    enum { S = 16, N = S * K };   /* a big step (S above the GEMM's rows), 48 assignments */
+    int idx[N]; float w[N];
+    for (int i = 0; i < N; i++) w[i] = 0.5f;
+    for (int i = 0; i < 6; i++) idx[i] = 2 + i;            /* six cold experts, one row each */
+    for (int i = 6; i < N; i++) idx[i] = 8 + (i & 1);      /* two cold experts, 21 rows each */
+    float *cap[2] = {0};
+    unsigned long long kept[2] = {0, 0}, streamed[2] = {0, 0};
+    for (int mode = 0; mode < 2; mode++) {
+        if (mode) { unsetenv("COLI_VK_TIER_STREAM_ROWS"); setenv("COLI_VK_TIER_STREAM_ROWS_ADAPTIVE", "1", 1); }
+        else { setenv("COLI_VK_TIER_STREAM_ROWS", "3", 1); unsetenv("COLI_VK_TIER_STREAM_ROWS_ADAPTIVE"); }
+        rng = 7;   /* the same inputs both legs */
+        VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+        vc.load = load_cb; vc.release = release_cb;
+        int on = vkt_init(&vc, rows);
+        CHECK(on, "stream rows %d: the tier did not start", mode);
+        if (!on) break;
+        int pl[L * E], pe[L * E], np = vkt_plan(pl, pe, L * E);
+        for (int i = 0; i < np; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+        vkt_put_done();
+        CHECK(np == 4, "stream rows %d: %d warm experts", mode, np);
+        cap[mode] = malloc(sizeof(float) * (size_t)S * H);
+        vkt_begin_forward();
+        Books bk = {0, 0};
+        double worst = stream_step(0, S, idx, w, 0, &bk, &streamed[mode], &kept[mode], 0, cap[mode]);
+        CHECK(worst < 2e-3, "stream rows %d: rows off the reference (%.3g)", mode, worst);
+        CHECK(bk.dev == (mode ? N : N - 6), "stream rows %d: %llu of %d assignments on the device", mode, bk.dev, N);
+        vkt_shutdown();
+    }
+    CHECK(kept[0] == 6 && streamed[0] == N - 6,
+          "stream rows fixed: the rule kept %llu rows and streamed %llu (6 and 42 expected)", kept[0], streamed[0]);
+    CHECK(kept[1] == 0 && streamed[1] == N,
+          "stream rows adaptive: R=1 kept %llu rows and streamed %llu (0 and %d expected)", kept[1], streamed[1], N);
+    CHECK(cap[0] && cap[1] && rel(cap[0], cap[1], S * H) < 2e-3,
+          "stream rows adaptive: the outputs differ from the fixed rule's (%.3g)",
+          cap[0] && cap[1] ? rel(cap[0], cap[1], S * H) : -1.0);
+    printf("  fixed R=3: %llu of %d assignments streamed (6 one-row experts kept); adaptive R=1: %llu streamed, rows equal within %.1e\n",
+           streamed[0], N, streamed[1], cap[0] && cap[1] ? rel(cap[0], cap[1], S * H) : -1.0);
+    free(cap[0]); free(cap[1]);
+    model_free();
+    unsetenv("COLI_VK_TIER_RATE"); unsetenv("COLI_VK_TIER_STREAM_SLOTS");
+    unsetenv("COLI_VK_TIER_STREAM_ROWS"); unsetenv("COLI_VK_TIER_STREAM_ROWS_ADAPTIVE");
+    unsetenv("COLI_VK_TIER_FILL");
+}
 /* ---- the stream ring (COLI_VK_TIER_STREAM_RING) ---------------------------------- */
 /* The ring's own reader: a counting hook that can cut its batches (the partial-batch
  * contract), park inside a read until the test lets it go or a bound passes (the
@@ -3971,6 +4029,7 @@ int main(int argc, char **argv) {
     printf("compute site alias cache:\n"); cs_alias_cache();
     printf("stream:\n"); stream();
     printf("stream batch:\n"); stream_batch();
+    printf("stream rows adaptive:\n"); stream_rows_adaptive();
     printf("stream ring:\n"); stream_ring();
     printf("layers:\n"); layers();
     printf("promote2:\n"); promote_partial_case();

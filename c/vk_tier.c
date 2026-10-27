@@ -342,6 +342,13 @@ static struct {
     unsigned long long rep_routed, rep_served;
     /* streaming (big prefill steps; see "streaming" below) */
     int st_ok, st_slots, st_n, st_per, st_half, st_rows_env, gemm_rows, st_par;
+    /* COLI_VK_TIER_STREAM_ROWS_ADAPTIVE: the R rule's floor is the measured break-even
+     * alone (1 before it exists), not the GEMM's rows -- the prefill keeps nothing on the
+     * CPU the upload does not pay for. st_group (COLI_VK_TIER_STREAM_GROUP) and st_pred
+     * (COLI_VK_TIER_STREAM_PRED) below: the inline fill groups' cap and the prefetch
+     * plan's row floor multiple. */
+    int st_rows_adapt, st_group;
+    double st_pred;
     VStage *st;
     double bw_up, cpu_row_ms;             /* measured: bytes per ms into a slot; CPU ms per (row, expert) */
     int big, big_fail, big_n, big_taken, said_fwd;
@@ -1541,11 +1548,17 @@ static int grow_rows(int need) {
  * its rows cost the CPU less than the upload. Until both are measured R = G.
  * COLI_VK_TIER_STREAM_ROWS=n fixes R at n (tests). A [VK] line per forward says what the
  * rule gave, and the run's line how much streamed and the R it settled at (an arm that
- * changes the load path moves bw_up, so R moves with it: compare arms at the same R). */
+ * changes the load path moves bw_up, so R moves with it: compare arms at the same R).
+ * COLI_VK_TIER_STREAM_ROWS_ADAPTIVE=1 drops the GEMM floor from the rule: R is the
+ * measured break-even alone, and 1 until the measurement exists -- the cs-timing2
+ * evidence class, where G=4 kept 5,408 rows (23.7 s) on the CPU while the run's own
+ * break-even (upload 1.69 ms against 4.391 ms a row) was under half a row. A cold
+ * expert of fewer rows than G still runs on the device, its rows through the per-row
+ * GEMV the batch takes below gemm_rows; a fixed COLI_VK_TIER_STREAM_ROWS keeps precedence. */
 static double vkt_now_ms(void);
 static int stream_min_rows(void) {
     if (T.st_rows_env > 0) return T.st_rows_env;
-    int r = T.gemm_rows;
+    int r = T.st_rows_adapt ? 1 : T.gemm_rows;   /* the armed rule's floor: the measurement's, else 1 */
     if (T.bw_up > 0 && T.cpu_row_ms > 0) {
         double up = (double)T.exp_bytes / T.bw_up, need = up / T.cpu_row_ms;
         if (need > 1e6) need = 1e6;
@@ -1890,10 +1903,14 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
         fprintf(stderr, VKT_TAG " tier %s stream: a step of %d rows; cold experts with %d rows or more go to the device (",
                 T.engine, S, R);
         if (T.st_rows_env > 0) fprintf(stderr, "COLI_VK_TIER_STREAM_ROWS");
+        else if (T.st_rows_adapt && !(T.bw_up > 0 && T.cpu_row_ms > 0))
+            fprintf(stderr, "1 row until the upload and the CPU's rows are measured (COLI_VK_TIER_STREAM_ROWS_ADAPTIVE)");
         else if (T.bw_up > 0 && T.cpu_row_ms > 0)
-            fprintf(stderr, "an upload of %s at %.1f GB/s takes %.3f ms, the CPU %.4f ms a row; the GEMM from %d rows",
+            fprintf(stderr, "an upload of %s at %.1f GB/s takes %.3f ms, the CPU %.4f ms a row; %s",
                     human((double)T.exp_bytes, hb, sizeof hb), T.bw_up / 1e6, (double)T.exp_bytes / T.bw_up,
-                    T.cpu_row_ms, T.gemm_rows);
+                    T.cpu_row_ms,
+                    T.st_rows_adapt ? "the measured break-even alone (COLI_VK_TIER_STREAM_ROWS_ADAPTIVE)"
+                                    : "the GEMM from more rows");
         else fprintf(stderr, "the GEMM's %d rows: the upload and the CPU's rows not measured yet", T.gemm_rows);
         fprintf(stderr, "); layer %d: %d resident, %d streamed (%d of them copied from the host pool), %d kept on the CPU (%d rows)",
                 layer, ndev, nst, npool, nkept, kept_rows);
@@ -4182,6 +4199,20 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         if (T.st_ok) {
             T.st_slots = slots;
             T.st_rows_env = sr && *sr ? atoi(sr) : 0;
+            {   /* COLI_VK_TIER_STREAM_ROWS_ADAPTIVE: the rule's floor the measurement's */
+                const char *sa = getenv("COLI_VK_TIER_STREAM_ROWS_ADAPTIVE");
+                T.st_rows_adapt = sa && *sa && atoi(sa) != 0;
+            }
+            {   /* COLI_VK_TIER_STREAM_GROUP: the inline fill groups' cap (the sub-batch's
+                 * room by default); COLI_VK_TIER_STREAM_PRED: the prefetch plan's floor */
+                const char *sg = getenv("COLI_VK_TIER_STREAM_GROUP");
+                T.st_group = sg && *sg ? atoi(sg) : 0;
+                if (T.st_group < 0) T.st_group = 0;
+                if (T.st_group > 64) T.st_group = 64;   /* the fill group's arrays are 64 wide */
+                T.st_pred = 1.0;
+                const char *spe = getenv("COLI_VK_TIER_STREAM_PRED");
+                if (spe && *spe) { T.st_pred = atof(spe); if (!(T.st_pred >= 0.0)) T.st_pred = 1.0; }
+            }
             /* a sub-batch's rows: its x rows within 32 MiB (a card without Resizable BAR
              * keeps them in its host-visible window) */
             long hr = (32L << 20) / ((long)T.c.hidden * 4);
@@ -4308,6 +4339,12 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
             T.balance ? ", balanced against the CPU" : "", T.sync ? ", uploads awaited (COLI_VK_TIER_SYNC)" : "");
     if (T.st_ok) {
         fprintf(stderr, ", streaming cold experts of prompt steps through %d slots", T.st_slots);
+        if (T.st_rows_adapt)
+            fprintf(stderr, ", the R rule the measured break-even's (COLI_VK_TIER_STREAM_ROWS_ADAPTIVE)");
+        if (T.st_group > 0)
+            fprintf(stderr, ", inline fill groups of up to %d experts (COLI_VK_TIER_STREAM_GROUP)", T.st_group);
+        if (T.st_pred != 1.0)
+            fprintf(stderr, ", the prefetch plan's floor %.2f x R (COLI_VK_TIER_STREAM_PRED)", T.st_pred);
         if (T.ring_on) fprintf(stderr, ", the stream ring on (COLI_VK_TIER_STREAM_RING)");
         if (T.ring_cold) fprintf(stderr, ", its cold layers whole-layer (COLI_VK_TIER_STREAM_RING_COLD)");
     }
@@ -4453,7 +4490,8 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
                 "prefetched %llu (%llu used), %llu cold experts (%llu rows) kept on the CPU, R=%d%s",
                 T.st_steps, T.st_experts, human((double)T.st_bytes, hs, sizeof hs),
                 T.st_up_ms > 0 ? (double)T.st_bytes / T.st_up_ms / 1e6 : 0.0, T.st_rows, T.st_subs, T.pf_n, T.pf_used,
-                T.st_kept, T.st_kept_rows, stream_min_rows(), T.st_rows_env > 0 ? " (fixed)" : "");
+                T.st_kept, T.st_kept_rows, stream_min_rows(),
+                T.st_rows_env > 0 ? " (fixed)" : T.st_rows_adapt ? " (adaptive)" : "");
         if (T.st_sums) fprintf(stderr, ", %llu steps summed on the device", T.st_sums);
         if (T.ring_jobs) fprintf(stderr, ", the ring %llu jobs (%llu experts)", T.ring_jobs, T.ring_experts);
         if (T.pc_experts) {
