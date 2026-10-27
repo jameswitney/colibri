@@ -2198,7 +2198,8 @@ static int join_big(const float **rows) {
 
 /* layer's likely streamed experts, best first: the prediction's rows per expert where
  * the layer has a big step behind it (T.pred), else the heat; the resident and the
- * below-rule ones never make the list. cand must hold T.c.experts ints; returns the
+ * below-rule ones never make the list (the rule's floor times COLI_VK_TIER_STREAM_PRED,
+ * above). cand must hold T.c.experts ints; returns the
  * count, capped at `cap`. Called on the engine thread (the slot table is read).
  * `whole` (the ring's cold branch, COLI_VK_TIER_STREAM_RING_COLD) drops the below-rule
  * filter: with no prediction to scale at the coming step's S there is nothing to hold
@@ -2207,6 +2208,12 @@ static int join_big(const float **rows) {
 static int st_prefetch_plan(int layer, int S, int *cand, int cap, int whole) {
     const int E = T.c.experts, K = T.c.topk;
     int R = stream_min_rows();
+    /* COLI_VK_TIER_STREAM_PRED (default 1, byte-identical): the plan's row floor is R
+     * times it. >1 tightens coverage -- the cs-timing2 over-fetch was 2,176 of 12,550
+     * prefetched experts unused (~27.9 GB of reads and uploads), the plan's low-row
+     * tail; a trimmed expert that does route falls back to the inline fill at the step
+     * (the `whole` branch keeps its filter dropped either way, as before). */
+    const double floor = (double)R * T.st_pred;
     double *est = malloc((size_t)E * sizeof(double));
     if (!est) return 0;
     double tot = 0;
@@ -2223,7 +2230,7 @@ static int st_prefetch_plan(int layer, int S, int *cand, int cap, int whole) {
     if (tot > 0 || whole)
         for (int e = 0; e < E; e++) {
             VSlot *v = slot(layer, e);
-            if (v->state == VS_RESIDENT || (est[e] < R && !whole)) continue;
+            if (v->state == VS_RESIDENT || (est[e] < floor && !whole)) continue;
             int at = nc;
             while (at > 0 && est[cand[at - 1]] < est[e]) { cand[at] = cand[at - 1]; at--; }
             cand[at] = e;

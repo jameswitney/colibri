@@ -1925,6 +1925,79 @@ static void stream_group(void) {
     unsetenv("COLI_VK_TIER_STREAM_ROWS"); unsetenv("COLI_VK_TIER_STREAM_GROUP");
     unsetenv("COLI_VK_TIER_FILL");
 }
+/* COLI_VK_TIER_STREAM_PRED: the prefetch plan's coverage. A layer's prediction is
+ * established by one step, then the next same-shape step's prefetch runs twice -- at
+ * the default floor (R) and tightened (3x): the plan keeps only the experts whose
+ * predicted rows clear the higher floor, the trimmed ones fall to the inline fill at
+ * the step, and the step's rows are byte-identical either way. */
+static void stream_pred(void) {
+    VktFmt f = {VKT_SRC_I4U_PAIRS_GS, 64};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    set_budget(16, f, f);
+    setenv("COLI_VK_TIER_RATE", "0", 1);
+    setenv("COLI_VK_TIER_STREAM_SLOTS", "8", 1);
+    setenv("COLI_VK_TIER_STREAM_ROWS", "3", 1);
+    setenv("COLI_VK_TIER_FILL", "0", 1);
+    uint32_t hist[L][E], *rows[L];
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = e < 2 ? 100 - e : 0; }
+    enum { S = 16, N = S * K };
+    int idx[N]; float w[N];
+    /* experts 2..9 all above R (3): their predicted rows are 6,6,6,6,6,6,6,6 -- one of
+     * them (9 rows) is the only one above a 3x floor */
+    for (int i = 0; i < N; i++) w[i] = 0.5f;
+    for (int i = 0; i < 9; i++) idx[i] = 9;                      /* the one hot expert: 9 rows */
+    for (int i = 9; i < 15; i++) idx[i] = 2;
+    for (int i = 15; i < 21; i++) idx[i] = 3;
+    for (int i = 21; i < 27; i++) idx[i] = 4;
+    for (int i = 27; i < 33; i++) idx[i] = 5;
+    for (int i = 33; i < 39; i++) idx[i] = 6;
+    for (int i = 39; i < 45; i++) idx[i] = 7;
+    for (int i = 45; i < 48; i++) idx[i] = 8;
+    float *cap[2] = {0};
+    int got[2] = {0, 0}, loads[2] = {0, 0};
+    for (int mode = 0; mode < 2; mode++) {
+        if (mode) setenv("COLI_VK_TIER_STREAM_PRED", "3", 1); else unsetenv("COLI_VK_TIER_STREAM_PRED");
+        rng = 7;
+        VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+        vc.load = load_cb; vc.release = release_cb;
+        int on = vkt_init(&vc, rows);
+        CHECK(on, "stream pred %d: the tier did not start", mode);
+        if (!on) break;
+        int pl[L * E], pe[L * E], np = vkt_plan(pl, pe, L * E);
+        for (int i = 0; i < np; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+        vkt_put_done();
+        cap[mode] = malloc(sizeof(float) * (size_t)S * H);
+        {   /* the prediction's step: same shape, no prefetch yet */
+            Books bk = {0, 0}; unsigned long long st = 0, kp = 0;
+            vkt_begin_forward();
+            stream_step(1, S, idx, w, 0, &bk, &st, &kp, 0, NULL);
+        }
+        g_loads = 0;
+        got[mode] = vkt_stream_prefetch(1, S);
+        int pref_loads = g_loads;   /* the prefetch's own reads, apart from the step's */
+        Books bk = {0, 0}; unsigned long long streamed = 0, kept = 0;
+        vkt_begin_forward();
+        double worst = stream_step(1, S, idx, w, 0, &bk, &streamed, &kept, 0, cap[mode]);
+        CHECK(worst < 2e-3, "stream pred %d: rows off the reference (%.3g)", mode, worst);
+        CHECK(streamed == N && kept == 0, "stream pred %d: %llu streamed, %llu kept", mode, streamed, kept);
+        CHECK(pref_loads == got[mode], "stream pred %d: the prefetch read %d of the %d it filled", mode, pref_loads, got[mode]);
+        loads[mode] = g_loads - pref_loads;
+        vkt_shutdown();
+    }
+    CHECK(got[0] == 8, "stream pred default: the plan prefetched %d of the 8 above-R experts", got[0]);
+    CHECK(got[1] == 1, "stream pred armed: the 3x floor kept %d experts (the one 9-row expert expected)", got[1]);
+    CHECK(loads[0] == 0 && loads[1] == 7,
+          "stream pred: %d inline loads at the default, %d armed (the trimmed fall back)", loads[0], loads[1]);
+    CHECK(cap[0] && cap[1] && memcmp(cap[0], cap[1], sizeof(float) * (size_t)S * H) == 0,
+          "stream pred: the outputs differ between the floors");
+    printf("  default floor R: %d of 8 prefetched, %d step loads; 3x floor: %d prefetched, %d step loads, outputs byte-identical\n",
+           got[0], loads[0], got[1], loads[1]);
+    free(cap[0]); free(cap[1]);
+    model_free();
+    unsetenv("COLI_VK_TIER_RATE"); unsetenv("COLI_VK_TIER_STREAM_SLOTS");
+    unsetenv("COLI_VK_TIER_STREAM_ROWS"); unsetenv("COLI_VK_TIER_STREAM_PRED");
+    unsetenv("COLI_VK_TIER_FILL");
+}
 /* ---- the stream ring (COLI_VK_TIER_STREAM_RING) ---------------------------------- */
 /* The ring's own reader: a counting hook that can cut its batches (the partial-batch
  * contract), park inside a read until the test lets it go or a bound passes (the
@@ -4100,6 +4173,7 @@ int main(int argc, char **argv) {
     printf("stream batch:\n"); stream_batch();
     printf("stream rows adaptive:\n"); stream_rows_adaptive();
     printf("stream group:\n"); stream_group();
+    printf("stream pred:\n"); stream_pred();
     printf("stream ring:\n"); stream_ring();
     printf("layers:\n"); layers();
     printf("promote2:\n"); promote_partial_case();
