@@ -2496,6 +2496,7 @@ static long slab_cap(void) {
     }
     return cap;
 }
+int coli_vk_slab_cap(void) { return (int)slab_cap(); }   /* the tier's keepalive cache stays under the live-import cap */
 int coli_vk_slab_import(const void *slab, size_t bytes, ColiVkSlab **out) {
     size_t al = coli_vk_import_alignment();
     if (!al || !slab || !bytes || !out || !G.ready) return 0;
@@ -2546,6 +2547,13 @@ void coli_vk_slab_unref(ColiVkSlab *r) {
     }
     free(r);
 }
+void coli_vk_slab_ref(ColiVkSlab *r) {   /* one more keepalive reference (the tier's alias cache) */
+    if (!r) return;
+    pthread_mutex_lock(&g_slabs.mx);
+    r->refs++;
+    pthread_mutex_unlock(&g_slabs.mx);
+}
+size_t coli_vk_slab_bytes(const ColiVkSlab *r) { return r ? r->bytes : 0; }   /* the imported bytes a reference pins */
 /* one record of the slab as a buffer bound into the imported memory at `off` bytes
  * into the caller's slab: the descriptor paths bind their buffers whole (offset 0),
  * so a record needs its own handle into the same pages, as a pool range has its own */

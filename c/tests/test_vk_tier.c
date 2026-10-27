@@ -2548,6 +2548,160 @@ static void cs_group(void) {
     cs_grow();        /* EXPERTS + DECODE_GROW: the aliased selections still install, > 2e-2 */
     unsetenv("COLI_VK_TIER_SYNC");   /* the suite's next cases (the stream ring) expect it unset */
 }
+
+/* One aliased expert's store slab carrying TWO copies of the same records at different
+ * offsets (the same slab pointer, two geometries): the slot-rewrite leg of the alias
+ * cache reuses the pointer with a new geometry and must invalidate the old entry. */
+static int cs_alias_slab2(int layer, int eid, VktAliasSrc *a, VktAliasSrc *b, void **slab_out) {
+    if (!coli_vk_import_alignment()) return 0;
+    const Ex *e = &ex[layer][eid];
+    const Mat *m[3] = {&e->g, &e->u, &e->d};
+    size_t woff[2][3], soff[2][3], cap = 0;
+    for (int copy = 0; copy < 2; copy++) {
+        for (int k = 0; k < 3; k++) {
+            size_t rb = row_bytes(m[k]->f.kind, m[k]->I), wb = rb * (size_t)m[k]->O;
+            size_t nb = (size_t)m[k]->O * (((size_t)m[k]->I + 31) / 32);   /* fmt 15: one ue8m0 byte a group */
+            size_t sb = (nb + 3) / 4 * 4;
+            woff[copy][k] = (cap + 4095) / 4096 * 4096; cap = woff[copy][k] + wb;
+            soff[copy][k] = (cap + 4095) / 4096 * 4096; cap = soff[copy][k] + sb;
+        }
+    }
+    cap = (cap + 4095) / 4096 * 4096;
+    uint8_t *slab = NULL;
+    if (posix_memalign(slab_out, 4096, cap) != 0 || !(slab = *slab_out)) return 0;
+    memset(slab, 0, cap);
+    for (int copy = 0; copy < 2; copy++) {
+        for (int k = 0; k < 3; k++) {
+            size_t rb = row_bytes(m[k]->f.kind, m[k]->I);
+            size_t nb = (size_t)m[k]->O * (((size_t)m[k]->I + 31) / 32);
+            memcpy(slab + woff[copy][k], m[k]->codes, rb * (size_t)m[k]->O);
+            memcpy(slab + soff[copy][k], m[k]->scales, nb);
+        }
+    }
+    memset(a, 0, sizeof(*a));
+    memset(b, 0, sizeof(*b));
+    a->slab = b->slab = slab; a->bytes = b->bytes = cap; a->fmt = b->fmt = 15; a->gs = b->gs = 32;
+    for (int k = 0; k < 3; k++) {
+        a->woff[k] = woff[0][k]; a->soff[k] = soff[0][k];
+        b->woff[k] = woff[1][k]; b->soff[k] = soff[1][k];
+        a->I[k] = b->I[k] = m[k]->I; a->O[k] = b->O[k] = m[k]->O;
+    }
+    return 1;
+}
+/* the report's cs alias cache clause, parsed for the keepalive books */
+static void cs_cache_report(const char *line, int *n, size_t *bytes,
+                            unsigned long long *hits, unsigned long long *misses,
+                            unsigned long long *evicts) {
+    *n = -1; *bytes = 0; *hits = *misses = *evicts = ~0ull;
+    const char *p = strstr(line, "cs alias cache: ");
+    if (!p || sscanf(p, "cs alias cache: %d entries, %zu bytes (%*[^)]), %llu hits, %llu misses, %llu evictions",
+                     n, bytes, hits, misses, evicts) != 5)
+        { *n = -1; *bytes = 0; *hits = *misses = *evicts = ~0ull; }
+}
+/* COLI_VK_TIER_CS_ALIAS_CACHE: the tier-owned keepalive for the compute site's aliased
+ * slabs -- a decode expert's store slab is imported once at its exact geometry and reused
+ * across joins (a hit), a slot rewritten in place to another geometry invalidates the old
+ * entry and re-imports, and the byte bound retires the coldest entries at the join. */
+static void cs_alias_cache(void) {
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    static const int route[K] = {0, 1, 2};
+    float w[K] = {0.5f, 0.3f, 0.2f};
+    /* leg A: the hit and the slot rewrite (same slab pointer, a second copy's geometry) */
+    rng = 7;
+    model_make(f, f); g_act = VKT_ACT_SWIGLU_V4; g_limit = 10.0f;
+    uint32_t hist[L][E], *rows[L];
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = 0; }
+    hist[0][0] = 100; hist[0][1] = 90;
+    setenv("COLI_VK_TIER_EXPERTS", "1", 1);
+    setenv("COLI_VK_TIER_CS_ALIAS_CACHE", "1", 1);
+    unsetenv("COLI_VK_TIER_CS_ALIAS_CACHE_MB");
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    set_budget(2, f, f);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU_V4, 10.0f);
+    CHECK(vkt_init(&vc, rows), "cs alias cache: the tier did not start");
+    int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+    for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+    vkt_put_done();
+    CHECK(n == 2, "cs alias cache: %d warm of 2 planned", n);
+    VktAliasSrc a, b; void *slab = NULL;
+    CHECK(cs_alias_slab2(0, 2, &a, &b, &slab), "cs alias cache: the dual-copy slab did not build");
+    VktAliasSrc src[K] = {{0}, {0}, a};
+    Books bk = {0, 0}; double worst = 0; unsigned long long aliased = 0;
+    char line[4096]; int cn; size_t cb; unsigned long long ch, cm, cev;
+
+    vkt_begin_forward();
+    double r = cs_group_step(0, route, w, src, 1, 10.0f, 1, &bk, &aliased);
+    if (r > worst) worst = r;
+    report_line(line, sizeof line);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev);
+    CHECK(ch == 0 && cm == 1 && cn == 1 && cev == 0, "cs alias cache: first use %llu hits, %llu misses, %d entries, %llu evictions (want 0/1/1/0)", ch, cm, cn, cev);
+
+    vkt_begin_forward();
+    r = cs_group_step(0, route, w, src, 1, 10.0f, 1, &bk, &aliased);
+    if (r > worst) worst = r;
+    report_line(line, sizeof line);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev);
+    CHECK(ch == 1 && cm == 1 && cn == 1 && cev == 0, "cs alias cache: the same geometry reused %llu hits, %llu misses, %d entries, %llu evictions (want 1/1/1/0)", ch, cm, cn, cev);
+
+    src[2] = b;   /* the slot rewritten in place: same slab, the second copy's geometry */
+    vkt_begin_forward();
+    r = cs_group_step(0, route, w, src, 1, 10.0f, 1, &bk, &aliased);
+    if (r > worst) worst = r;
+    report_line(line, sizeof line);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev);
+    CHECK(ch == 1 && cm == 2 && cn == 1 && cev == 1, "cs alias cache: the slot rewrite re-imported %llu hits, %llu misses, %d entries, %llu evictions (want 1/2/1/1)", ch, cm, cn, cev);
+
+    vkt_begin_forward();
+    r = cs_group_step(0, route, w, src, 1, 10.0f, 1, &bk, &aliased);
+    if (r > worst) worst = r;
+    report_line(line, sizeof line);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev);
+    CHECK(ch == 2 && cm == 2 && cn == 1 && cev == 1, "cs alias cache: the rewritten geometry reused %llu hits, %llu misses, %d entries, %llu evictions (want 2/2/1/1)", ch, cm, cn, cev);
+    CHECK(no_nan(worst) < 2e-2, "cs alias cache: rows off the reference (%.3g)", no_nan(worst));
+    CHECK(aliased > 0, "cs alias cache: no aliased selection flew");
+    vkt_shutdown();
+    free(slab);
+    model_free();
+
+    /* leg B: the byte bound retires the coldest entries at the join (1 MiB over 30 slabs) */
+    rng = 7;
+    model_make(f, f); g_act = VKT_ACT_SWIGLU_V4; g_limit = 10.0f;
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = 0; }
+    hist[0][0] = 100; hist[0][1] = 90;
+    setenv("COLI_VK_TIER_CS_ALIAS_CACHE_MB", "1", 1);
+    set_budget(2, f, f);
+    CHECK(vkt_init(&vc, rows), "cs alias cache bound: the tier did not start");
+    n = vkt_plan(pl, pe, L * E);
+    for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+    vkt_put_done();
+    CHECK(n == 2, "cs alias cache bound: %d warm of 2 planned", n);
+    enum { NB = 30 };
+    void *slabs[NB];
+    for (int i = 0; i < NB; i++) slabs[i] = NULL;
+    Books bkb = {0, 0}; double worstb = 0;
+    for (int i = 0; i < NB; i++) {
+        VktAliasSrc as;
+        CHECK(cs_alias_slab(0, 2, &as, &slabs[i]), "cs alias cache bound: slab %d did not build", i);
+        VktAliasSrc srcc[K] = {{0}, {0}, as};
+        vkt_begin_forward();
+        double rb = cs_group_step(0, route, w, srcc, 1, 10.0f, 1, &bkb, NULL);
+        if (rb > worstb) worstb = rb;
+    }
+    report_line(line, sizeof line);
+    cs_cache_report(line, &cn, &cb, &ch, &cm, &cev);
+    CHECK(cev > 0, "cs alias cache bound: no byte-bound eviction (%d entries, %zu bytes, %llu evictions)", cn, cb, cev);
+    CHECK(cb <= 1048576u, "cs alias cache bound: %zu bytes held over the 1 MiB cap", cb);
+    CHECK(cn < NB, "cs alias cache bound: %d entries still held of %d", cn, NB);
+    CHECK(no_nan(worstb) < 2e-2, "cs alias cache bound: rows off the reference (%.3g)", no_nan(worstb));
+    vkt_shutdown();
+    for (int i = 0; i < NB; i++) free(slabs[i]);
+    model_free();
+    unsetenv("COLI_VK_TIER_CS_ALIAS_CACHE");
+    unsetenv("COLI_VK_TIER_CS_ALIAS_CACHE_MB");
+    unsetenv("COLI_VK_TIER_SYNC");
+    unsetenv("COLI_VK_TIER_EXPERTS");
+}
 /* The hot set overlay (COLI_VK_TIER_HOT): the history's top share of the resident places,
  * ranked on the RAW counts, marked on the slots and skipped by every victim path. The
  * history names layer 0 ten times hotter than layer 1, so the global ranking and the
@@ -3699,6 +3853,7 @@ int main(int argc, char **argv) {
     printf("decode grow:\n"); decode_grow(dg_leg);
     printf("DeepSeek V4:\n"); v4_act();
     printf("compute site:\n"); cs_group();
+    printf("compute site alias cache:\n"); cs_alias_cache();
     printf("stream:\n"); stream();
     printf("stream batch:\n"); stream_batch();
     printf("stream ring:\n"); stream_ring();

@@ -72,6 +72,20 @@ typedef struct { int layer, eid, ok, copy_failed; ColiVkTensor *g, *u, *d, *hg, 
 enum { SS_FREE = 0, SS_FILLED, SS_BUSY };
 typedef struct { ColiVkTensor *t[3]; ColiVkExpert *ex; int layer, eid, state, pending, pref; } VStage;
 typedef struct { int n, nslot, cap, *slot; float **yout; } VSub;
+/* One tier-owned CS alias keepalive (COLI_VK_TIER_CS_ALIAS_CACHE): the exact alias-source
+ * geometry as the key -- slab pointer and bytes beside woff/soff, fmt, I/O and gs, so a slot
+ * rewritten to another expert's geometry (or reallocated elsewhere) is a different entry -- and
+ * the one slab reference the cache holds across joins (the tensors' own references ride the
+ * in-flight group and go at its join). imp_bytes is the slab's imported bytes, the MB bound's
+ * charge; seq is the LRU stamp. */
+typedef struct {
+    const void *slab; size_t bytes;
+    size_t woff[3], soff[3];
+    int I[3], O[3], fmt, gs;
+    ColiVkSlab *imp;
+    size_t imp_bytes;
+    unsigned long long seq;
+} VCsAlias;
 
 static struct {
     int on;
@@ -258,6 +272,17 @@ static struct {
     int csx, cs_pending, cs_layer;
     ColiVkExpert **cs_ex; int cs_nex, cs_cex;
     unsigned long long cs_groups, cs_res, cs_alias, cs_fallback, cs_refuse;
+    /* the CS alias keepalive cache (COLI_VK_TIER_CS_ALIAS_CACHE, CS-1c): a tier-owned
+     * hold on each aliased store slab across the group's join, so a decode expert's
+     * slab is imported once and reused at its exact geometry, not re-imported every
+     * token. Byte-bound by cs_cache_cap (COLI_VK_TIER_CS_ALIAS_CACHE_MB, 4096 when
+     * armed), count-bound by the backend's live-import cap, LRU-evicted at the join
+     * (never while a group is in flight). */
+    int cs_cache;
+    size_t cs_cache_cap;
+    VCsAlias *cs_cache_e; int cs_cache_n, cs_cache_capn;
+    size_t cs_cache_bytes;
+    unsigned long long cs_cache_seq, cs_cache_hits, cs_cache_misses, cs_cache_evicts;
     /* CS diagnostics (COLI_VK_CHAIN_DPROF=1 only): the deferred group's window split,
      * double-ms + counts; all zero and untimed unless the gate is on. They reconcile
      * against the decode dprof line's waited/device/CPU (see vkt_report's cs dprof):
@@ -2893,6 +2918,77 @@ static void cs_ex_release(void) {
     if (vkt_cs_dprof()) { T.cs_release_ms += vkt_now_ms() - t0; T.cs_release_n++; }
     T.cs_nex = 0;
 }
+
+/* ---- the CS alias keepalive cache (COLI_VK_TIER_CS_ALIAS_CACHE) -------------------- */
+static int cs_cache_key_eq(const VCsAlias *e, const VktAliasSrc *s) {
+    if (e->slab != s->slab || e->bytes != s->bytes || e->fmt != s->fmt || e->gs != s->gs) return 0;
+    for (int k = 0; k < 3; k++)
+        if (e->woff[k] != s->woff[k] || e->soff[k] != s->soff[k] || e->I[k] != s->I[k] || e->O[k] != s->O[k]) return 0;
+    return 1;
+}
+static int cs_cache_find(const VktAliasSrc *s) {
+    if (!T.cs_cache) return -1;
+    for (int i = 0; i < T.cs_cache_n; i++)
+        if (cs_cache_key_eq(&T.cs_cache_e[i], s)) return i;
+    return -1;
+}
+/* the slab pointer is the store slot's own buffer (one slot, one record): a new geometry
+ * at the same pointer is the slot rewritten in place, so the old entry -- still pinning
+ * those pages -- is dropped before the new import reads what the slot now holds */
+static int cs_cache_find_slab(const void *slab) {
+    if (!T.cs_cache || !slab) return -1;
+    for (int i = 0; i < T.cs_cache_n; i++)
+        if (T.cs_cache_e[i].slab == slab) return i;
+    return -1;
+}
+static void cs_cache_drop(int i) {
+    VCsAlias *e = &T.cs_cache_e[i];
+    coli_vk_slab_unref(e->imp);   /* the keepalive reference: the last one frees the import */
+    T.cs_cache_bytes -= e->imp_bytes;
+    T.cs_cache_n--;
+    if (i < T.cs_cache_n) T.cs_cache_e[i] = T.cs_cache_e[T.cs_cache_n];
+    T.cs_cache_evicts++;
+}
+static void cs_cache_drop_lru(void) {
+    int bi = -1;
+    unsigned long long bs = ~0ull;
+    for (int i = 0; i < T.cs_cache_n; i++)
+        if (T.cs_cache_e[i].seq < bs) { bs = T.cs_cache_e[i].seq; bi = i; }
+    if (bi >= 0) cs_cache_drop(bi);
+}
+/* the byte bound is retired at the join, after the group's tensors are gone: evicting
+ * here can free a slab the batch no longer reads (never while it is in flight) */
+static void cs_cache_evict_bytes(void) {
+    if (!T.cs_cache) return;
+    while (T.cs_cache_n && T.cs_cache_bytes > T.cs_cache_cap) cs_cache_drop_lru();
+}
+static void cs_cache_insert(const VktAliasSrc *s, ColiVkSlab *r) {
+    long cap = coli_vk_slab_cap();   /* the live-import count cap: keep one slot free so the next fresh alias can import before the cache retires a hold */
+    if (cap <= 1) return;            /* 0/1: no room for a keepalive beside the one live import */
+    while (T.cs_cache_n && (long)T.cs_cache_n >= cap - 1) cs_cache_drop_lru();
+    if (T.cs_cache_n == T.cs_cache_capn) {
+        int nc = T.cs_cache_capn ? T.cs_cache_capn * 2 : 16;
+        VCsAlias *a = realloc(T.cs_cache_e, (size_t)nc * sizeof(*a));
+        if (!a) return;   /* no room for the hold: this group still uses the slab, its pages go at the join */
+        T.cs_cache_e = a; T.cs_cache_capn = nc;
+    }
+    VCsAlias *e = &T.cs_cache_e[T.cs_cache_n++];
+    memset(e, 0, sizeof *e);
+    e->slab = s->slab; e->bytes = s->bytes; e->fmt = s->fmt; e->gs = s->gs;
+    for (int k = 0; k < 3; k++) { e->woff[k] = s->woff[k]; e->soff[k] = s->soff[k]; e->I[k] = s->I[k]; e->O[k] = s->O[k]; }
+    e->imp = r;
+    e->imp_bytes = coli_vk_slab_bytes(r);
+    e->seq = ++T.cs_cache_seq;
+    T.cs_cache_bytes += e->imp_bytes;
+    coli_vk_slab_ref(r);   /* the keepalive reference beside the caller's own */
+}
+static void cs_cache_clear(void) {
+    if (!T.cs_cache_e) return;
+    for (int i = 0; i < T.cs_cache_n; i++) coli_vk_slab_unref(T.cs_cache_e[i].imp);
+    T.cs_cache_n = 0;
+    T.cs_cache_bytes = 0;
+}
+
 /* One aliased expert over its imported slab: CS-1a's capability, VktAliasSrc's three
  * records as ColiVkTensors and an expert of them. The import is refcounted by the
  * slab's own pages (a slot reused keeps it); this call's own reference goes back once
@@ -2905,8 +3001,21 @@ static ColiVkExpert *cs_alias_expert(const VktAliasSrc *s) {
             T.cs_refuse++;
             return NULL;
         }
+    int ci = -1;
+    if (T.cs_cache) {
+        ci = cs_cache_find(s);
+        if (ci >= 0) {
+            T.cs_cache_hits++;
+            T.cs_cache_e[ci].seq = ++T.cs_cache_seq;   /* the fresh store view (ptr+bytes) is the key match: the slot still holds this geometry */
+        } else {
+            T.cs_cache_misses++;
+            int pi = cs_cache_find_slab(s->slab);
+            if (pi >= 0) cs_cache_drop(pi);   /* the slot was rewritten: invalidate the old geometry's hold before the new import */
+        }
+    }
     ColiVkSlab *r;
     if (!coli_vk_slab_import(s->slab, s->bytes, &r)) { T.cs_refuse++; return NULL; }
+    if (T.cs_cache && ci < 0) cs_cache_insert(s, r);
     ColiVkTensor *t[3] = {NULL, NULL, NULL};
     int ok = 1;
     for (int k = 0; ok && k < 3; k++)
@@ -3073,6 +3182,7 @@ int vkt_join(const float **rows) {
     }
     T.d0_inflight = T.d2_inflight = 0;
     if (T.cs_nex) cs_ex_release();   /* the group's aliased experts: the batch is done, never freed in flight */
+    cs_cache_evict_bytes();          /* the keepalive byte bound retires here, after the batch's tensors gave way */
     double tw = vkt_now_ms() - t0;
     T.wait_ms += tw;
     T.dev_ms += dms + dms1; T.d2_ms += dms1;
@@ -3799,6 +3909,16 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         if (T.csx)
             fprintf(stderr, VKT_TAG " tier %s: cs experts armed (%d): decode's routed group -- the residents' handles and zero-copy store-slab aliases -- issues at the token's finish site%s\n",
                     eng, T.csx, T.csx == 2 ? ", composed with the decode-growth headroom arm" : "");
+        if (T.csx) {   /* CS-1c: the alias keepalive cache (off unless asked; the byte bound's default 4096) */
+            const char *ce = getenv("COLI_VK_TIER_CS_ALIAS_CACHE");
+            T.cs_cache = ce && *ce && atoi(ce) != 0 ? 1 : 0;
+            if (T.cs_cache) {
+                const char *me = getenv("COLI_VK_TIER_CS_ALIAS_CACHE_MB");
+                long mb = me && *me ? atol(me) : 4096;
+                if (mb < 0) mb = 0;
+                T.cs_cache_cap = (size_t)mb * 1048576u;
+            }
+        }
     }
     {
         ColiVkXbStats xs; coli_vk_xb_stats(&xs);
@@ -4050,6 +4170,12 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     if (T.cs_groups)   /* COLI_VK_TIER_EXPERTS: the finish-site group's own books (one group a layer-token) */
         fprintf(stderr, " | cs: %llu groups, %llu resident + %llu aliased entries on the device, %llu cpu-fallback (%llu alias refusals)",
                 T.cs_groups, T.cs_res, T.cs_alias, T.cs_fallback, T.cs_refuse);
+    if (T.cs_cache) {   /* CS-1c: the alias keepalive cache's standing (entries, pinned bytes, reuse) */
+        char hc[32];
+        fprintf(stderr, " | cs alias cache: %d entries, %zu bytes (%s), %llu hits, %llu misses, %llu evictions",
+                T.cs_cache_n, T.cs_cache_bytes, human((double)T.cs_cache_bytes, hc, sizeof hc),
+                T.cs_cache_hits, T.cs_cache_misses, T.cs_cache_evicts);
+    }
     if (dprof && T.cs_groups) {   /* COLI_VK_CHAIN_DPROF: the group's window split. Reconciliation against the
                                    * decode dprof line (all CS decode steps): CPU window = settle + build + issue
                                    * + residual (the serial CPU loop, 0 under CS); waited = fence + qread +
@@ -4296,6 +4422,7 @@ void vkt_shutdown(void) {
     if (coli_vk_available()) {
         quiesce();
         cs_ex_release();   /* a group abandoned mid-step: its transient aliases go with the rest */
+        cs_cache_clear();  /* the keepalive holds go with them (the device is idle here) */
         size_t n = (size_t)T.c.layers * T.c.experts;
         for (size_t i = 0; i < n; i++) {
             if (T.s[i].hex && T.s[i].hex != T.s[i].ex) coli_vk_xb_expert_free(T.s[i].hex);
@@ -4318,6 +4445,7 @@ void vkt_shutdown(void) {
     free(T.hot_order);
     free(T.bank_valid); free(T.bank_tried);
     free(T.dgrow_heat);
+    free(T.cs_cache_e);
     free(T.hy_of); free(T.hy_v); free(T.hy_hx); free(T.hy_x); free(T.hy_gu); free(T.hy_hh); free(T.hy_out); free(T.hy_w); free(T.hy_xb); free(T.hy_src); free(T.bpool);
     memset(&T, 0, sizeof T);
 }
