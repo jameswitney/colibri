@@ -4063,7 +4063,6 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
                     human(T.adapt_reserve + T.adapt_margin, hg, sizeof hg), T.adapt_cap ? " (capped)" : "");
         }
         }
-        }
     }
     {
         ColiVkXbStats xs; coli_vk_xb_stats(&xs);
