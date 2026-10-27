@@ -312,6 +312,7 @@ static struct {
     unsigned long long cs_settle_n;
     double cs_lookup_ms;               /* B: the group's entry loop (resident lookup + alias builds) */
     double cs_alias_ms;                /* B: cs_alias_expert's span, a subset of cs_lookup_ms */
+    double cs_alias_hit_ms, cs_alias_miss_ms;   /* B: the same span by the cache's outcome (a hit rode the keepalive, a miss built the entry) -- the bench wave's effectiveness read, beside the backend's create/hit import split */
     double cs_xbex_ms;                 /* B: coli_vk_xb_expert's span, a subset of cs_alias_ms */
     double cs_import_ms;               /* B: coli_vk_slab_import's span, a subset of cs_alias_ms (the import
                                         * churn's own time, beside the backend's create/hit split) */
@@ -3201,8 +3202,13 @@ int vkt_issue_group(int layer, const float *x, int S, int K, const int *idx, con
         if (v->state == VS_RESIDENT && v->ex) { ex[i] = v->ex; res[i] = 1; }
         else if (src && src[i].slab) {
             double ta = vkt_cs_dprof() ? vkt_now_ms() : 0;
-            ex[i] = cs_alias_expert(layer, e, &src[i], NULL);
-            if (vkt_cs_dprof()) T.cs_alias_ms += vkt_now_ms() - ta;
+            int ahit = 0;
+            ex[i] = cs_alias_expert(layer, e, &src[i], &ahit);
+            if (vkt_cs_dprof()) {   /* the span and its outcome split: the cache's own wall, hit vs fresh */
+                double da = vkt_now_ms() - ta;
+                T.cs_alias_ms += da;
+                if (ahit) T.cs_alias_hit_ms += da; else T.cs_alias_miss_ms += da;
+            }
             if (ex[i] && !cs_ex_keep(ex[i])) {
                 coli_vk_xb_expert_free(ex[i]);   /* the kept list could not grow: not worth the batch's failure */
                 ex[i] = NULL;
@@ -4451,11 +4457,11 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
                                    * xb_expert are subsets of build (the lookup loop); release is a subset of
                                    * waited. resident bytes = resident entries * the tier's per-expert bytes. */
         ColiVkCsDiag cd; coli_vk_cs_diag(&cd);
-        fprintf(stderr, " | cs dprof: settle %.1f ms (%llu), build %.1f ms (%llu; alias %.1f, import %.1f (%llu), xb_expert %.1f), "
+        fprintf(stderr, " | cs dprof: settle %.1f ms (%llu), build %.1f ms (%llu; alias %.1f (hit %.1f / miss %.1f), import %.1f (%llu), xb_expert %.1f), "
                 "issue %.1f ms (%llu), fence %.1f ms, qread %.1f ms, device %.1f ms, release %.1f ms (%llu) | "
                 "slab import %llu create + %llu hit (create %.1f ms, hit %.1f ms), unref-zero %llu (%.1f ms), alias buffers %llu destroyed (%.1f ms) | "
                 "aliased %.1f MiB, resident %.1f MiB",
-                T.cs_settle_ms, T.cs_settle_n, T.cs_lookup_ms, T.cs_build_n, T.cs_alias_ms, T.cs_import_ms, T.cs_import_n, T.cs_xbex_ms,
+                T.cs_settle_ms, T.cs_settle_n, T.cs_lookup_ms, T.cs_build_n, T.cs_alias_ms, T.cs_alias_hit_ms, T.cs_alias_miss_ms, T.cs_import_ms, T.cs_import_n, T.cs_xbex_ms,
                 T.cs_issue_ms, T.cs_issue_n, T.cs_fence_ms, T.cs_qread_ms, T.cs_dev_ms, T.cs_release_ms, T.cs_release_n,
                 cd.slab_creates, cd.slab_hits, cd.slab_create_ms, cd.slab_hit_ms, cd.slab_zeros, cd.slab_zero_ms,
                 cd.alias_buf_destroys, cd.alias_buf_destroy_ms,

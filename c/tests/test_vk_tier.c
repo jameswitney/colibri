@@ -2933,7 +2933,7 @@ out:
  * GEMM infs its output column). One slab, two experts, one geometry: the miss records
  * the first expert's verdicts, its repeat skips, the rewrite to the second expert
  * rescans (and re-records), and its repeat skips again -- the rows right throughout. */
-static void cs_alias_scan_skip(void) {
+static void cs_alias_scan_skip(int dprof) {
     VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
     rng = 7;
     model_make(f, f); g_act = VKT_ACT_SWIGLU_V4; g_limit = 10.0f;
@@ -2999,6 +2999,18 @@ static void cs_alias_scan_skip(void) {
     report_line(line, sizeof line);
     cs_cache_report(line, &cn, &cb, &ch, &cm, &cev, &cs);
     CHECK(ch == 3 && cm == 1 && cs == 2, "cs scan skip: the second expert's hit skipped (%llu hits, %llu misses, %lld skips; want 3/1/2)", ch, cm, cs);
+    if (dprof) {   /* the DPROF split (c): the alias bucket by its outcome -- hit + miss
+                    * close on the total, both books fed by the same deltas */
+        double tot = 0, hv = 0, mv = 0;
+        const char *p = strstr(line, "; alias ");   /* the dprof clause's own 'alias', never the cache clause's */
+        int ok = p && sscanf(p, "; alias %lf (hit %lf / miss %lf)", &tot, &hv, &mv) == 3;
+        CHECK(ok, "cs scan skip: the dprof alias split did not parse");
+        if (ok) {
+            CHECK(hv >= 0 && mv >= 0, "cs scan skip: a negative alias split (%.3f / %.3f)", hv, mv);
+            CHECK(tot <= 0 || fabs(hv + mv - tot) <= 0.01 + 1e-3 * tot,
+                  "cs scan skip: the split misses the total (%.3f + %.3f vs %.3f)", hv, mv, tot);
+        }
+    }
     CHECK(no_nan(worst) < 2e-2, "cs scan skip: rows off the reference (%.3g)", no_nan(worst));
     vkt_shutdown();
     free(slab);
@@ -4117,6 +4129,12 @@ int main(int argc, char **argv) {
      * packed path, and packed_scales' shrink half asserts it at the unset default.
      * tier_fmt15() re-reads the env on every call (no cache), so the set's timing is
      * free; it stays at main's top regardless. */
+    /* the counters-split leg (c's): one invocation with COLI_VK_CHAIN_DPROF on from
+     * the top -- vk_tier.c caches the env at its first timing call, so it must be set
+     * before any tier activity; the whole suite runs with its buckets on (counts and
+     * walls only, the checked values unaffected) */
+    int dprof_leg = argc > 2 && !strcmp(argv[2], "dprof");
+    if (dprof_leg) setenv("COLI_VK_CHAIN_DPROF", "1", 1);
     int fmt15_leg = argc > 2 && !strcmp(argv[2], "fmt15");
     if (fmt15_leg) setenv("COLI_VK_TIER_FMT15", "1", 1);
     /* the decode-growth headroom legs' own invocation (see decode_grow's comment): their
@@ -4164,7 +4182,7 @@ int main(int argc, char **argv) {
     printf("compute site:\n"); cs_group();
     printf("compute site alias cache:\n"); cs_alias_cache();
     printf("compute site VA reuse:\n"); cs_alias_va_reuse();
-    printf("compute site scan skip:\n"); cs_alias_scan_skip();
+    printf("compute site scan skip:\n"); cs_alias_scan_skip(dprof_leg);
     printf("stream:\n"); stream();
     printf("stream batch:\n"); stream_batch();
     printf("stream ring:\n"); stream_ring();
