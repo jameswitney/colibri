@@ -2468,6 +2468,22 @@ struct ColiVkSlab {
     struct ColiVkSlab *next;
 };
 static struct { pthread_mutex_t mx; struct ColiVkSlab *live; int n; } g_slabs = {.mx = PTHREAD_MUTEX_INITIALIZER};
+/* ---- compute-site diagnostics (COLI_VK_CHAIN_DPROF=1 only) --------------------------
+ * The finish-site group's backend split: slab import create/hit, the aliased tensors'
+ * release (buffer destroys, the slab's unref-to-zero and its vkFreeMemory), and the xb
+ * batch's fence-wait/query-read CPU spans. All zero and untimed unless the gate is on;
+ * read once per report by vk_tier.c on the single-threaded engine path. */
+static int cs_dprof_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_DPROF"); on = e && *e && *e != '0' ? 1 : 0; }
+    return on;
+}
+static struct {
+    unsigned long long slab_creates, slab_hits;
+    unsigned long long slab_zeros; double slab_zero_ms;
+    unsigned long long alias_buf_destroys; double alias_buf_destroy_ms;
+} g_cs_diag;
+typedef struct { double fence_ms, qread_ms; unsigned long long fences, qreads; } XbCsDiag;
 /* live slab imports bound: past COLI_VK_TIER_EXPERTS_IMPORT_CAP (default 1408, under
  * the driver's maxMemoryAllocationCount) the import refuses -- the caller's experts
  * run on the CPU, the lever's refusal ladder */
@@ -2491,7 +2507,7 @@ int coli_vk_slab_import(const void *slab, size_t bytes, ColiVkSlab **out) {
              * reused keeps its pointer and size; anything else sharing the page is a
              * different slab the caller reallocated -- not ours to grow) */
             int ok = r->ptr == slab && r->user_bytes == bytes;
-            if (ok) { r->refs++; *out = r; }
+            if (ok) { r->refs++; *out = r; if (cs_dprof_on()) g_cs_diag.slab_hits++; }
             pthread_mutex_unlock(&g_slabs.mx);
             return ok;
         }
@@ -2505,6 +2521,7 @@ int coli_vk_slab_import(const void *slab, size_t bytes, ColiVkSlab **out) {
             r->base = base; r->ptr = slab; r->bytes = sz; r->user_bytes = bytes;
             r->buf = buf; r->mem = mem; r->refs = 1;
             r->next = g_slabs.live; g_slabs.live = r; g_slabs.n++;
+            if (cs_dprof_on()) g_cs_diag.slab_creates++;
             *out = r;
         } else {
             coli_vk_host_buffer_free(buf, mem, sz);
@@ -2522,7 +2539,11 @@ void coli_vk_slab_unref(ColiVkSlab *r) {
         if (*pp == r) { *pp = r->next; break; }
     g_slabs.n--;
     pthread_mutex_unlock(&g_slabs.mx);
-    if (G.ready) coli_vk_host_buffer_free(r->buf, r->mem, r->bytes);
+    if (G.ready) {
+        double t0 = cs_dprof_on() ? vk_now() : 0;
+        coli_vk_host_buffer_free(r->buf, r->mem, r->bytes);
+        if (cs_dprof_on()) { g_cs_diag.slab_zeros++; g_cs_diag.slab_zero_ms += vk_now() - t0; }
+    }
     free(r);
 }
 /* one record of the slab as a buffer bound into the imported memory at `off` bytes
@@ -4177,8 +4198,13 @@ static void tensor_release(ColiVkTensor *t) {
     if (t->slab) {   /* an aliased record of an imported slab: its two buffer handles and the slab's reference, no pool's */
         ColiVkSlab *r = t->slab;
         if (G.ready) {
+            double t0 = cs_dprof_on() ? vk_now() : 0;
             if (t->wbuf) vkDestroyBuffer(G.dev, t->wbuf, NULL);
             if (t->sbuf) vkDestroyBuffer(G.dev, t->sbuf, NULL);
+            if (cs_dprof_on()) {
+                g_cs_diag.alias_buf_destroys += (t->wbuf ? 1ull : 0ull) + (t->sbuf ? 1ull : 0ull);
+                g_cs_diag.alias_buf_destroy_ms += vk_now() - t0;
+            }
         }
         __atomic_sub_fetch(&g_import_bytes, t->wbytes, __ATOMIC_RELAXED);
         free(t);
@@ -4440,6 +4466,7 @@ typedef struct XbCtx {
     size_t *yoff; int nrows, cyoff;
     unsigned long long batches, experts, rows, gemm_experts;
     double dev_ms;
+    XbCsDiag csd;                  /* COLI_VK_CHAIN_DPROF: fence-wait/query-read CPU spans */
     /* COLI_VK_ACT_SWIGLU_V4: expert_act_v4.spv between the activation and down, its
      * row weights in the x buffer after each expert's rows (xb_v4_init) */
     VkShaderModule sh_v4; VkDescriptorSetLayout dsl_v4; VkPipelineLayout pl_v4; VkPipeline p_v4;
@@ -5810,7 +5837,10 @@ static int dev2_fault(void) {
 static int xb_join(XbCtx *X, const float **yrows, double *device_ms) {
     if (!X->inflight) return 0;
     X->inflight = 0;
+    int cd = cs_dprof_on();
+    double t0 = cd ? vk_now() : 0;
     VkResult r = !X->d && wait_fault() ? VK_TIMEOUT : vk_fence_wait(X->dev, X->fence);
+    if (cd) { X->csd.fence_ms += vk_now() - t0; X->csd.fences++; }
     if (r == VK_SUCCESS && X->d && dev2_fault()) r = VK_ERROR_DEVICE_LOST;
     if (r != VK_SUCCESS) {   /* no async_end: the batch may still run */
         fprintf(stderr, "[VK] %sexpert batch: fence wait failed (%d), %s\n", X->d ? "dev2 " : "", r,
@@ -5824,7 +5854,10 @@ static int xb_join(XbCtx *X, const float **yrows, double *device_ms) {
     double ms = 0;
     if (X->has_ts) {
         uint64_t ts[2];
-        if (vkGetQueryPoolResults(X->dev, X->qpool, 0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+        double t1 = cd ? vk_now() : 0;
+        VkResult qr = vkGetQueryPoolResults(X->dev, X->qpool, 0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT);
+        if (cd) { X->csd.qread_ms += vk_now() - t1; X->csd.qreads++; }
+        if (qr == VK_SUCCESS) {
             uint64_t mask = X->ts_bits >= 64 ? ~0ull : ((1ull << X->ts_bits) - 1);
             ms = (double)((ts[1] - ts[0]) & mask) * X->ts_period / 1e6;
         }
@@ -5854,6 +5887,19 @@ static void xb_stats(const XbCtx *X, ColiVkXbStats *st) {
 void coli_vk_xb_stats(ColiVkXbStats *st) { xb_stats(&g_xb[0], st); }
 void coli_vk_xb_stats_dev(int dev, ColiVkXbStats *st) {
     if (dev == 0 || dev == 1) xb_stats(&g_xb[dev], st); else memset(st, 0, sizeof(*st));
+}
+void coli_vk_cs_diag(ColiVkCsDiag *out) {
+    memset(out, 0, sizeof *out);
+    out->slab_creates = g_cs_diag.slab_creates;
+    out->slab_hits = g_cs_diag.slab_hits;
+    out->slab_zeros = g_cs_diag.slab_zeros;
+    out->slab_zero_ms = g_cs_diag.slab_zero_ms;
+    out->alias_buf_destroys = g_cs_diag.alias_buf_destroys;
+    out->alias_buf_destroy_ms = g_cs_diag.alias_buf_destroy_ms;
+    for (int d = 0; d < 2; d++) {
+        out->xb_fence_ms[d] = g_xb[d].csd.fence_ms; out->xb_fences[d] = g_xb[d].csd.fences;
+        out->xb_qread_ms[d] = g_xb[d].csd.qread_ms; out->xb_qreads[d] = g_xb[d].csd.qreads;
+    }
 }
 
 /* ---- sub-batches: a big prefill step as several batches, two in flight ----------------

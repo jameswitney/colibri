@@ -149,6 +149,9 @@ static const CuTierOps *cut_ops(void) {
 #define coli_vk_slab_import(...) (0)
 #define coli_vk_tensor_alias(...) (0)
 #define coli_vk_slab_unref(...) ((void)0)
+/* the Vulkan backend's CS diagnostics (backend_vulkan.h); the CUDA tier has no slab
+ * import, so vk_tier.c's report reads an all-zero snapshot */
+#define coli_vk_cs_diag(out) (memset((out), 0, sizeof *(out)))
 #define VKT_TAG "[CUDA]"
 #ifndef COLI_VULKAN
 #define COLI_VULKAN 1   /* vk_tier.c's body */

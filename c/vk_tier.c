@@ -258,6 +258,27 @@ static struct {
     int csx, cs_pending, cs_layer;
     ColiVkExpert **cs_ex; int cs_nex, cs_cex;
     unsigned long long cs_groups, cs_res, cs_alias, cs_fallback, cs_refuse;
+    /* CS diagnostics (COLI_VK_CHAIN_DPROF=1 only): the deferred group's window split,
+     * double-ms + counts; all zero and untimed unless the gate is on. They reconcile
+     * against the decode dprof line's waited/device/CPU (see vkt_report's cs dprof):
+     * per group CPU window = settle + lookup + issue + residual (the serial CPU loop,
+     * zero under CS); waited = fence + qread + release + residual join glue; device is
+     * the timestamp span. alias/xbex are subsets of lookup (which is itself the
+     * resident-lookup + alias-build loop), and release is a subset of waited. */
+    double cs_settle_ms;               /* A: defer -> group build entry (the loader's slide-join/read settle) */
+    unsigned long long cs_settle_n;
+    double cs_lookup_ms;               /* B: the group's entry loop (resident lookup + alias builds) */
+    double cs_alias_ms;                /* B: cs_alias_expert's span, a subset of cs_lookup_ms */
+    double cs_xbex_ms;                 /* B: coli_vk_xb_expert's span, a subset of cs_alias_ms */
+    unsigned long long cs_build_n;
+    double cs_issue_ms;                /* C: coli_vk_xb_issue_w/_dev's CPU span (the xb submit call) */
+    unsigned long long cs_issue_n;
+    double cs_fence_ms;                /* C: xb_join's fence-wait CPU span (backend, delta) */
+    double cs_qread_ms;                /* C: xb_join's query-pool-result read span (backend, delta) */
+    double cs_dev_ms;                  /* C: the group's device elapsed (timestamps) */
+    double cs_release_ms;              /* D: cs_ex_release's span, inside the join's waited */
+    unsigned long long cs_release_n;
+    unsigned long long cs_alias_bytes; /* E: aliased tensor bytes (weights + scales) built */
     double dev_ms, cpu_ms, wait_ms;
     unsigned long long rep_routed, rep_served;
     /* streaming (big prefill steps; see "streaming" below) */
@@ -303,6 +324,13 @@ static const char *human(double b, char *buf, size_t n) {
     return buf;
 }
 static double vkt_now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+/* COLI_VK_CHAIN_DPROF's own reading for the CS group split (the same grammar vkt_report
+ * uses): cached, so a disabled run takes no timers and prints no CS diagnostics. */
+static int vkt_cs_dprof(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_DPROF"); on = e && *e && *e != '0' ? 1 : 0; }
+    return on;
+}
 static VSlot *slot(int layer, int eid) { return &T.s[(size_t)layer * T.c.experts + eid]; }
 static int kind_of(int layer) { return layer >= T.main_layers; }   /* main (0) or extra (1): the pool */
 /* where a slot's tensors are or go: its device, or 2 for the primary device's host pool */
@@ -2860,7 +2888,9 @@ static int cs_ex_keep(ColiVkExpert *e) {   /* the transient aliased experts, fre
     return 1;
 }
 static void cs_ex_release(void) {
+    double t0 = vkt_cs_dprof() ? vkt_now_ms() : 0;
     for (int i = 0; i < T.cs_nex; i++) coli_vk_xb_expert_free(T.cs_ex[i]);
+    if (vkt_cs_dprof()) { T.cs_release_ms += vkt_now_ms() - t0; T.cs_release_n++; }
     T.cs_nex = 0;
 }
 /* One aliased expert over its imported slab: CS-1a's capability, VktAliasSrc's three
@@ -2881,10 +2911,17 @@ static ColiVkExpert *cs_alias_expert(const VktAliasSrc *s) {
     int ok = 1;
     for (int k = 0; ok && k < 3; k++)
         ok = coli_vk_tensor_alias(r, s->woff[k], s->soff[k], s->fmt, s->I[k], s->O[k], s->gs, &t[k]) == 1;
+    double t1 = vkt_cs_dprof() ? vkt_now_ms() : 0;
     ColiVkExpert *ex = ok ? coli_vk_xb_expert(t[0], t[1], t[2]) : NULL;
+    if (vkt_cs_dprof()) T.cs_xbex_ms += vkt_now_ms() - t1;
     if (!ex) {   /* the sets refused: the tensors (their import references with them) give way here */
         T.cs_refuse++;
         for (int k = 0; k < 3; k++) coli_vk_tensor_free(t[k]);
+    } else if (vkt_cs_dprof()) {   /* E: the actual bytes this alias built (weights + scales), from the geometry the tensors hold */
+        for (int k = 0; k < 3; k++) {
+            size_t sb = 0;
+            T.cs_alias_bytes += coli_vk_tensor_alloc_bytes(s->fmt, s->I[k], s->O[k], s->gs, &sb) + sb;
+        }
     }
     coli_vk_slab_unref(r);   /* the built tensors hold their own; an empty hand returns the pages */
     return ex;
@@ -2905,6 +2942,7 @@ int vkt_issue_group(int layer, const float *x, int S, int K, const int *idx, con
         return 0;
     }
     if (T.d2 && !coli_vk_xb_ready_dev(1)) d2_stop("the second device stopped answering");
+    if (vkt_cs_dprof()) { T.cs_settle_ms += vkt_now_ms() - T.t_issued; T.cs_settle_n++; }   /* A: defer -> group build entry (the loader's slide-join/read settle) */
     int E = T.c.experts;
     if (!grow_map(n) || !grow_groups(n) || !grow_rows(n)) { T.cs_pending = T.inflight = 0; return 0; }
     ColiVkExpert **ex = malloc((size_t)n * sizeof(*ex));
@@ -2913,6 +2951,7 @@ int vkt_issue_group(int layer, const float *x, int S, int K, const int *idx, con
     /* the entries: a resident's cached handle, else the aliased expert; a refusal (no
      * source, the import, the batch's cap) leaves the selection the CPU's */
     int ng = 0, total = 0;
+    double tb = vkt_cs_dprof() ? vkt_now_ms() : 0;
     for (int i = 0; i < n; i++) {
         T.map[i] = -1;
         taken[i] = 0;
@@ -2923,13 +2962,19 @@ int vkt_issue_group(int layer, const float *x, int S, int K, const int *idx, con
         if (total >= T.max_dev_rows) { T.cs_fallback++; continue; }   /* the batch is as large as it gets */
         VSlot *v = slot(layer, e);
         if (v->state == VS_RESIDENT && v->ex) { ex[i] = v->ex; res[i] = 1; }
-        else if (src && src[i].slab && (ex[i] = cs_alias_expert(&src[i])) && !cs_ex_keep(ex[i])) {
-            coli_vk_xb_expert_free(ex[i]);   /* the kept list could not grow: not worth the batch's failure */
-            ex[i] = NULL;
+        else if (src && src[i].slab) {
+            double ta = vkt_cs_dprof() ? vkt_now_ms() : 0;
+            ex[i] = cs_alias_expert(&src[i]);
+            if (vkt_cs_dprof()) T.cs_alias_ms += vkt_now_ms() - ta;
+            if (ex[i] && !cs_ex_keep(ex[i])) {
+                coli_vk_xb_expert_free(ex[i]);   /* the kept list could not grow: not worth the batch's failure */
+                ex[i] = NULL;
+            }
         }
         if (!ex[i]) { T.cs_fallback++; continue; }
         ng++; total++;
     }
+    if (vkt_cs_dprof()) { T.cs_lookup_ms += vkt_now_ms() - tb; T.cs_build_n++; }
     int took = 0;
     if (ng) {
         /* the primary device's groups first, then the second's, as issue() orders them:
@@ -2947,10 +2992,14 @@ int vkt_issue_group(int layer, const float *x, int S, int K, const int *idx, con
                 at++;
                 if (pass == 0) n0 = at;
             }
+        double ti = (vkt_cs_dprof() && n0 > 0) ? vkt_now_ms() : 0;
         T.d0_inflight = n0 > 0 && coli_vk_xb_issue_w(T.bex, T.brows, n0, T.bx, w ? T.bw : NULL);
+        if (vkt_cs_dprof() && n0 > 0) { T.cs_issue_ms += vkt_now_ms() - ti; T.cs_issue_n++; }
         T.d2_inflight = 0; T.d2_rows0 = n0;
         if (n0 < ng) {
+            double tj = vkt_cs_dprof() ? vkt_now_ms() : 0;
             T.d2_inflight = coli_vk_xb_issue_dev(1, T.bex + n0, T.brows + n0, ng - n0, T.bx + n0, w ? T.bw + n0 : NULL);
+            if (vkt_cs_dprof()) { T.cs_issue_ms += vkt_now_ms() - tj; T.cs_issue_n++; }
             if (!T.d2_inflight && !coli_vk_xb_ready_dev(1)) d2_stop("the second device's group failed");
         }
         for (int i = 0; i < n; i++) {
@@ -2997,8 +3046,20 @@ int vkt_join(const float **rows) {
         T.hy_n = 0;
     }
     T.cpu_ms += tc;
+    /* C/D: the CS group's fence-wait and query-read spans are the backend's own
+     * counters; snapshot deltas around the joins so only this group's calls count. */
+    int csd = vkt_cs_dprof() && T.csx && T.S == 1;
+    ColiVkCsDiag db, da;
+    if (csd) coli_vk_cs_diag(&db);
     int ok = !T.d0_inflight || coli_vk_xb_join(T.by, &dms);
+    if (csd) coli_vk_cs_diag(&da);
     int ok1 = !T.d2_inflight || coli_vk_xb_join_dev(1, T.by + T.d2_rows0, &dms1);
+    if (csd) {
+        ColiVkCsDiag dc; coli_vk_cs_diag(&dc);
+        T.cs_fence_ms += (da.xb_fence_ms[0] - db.xb_fence_ms[0]) + (dc.xb_fence_ms[1] - da.xb_fence_ms[1]);
+        T.cs_qread_ms += (da.xb_qread_ms[0] - db.xb_qread_ms[0]) + (dc.xb_qread_ms[1] - da.xb_qread_ms[1]);
+        T.cs_dev_ms += dms + dms1;
+    }
     T.d0_inflight = T.d2_inflight = 0;
     if (T.cs_nex) cs_ex_release();   /* the group's aliased experts: the batch is done, never freed in flight */
     double tw = vkt_now_ms() - t0;
@@ -3978,6 +4039,22 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     if (T.cs_groups)   /* COLI_VK_TIER_EXPERTS: the finish-site group's own books (one group a layer-token) */
         fprintf(stderr, " | cs: %llu groups, %llu resident + %llu aliased entries on the device, %llu cpu-fallback (%llu alias refusals)",
                 T.cs_groups, T.cs_res, T.cs_alias, T.cs_fallback, T.cs_refuse);
+    if (dprof && T.cs_groups) {   /* COLI_VK_CHAIN_DPROF: the group's window split. Reconciliation against the
+                                   * decode dprof line (all CS decode steps): CPU window = settle + build + issue
+                                   * + residual (the serial CPU loop, 0 under CS); waited = fence + qread +
+                                   * release + residual join glue; device = the timestamp span. alias and
+                                   * xb_expert are subsets of build (the lookup loop); release is a subset of
+                                   * waited. resident bytes = resident entries * the tier's per-expert bytes. */
+        ColiVkCsDiag cd; coli_vk_cs_diag(&cd);
+        fprintf(stderr, " | cs dprof: settle %.1f ms (%llu), build %.1f ms (%llu; alias %.1f, xb_expert %.1f), "
+                "issue %.1f ms (%llu), fence %.1f ms, qread %.1f ms, device %.1f ms, release %.1f ms (%llu) | "
+                "slab import %llu create + %llu hit, unref-zero %llu (%.1f ms), alias buffers %llu destroyed (%.1f ms) | "
+                "aliased %.1f MiB, resident %.1f MiB",
+                T.cs_settle_ms, T.cs_settle_n, T.cs_lookup_ms, T.cs_build_n, T.cs_alias_ms, T.cs_xbex_ms,
+                T.cs_issue_ms, T.cs_issue_n, T.cs_fence_ms, T.cs_qread_ms, T.cs_dev_ms, T.cs_release_ms, T.cs_release_n,
+                cd.slab_creates, cd.slab_hits, cd.slab_zeros, cd.slab_zero_ms, cd.alias_buf_destroys, cd.alias_buf_destroy_ms,
+                (double)T.cs_alias_bytes / 1048576.0, (double)((unsigned long long)T.cs_res * (unsigned long long)T.exp_bytes) / 1048576.0);
+    }
     if (dprof && T.p_steps)   /* COLI_VK_CHAIN_DPROF: the prompt steps' span (S > VKT_UP_ROWS), issue to join: the host-MoE window's tier half */
         fprintf(stderr, " | prompt dprof: %llu steps, waited %.1f ms, device %.1f ms, host %.1f ms",
                 T.p_steps, T.p_wait_ms, T.p_dev_ms, T.p_cpu_ms);
