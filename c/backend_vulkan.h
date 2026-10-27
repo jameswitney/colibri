@@ -399,10 +399,12 @@ void coli_vk_xb_stats(ColiVkXbStats *st);
  * xb_*_ms/fence/qread are per device (0 primary, 1 COLI_VK_DEV2's). */
 typedef struct {
     unsigned long long slab_creates, slab_hits;      /* unique slab import: new vs reused */
+    double slab_create_ms, slab_hit_ms;              /* the import's wall by outcome: new (pages pinned) vs reused */
     double xb_fence_ms[2]; unsigned long long xb_fences[2];   /* the xb batch's fence-wait CPU span */
     double xb_qread_ms[2]; unsigned long long xb_qreads[2];   /* its query-pool-result read span */
     unsigned long long slab_zeros; double slab_zero_ms;       /* slab unref-to-zero, and its vkFreeMemory span */
     unsigned long long alias_buf_destroys; double alias_buf_destroy_ms; /* aliased tensors' buffer destroys */
+    unsigned long long xb_foreign_joins;            /* xb_join off the thread the fence/qread deltas assume */
 } ColiVkCsDiag;
 void coli_vk_cs_diag(ColiVkCsDiag *out);
 /* A big step's whole-step buffers on the primary device (the grouped GEMM): the step's

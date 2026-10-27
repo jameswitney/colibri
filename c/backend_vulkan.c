@@ -2480,10 +2480,23 @@ static int cs_dprof_on(void) {
 }
 static struct {
     unsigned long long slab_creates, slab_hits;
+    double slab_create_ms, slab_hit_ms;   /* the import's wall by its outcome: the churn question's own split */
     unsigned long long slab_zeros; double slab_zero_ms;
     unsigned long long alias_buf_destroys; double alias_buf_destroy_ms;
+    unsigned long long xb_foreign_joins;  /* xb_join off the thread the fence/qread deltas assume (below) */
 } g_cs_diag;
 typedef struct { double fence_ms, qread_ms; unsigned long long fences, qreads; } XbCsDiag;
+/* The fence/qread deltas vk_tier.c brackets its joins with assume ONE thread joins:
+ * a join from another thread inside a bracket lands in this group's bucket. The
+ * first joiner (or the report's snapshotter) claims the thread; any other joiner
+ * counts here, and the report says the deltas are dirty. Zero on every run so far
+ * (the ring worker fills slots, the uploader promotes; neither joins a batch). */
+static pthread_t g_csd_thread;
+static int g_csd_thread_set;
+static void cs_diag_thread_check(void) {
+    if (!g_csd_thread_set) { g_csd_thread = pthread_self(); g_csd_thread_set = 1; }
+    else if (!pthread_equal(pthread_self(), g_csd_thread)) g_cs_diag.xb_foreign_joins++;
+}
 /* live slab imports bound: past COLI_VK_TIER_EXPERTS_IMPORT_CAP (default 1408, under
  * the driver's maxMemoryAllocationCount) the import refuses -- the caller's experts
  * run on the CPU, the lever's refusal ladder */
@@ -2501,6 +2514,8 @@ int coli_vk_slab_import(const void *slab, size_t bytes, ColiVkSlab **out) {
     size_t al = coli_vk_import_alignment();
     if (!al || !slab || !bytes || !out || !G.ready) return 0;
     const void *base = (const void *)((uintptr_t)slab / al * al);
+    int cd = cs_dprof_on();
+    double t0 = cd ? vk_now() : 0;
     pthread_mutex_lock(&g_slabs.mx);
     for (ColiVkSlab *r = g_slabs.live; r; r = r->next)
         if (r->base == base) {
@@ -2508,7 +2523,10 @@ int coli_vk_slab_import(const void *slab, size_t bytes, ColiVkSlab **out) {
              * reused keeps its pointer and size; anything else sharing the page is a
              * different slab the caller reallocated -- not ours to grow) */
             int ok = r->ptr == slab && r->user_bytes == bytes;
-            if (ok) { r->refs++; *out = r; if (cs_dprof_on()) g_cs_diag.slab_hits++; }
+            if (ok) {
+                r->refs++; *out = r;
+                if (cd) { g_cs_diag.slab_hits++; g_cs_diag.slab_hit_ms += vk_now() - t0; }
+            }
             pthread_mutex_unlock(&g_slabs.mx);
             return ok;
         }
@@ -2522,7 +2540,7 @@ int coli_vk_slab_import(const void *slab, size_t bytes, ColiVkSlab **out) {
             r->base = base; r->ptr = slab; r->bytes = sz; r->user_bytes = bytes;
             r->buf = buf; r->mem = mem; r->refs = 1;
             r->next = g_slabs.live; g_slabs.live = r; g_slabs.n++;
-            if (cs_dprof_on()) g_cs_diag.slab_creates++;
+            if (cd) { g_cs_diag.slab_creates++; g_cs_diag.slab_create_ms += vk_now() - t0; }
             *out = r;
         } else {
             coli_vk_host_buffer_free(buf, mem, sz);
@@ -5846,6 +5864,7 @@ static int xb_join(XbCtx *X, const float **yrows, double *device_ms) {
     if (!X->inflight) return 0;
     X->inflight = 0;
     int cd = cs_dprof_on();
+    if (cd) cs_diag_thread_check();   /* the fence/qread delta brackets assume this one thread */
     double t0 = cd ? vk_now() : 0;
     VkResult r = !X->d && wait_fault() ? VK_TIMEOUT : vk_fence_wait(X->dev, X->fence);
     if (cd) { X->csd.fence_ms += vk_now() - t0; X->csd.fences++; }
@@ -5898,12 +5917,16 @@ void coli_vk_xb_stats_dev(int dev, ColiVkXbStats *st) {
 }
 void coli_vk_cs_diag(ColiVkCsDiag *out) {
     memset(out, 0, sizeof *out);
+    if (cs_dprof_on()) cs_diag_thread_check();   /* the snapshotter claims the delta thread too */
     out->slab_creates = g_cs_diag.slab_creates;
     out->slab_hits = g_cs_diag.slab_hits;
+    out->slab_create_ms = g_cs_diag.slab_create_ms;
+    out->slab_hit_ms = g_cs_diag.slab_hit_ms;
     out->slab_zeros = g_cs_diag.slab_zeros;
     out->slab_zero_ms = g_cs_diag.slab_zero_ms;
     out->alias_buf_destroys = g_cs_diag.alias_buf_destroys;
     out->alias_buf_destroy_ms = g_cs_diag.alias_buf_destroy_ms;
+    out->xb_foreign_joins = g_cs_diag.xb_foreign_joins;
     for (int d = 0; d < 2; d++) {
         out->xb_fence_ms[d] = g_xb[d].csd.fence_ms; out->xb_fences[d] = g_xb[d].csd.fences;
         out->xb_qread_ms[d] = g_xb[d].csd.qread_ms; out->xb_qreads[d] = g_xb[d].csd.qreads;

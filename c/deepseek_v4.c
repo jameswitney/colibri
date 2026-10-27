@@ -5572,6 +5572,36 @@ unsigned long long g_v4_hyb_upload_n, g_v4_hyb_skip_n;
 #endif
 
 #if (defined(COLI_VULKAN) || defined(COLI_CUDA)) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+/* COLI_VK_CHAIN_DPROF (decode settle bytes, gap-wave1 inventory gap 2 / open item O1):
+ * the loader's read pass between the CS deferral and the finish-site group is the
+ * settle bucket's own work. These snapshot the store's cache counters around that
+ * window (its stats op, the same lock the lookups hold), so the reads that settled
+ * the deferred bytes split ram-hit (a slot the cache already held: no bytes moved)
+ * from disk (a record read into one), and the alias sources count the slab bytes the
+ * group's aliases stand on -- the 2.67 GiB/token vs 0.78 GB/tok read-parity question.
+ * All zero and untouched unless the gate is on. */
+int v4_cs_dprof(void);
+unsigned long long g_v4_cs_win, g_v4_cs_win_ram, g_v4_cs_win_disk, g_v4_cs_win_disk_b;
+unsigned long long g_v4_cs_src_n;
+double g_v4_cs_src_b;
+int v4_cs_dprof(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_DPROF"); on = e && *e && *e != '0' ? 1 : 0; }
+    return on;
+}
+static ColiExpertStoreStats g_v4_cs_snap;
+static void v4_cs_settle_open(ColiExpertStore *store) {
+    if (store && store->ops && store->ops->stats) store->ops->stats(store, &g_v4_cs_snap);
+}
+static void v4_cs_settle_close(ColiExpertStore *store) {
+    ColiExpertStoreStats st;
+    if (!store || !store->ops || !store->ops->stats) return;
+    store->ops->stats(store, &st);
+    g_v4_cs_win++;
+    g_v4_cs_win_ram += st.hits - g_v4_cs_snap.hits;
+    g_v4_cs_win_disk += st.misses - g_v4_cs_snap.misses;
+    g_v4_cs_win_disk_b += st.bytes_read - g_v4_cs_snap.bytes_read;
+}
 /* ---- the Vulkan routed-expert tier (vk_tier.c) in the MoE ------------------------
  * coli_v4_vk_tier (deepseek_v4_internal.h) is set when COLI_VULKAN=1 started the
  * tier. A step then hands the device its routed experts first, rows rounded to E4M3
@@ -5634,6 +5664,7 @@ static void v4_vk_token_issue(V4VkToken *vk, ColiExpertStore *store, int layer,
     if (!xq || !ids || !w || !taken) { free(xq); free(ids); free(w); free(taken); return; }
     int n = tier->issue(layer, xq, 1, full, expert_ids, expert_weights, taken);
     int cs = tier->issue_group && n > 0;   /* the deferral: the whole selection is the finish-site group's */
+    if (cs && v4_cs_dprof()) v4_cs_settle_open(store);   /* DPROF: the settle window opens with the deferral (the loader reads below) */
     if (!cs) free(xq);
     memcpy(ids, expert_ids, (size_t)full * sizeof(*ids));
     memcpy(w, expert_weights, (size_t)full * sizeof(*w));
@@ -5688,6 +5719,7 @@ static void v4_vk_alias_src(ColiExpertStore *store, const ColiExpertView *view, 
     s->bytes = bytes;
     s->fmt = m[0]->scale_format == COLI_SCALE_UE8M0 ? 15 : 7;
     s->gs = (int)m[0]->block_columns;
+    if (v4_cs_dprof()) { g_v4_cs_src_n++; g_v4_cs_src_b += (double)bytes; }   /* DPROF: the slab bytes this alias stands on */
 }
 
 /* The CPU's experts (views[0..cpu), weights beside them), the device's join, and
@@ -5698,6 +5730,7 @@ static int v4_vk_token_finish(V4VkToken *vk, float *output, ColiExpertStore *sto
                               int cpu, const float *input, const float *shared_output,
                               int d, float limit) {
     const ColiV4VkTier *tier = coli_v4_vk_tier;
+    if (vk->cs && v4_cs_dprof()) v4_cs_settle_close(store);   /* DPROF: the settle window closes at the group's build (the tier's own settle bucket) */
     float *rows = malloc(((size_t)cpu + 1) * d * sizeof(*rows));
     const float **dev = malloc((size_t)vk->full * sizeof(*dev));
     int result = rows && dev ? 0 : moe_fail("layer %d: out of memory for the device's experts", layer);
@@ -14718,9 +14751,27 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
 
 /* The tier's line for a run or a serve turn: RAM hits and disk loads from the
  * store's counters over the same span. */
+static const char *v4_cs_bytes(double b, char *buf, size_t n) {   /* the settle line's own units */
+    if (b >= 1073741824.0) snprintf(buf, n, "%.2f GiB", b / 1073741824.0);
+    else if (b >= 1048576.0) snprintf(buf, n, "%.1f MiB", b / 1048576.0);
+    else snprintf(buf, n, "%.1f KiB", b / 1024.0);
+    return buf;
+}
 static void v4_vk_tier_report(const char *scope, unsigned long long hits,
                               unsigned long long misses) {
-    if (coli_v4_vk_tier) XT(report)(scope, hits, misses);
+    if (!coli_v4_vk_tier) return;
+    XT(report)(scope, hits, misses);
+    if (v4_cs_dprof() && g_v4_cs_win) {   /* DPROF: the decode settle's bytes, beside the tier's own cs lines */
+        char hd[32], hr[32], ha[32], hc[32];
+        uint64_t rec = coli_v4_expert_store_record_bytes(coli_v4_vk_tier->store);
+        fprintf(stderr, "v4_cs settle dprof: %llu windows, %llu loader reads (%llu ram-hit + %llu disk; "
+                        "%s read off disk, %s ram-served), %llu alias sources over %s (%s a record)\n",
+                g_v4_cs_win, g_v4_cs_win_ram + g_v4_cs_win_disk, g_v4_cs_win_ram, g_v4_cs_win_disk,
+                v4_cs_bytes((double)g_v4_cs_win_disk_b, hd, sizeof hd),
+                v4_cs_bytes((double)g_v4_cs_win_ram * (double)rec, hr, sizeof hr),
+                g_v4_cs_src_n, v4_cs_bytes(g_v4_cs_src_b, ha, sizeof ha),
+                v4_cs_bytes((double)rec, hc, sizeof hc));
+    }
 }
 #endif /* COLI_VULKAN || COLI_CUDA */
 
