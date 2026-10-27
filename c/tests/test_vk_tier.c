@@ -2473,11 +2473,79 @@ static void cs_group_i8(int armed) {
     CHECK(no_nan(worst) < 2e-3, "cs i8 (%s): rows off the reference (%.3g)", armed ? "armed" : "unarmed", no_nan(worst));
     vkt_shutdown(); model_free();
 }
+/* CS x decode-growth composition (CS-1b x T2): EXPERTS and DECODE_GROW both armed -- the
+ * finish-site group's aliased selections must still install by the decode-only rank
+ * (the ordinary path's vkt_note never sees them). Warm two residents, grow two free
+ * places, and route the two hot aliases: both install, the below-cutoff alias does
+ * not, and the group's rows stay on the reference. */
+static void cs_grow(void) {
+    rng = 7;
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU_V4; g_limit = 10.0f;
+    const double eb = (double)vkt_expert_bytes(H, F, f, f);
+    uint32_t hist[L][E], dhist[L][E], *rows[L], *drows[L];
+    for (int l = 0; l < L; l++) {
+        rows[l] = hist[l]; drows[l] = dhist[l];
+        for (int e = 0; e < E; e++) {
+            hist[l][e] = (l == 0 && e < 2) ? 100u : 0u;   /* the warm start: layer 0's experts 0 and 1 */
+            dhist[l][e] = (l == 0 && e >= 2 && e <= 4) ? 40u - 10u * (uint32_t)(e - 2) : 0u;
+        }
+    }
+    setenv("COLI_VK_TIER_EXPERTS", "1", 1);
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    set_budget(2, f, f);   /* exactly the two warm residents: no free place to promote into */
+    char gb[64]; snprintf(gb, sizeof gb, "%.12f", 2.5 * eb / 1073741824.0);   /* two grown places */
+    setenv("COLI_VK_TIER_DECODE_GROW", "1", 1);
+    setenv("COLI_VK_TIER_DECODE_GROW_GB", gb, 1);
+    setenv("COLI_VK_TIER_DECODE_GROW_RESERVE_GB", "0.000001", 1);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU_V4, 10.0f);
+    vc.decode_heat = drows;
+    CHECK(vkt_init(&vc, rows), "cs grow: the tier did not start");
+    int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+    for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+    vkt_put_done();
+    CHECK(n == 2 && dg_res() == 2, "cs grow: %d warm of 2 planned", n);
+    VktAliasSrc asrc[E]; void *slabs[E];
+    for (int e = 0; e < E; e++) slabs[e] = NULL;
+    for (int e = 2; e <= 4; e++)
+        CHECK(cs_alias_slab(0, e, &asrc[e], &slabs[e]), "cs grow: alias slab for expert %d", e);
+    static const int routes[][K] = {{0, 1, 2}, {0, 1, 3}, {1, 2, 4}, {0, 2, 3}};
+    float w[K] = {0.5f, 0.3f, 0.2f};
+    Books bk = {0, 0}; double worst = 0; unsigned long long aliased = 0;
+    for (int t = 0; t < 4; t++) {
+        VktAliasSrc src[K];
+        for (int k = 0; k < K; k++) {
+            int e = routes[t][k];
+            src[k] = e >= 2 ? asrc[e] : (VktAliasSrc){0};
+        }
+        vkt_begin_forward();
+        double r = cs_group_step(0, routes[t], w, src, 1, 10.0f, 1, &bk, &aliased);
+        if (!(r <= worst)) worst = r;
+        vkt_settle();
+    }
+    char line[4096]; report_line(line, sizeof line);
+    const char *grow = strstr(line, "decode grow: ");
+    printf("  cs grow (EXPERTS + DECODE_GROW): residents 2 -> %d, aliased %llu, worst %.2e, \"%s\"\n",
+           dg_res(), aliased, no_nan(worst), grow ? grow : "no clause");
+    CHECK(dg_res() == 4, "cs grow: %d residents, not the warm 2 + 2", dg_res());
+    CHECK(vkt_resident(0, 2) && vkt_resident(0, 3), "cs grow: the hot aliases did not install");
+    CHECK(!vkt_resident(0, 4), "cs grow: a below-cutoff alias installed");
+    CHECK(strstr(line, "decode grow: 2 installed by decode-only rank (cutoff 30)"), "cs grow: the growth clause");
+    CHECK(no_nan(worst) < 2e-2, "cs grow: rows off the reference (%.3g)", no_nan(worst));
+    vkt_shutdown();
+    for (int e = 0; e < E; e++) free(slabs[e]);
+    model_free();
+    unsetenv("COLI_VK_TIER_DECODE_GROW"); unsetenv("COLI_VK_TIER_DECODE_GROW_GB");
+    unsetenv("COLI_VK_TIER_DECODE_GROW_RESERVE_GB");
+    unsetenv("COLI_VK_TIER_EXPERTS");
+}
 static void cs_group(void) {
     cs_group_v4(1);   /* the v4 MXFP4 class: aliased + resident selections in one group, < 2e-2 */
     cs_group_v4(0);
     cs_group_i8(1);   /* the non-fp4 rows: the resident selections through the same group, < 2e-3 */
     cs_group_i8(0);
+    cs_grow();        /* EXPERTS + DECODE_GROW: the aliased selections still install, > 2e-2 */
     unsetenv("COLI_VK_TIER_SYNC");   /* the suite's next cases (the stream ring) expect it unset */
 }
 /* The hot set overlay (COLI_VK_TIER_HOT): the history's top share of the resident places,

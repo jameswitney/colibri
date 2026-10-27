@@ -2970,6 +2970,17 @@ int vkt_issue_group(int layer, const float *x, int S, int K, const int *idx, con
                 coli_vk_xb_expert_free(ex[i]);   /* the kept list could not grow: not worth the batch's failure */
                 ex[i] = NULL;
             }
+            /* CS x decode-growth composition: the alias serves THIS token; feed the
+             * same bytes the CPU's note would have staged so the growth still installs
+             * them for the tokens ahead. vkt_note's own gate keeps the rank/cutoff,
+             * the byte cap and the forward's promo cap, and its staged copy never
+             * touches the group built here (the alias stays this token's entry). */
+            if (ex[i] && T.csx && T.dgrow_armed && T.dgrow_dec && !kind_of(layer)) {
+                const uint8_t *b = (const uint8_t *)src[i].slab;
+                VktExpertSrc ns = { b + src[i].woff[0], b + src[i].woff[1], b + src[i].woff[2],
+                                    b + src[i].soff[0], b + src[i].soff[1], b + src[i].soff[2] };
+                vkt_note(layer, e, &ns);
+            }
         }
         if (!ex[i]) { T.cs_fallback++; continue; }
         ng++; total++;
