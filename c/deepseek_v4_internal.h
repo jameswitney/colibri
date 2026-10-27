@@ -808,6 +808,13 @@ uint32_t *const *coli_v4_expert_store_history(ColiExpertStore *store);
 uint32_t *const *coli_v4_expert_store_mfu_history(ColiExpertStore *store);
 int coli_v4_expert_store_in_ram(ColiExpertStore *store, ColiExpertKey key);
 uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store);
+/* COLI_VK_CHAIN_DPROF (deepseek_v4.c's BLOCK_HYBRID unit): the CS decode settle's
+ * own byte books -- windows measured, the loader reads inside them (ram-hit vs
+ * disk, disk bytes), and the alias sources' slab bytes. Zero unless the gate is on. */
+int v4_cs_dprof(void);
+extern unsigned long long g_v4_cs_win, g_v4_cs_win_ram, g_v4_cs_win_disk, g_v4_cs_win_disk_b;
+extern unsigned long long g_v4_cs_src_n;
+extern double g_v4_cs_src_b;
 /* A GGUF store's experts at `layer` (st_gguf.h): 1 with the ggml types of gate (w1), up
  * (w3) and down (w2) as the file has them, *mx = 1 when the store lays them out as the
  * checkpoint's FP4 (all three MXFP4); 0 for a checkpoint's store, -1 without one. */

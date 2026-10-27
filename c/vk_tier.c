@@ -264,12 +264,16 @@ static struct {
      * per group CPU window = settle + lookup + issue + residual (the serial CPU loop,
      * zero under CS); waited = fence + qread + release + residual join glue; device is
      * the timestamp span. alias/xbex are subsets of lookup (which is itself the
-     * resident-lookup + alias-build loop), and release is a subset of waited. */
+     * resident-lookup + alias-build loop), import a subset of alias, and release is a
+     * subset of waited. vkt_report prints the two equations with their residuals. */
     double cs_settle_ms;               /* A: defer -> group build entry (the loader's slide-join/read settle) */
     unsigned long long cs_settle_n;
     double cs_lookup_ms;               /* B: the group's entry loop (resident lookup + alias builds) */
     double cs_alias_ms;                /* B: cs_alias_expert's span, a subset of cs_lookup_ms */
     double cs_xbex_ms;                 /* B: coli_vk_xb_expert's span, a subset of cs_alias_ms */
+    double cs_import_ms;               /* B: coli_vk_slab_import's span, a subset of cs_alias_ms (the import
+                                        * churn's own time, beside the backend's create/hit split) */
+    unsigned long long cs_import_n;
     unsigned long long cs_build_n;
     double cs_issue_ms;                /* C: coli_vk_xb_issue_w/_dev's CPU span (the xb submit call) */
     unsigned long long cs_issue_n;
@@ -279,6 +283,28 @@ static struct {
     double cs_release_ms;              /* D: cs_ex_release's span, inside the join's waited */
     unsigned long long cs_release_n;
     unsigned long long cs_alias_bytes; /* E: aliased tensor bytes (weights + scales) built */
+    /* PROMPT dprof (COLI_VK_CHAIN_DPROF, the prompt class S > VKT_UP_ROWS): the p_*
+     * mirror's host side split. pd_* nest inside one step's window: issue is the
+     * issue_big wall (fill/joins/submit are disjoint spans inside it, the rest of
+     * it classify+pack), kept is the engine's own span from the issue's end to the
+     * join's entry (the kept rows' CPU compute), and the remainder of p_cpu_ms is
+     * the join-side glue the report prints as residual. The stage fills run in
+     * vkt_stream_prefetch, between steps -- outside every p_* window, the chain's
+     * staging role; pdst_* time their fill groups so the per-group cost (the
+     * 6.4 ms a sub-batch question, gap-wave1 ttft F1/F3) reads off the tier's books. */
+    double pd_issue_ms;                /* issue_big's whole wall, ⊂ p_cpu_ms */
+    unsigned long long pd_issue_n;
+    double pd_fill_ms;                 /* st_fill_group's wall, inline in issue_big (⊂ pd_issue_ms) */
+    unsigned long long pd_fill_n;
+    double pd_fill_max;
+    double pd_rjoin_ms;                /* st_join_half/st_ring_take inside issue_big (⊂ pd_issue_ms) */
+    unsigned long long pd_rjoin_n;
+    double pd_submit_ms;               /* the xb sub-batch submits inside issue_big (⊂ pd_issue_ms) */
+    unsigned long long pd_submit_n;
+    double pd_kept_ms;                 /* issue's end -> join's entry: the kept rows' CPU compute */
+    double pdst_fill_ms;               /* the stage prefetch's st_fill_group wall, outside the p_* window */
+    unsigned long long pdst_fill_n;
+    double pdst_fill_max;
     double dev_ms, cpu_ms, wait_ms;
     unsigned long long rep_routed, rep_served;
     /* streaming (big prefill steps; see "streaming" below) */
@@ -1892,15 +1918,20 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
     }
     for (int e = 0; e < E; e++) if (cls[e] == BC_STREAM && eslot[e] < 0) order[no++] = e;
     /* the second device's batch first, so it runs beside every sub-batch */
+    double tsd2 = vkt_cs_dprof() && nd2 ? vkt_now_ms() : 0;   /* DPROF: its gather + submit counts with the issue's submits */
     int d2_taken = nd2 ? d2_issue_big(layer, x, K, w, cnt, ofs, cls, taken) : 0;
+    if (tsd2) { T.pd_submit_ms += vkt_now_ms() - tsd2; T.pd_submit_n++; }
     /* sub-batches */
     int cnt_b = 0, rows_b = 0, nst_b = 0, total = 0;
     VSub *cur = NULL;
     int curh = 0;
 #define SUBMIT_CURRENT() do { \
         if (cnt_b) { \
-            int okk = !T.big_fail && (T.sy_step ? coli_vk_xb_sub_issue_step(curh, bex, brows, cnt_b, bidx, bw) \
+            int attempt = !T.big_fail; \
+            double ts = attempt && vkt_cs_dprof() ? vkt_now_ms() : 0; \
+            int okk = attempt && (T.sy_step ? coli_vk_xb_sub_issue_step(curh, bex, brows, cnt_b, bidx, bw) \
                                                 : coli_vk_xb_sub_issue(curh, bex, brows, cnt_b, bx, bw)); \
+            if (ts) { T.pd_submit_ms += vkt_now_ms() - ts; T.pd_submit_n++; } \
             if (okk) { \
                 for (int q = 0; q < rows_b; q++) { taken[bidx[q]] = 1; T.map[bidx[q]] = bidx[q]; } \
                 total += rows_b; T.st_subs++; T.sk++; \
@@ -1934,7 +1965,11 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
                 if (T.ring_run) {   /* free room outside the ring's half first; short of it, take the ring (another layer's set) rather than race it */
                     for (int i = 0; i < T.st_n; i++)
                         if (!(i >= T.ring_lo && i < T.ring_hi) && T.st[i].state == SS_FREE) nfree++;
-                    if (nfree < gn) st_ring_take();
+                    if (nfree < gn) {
+                        double tj = vkt_cs_dprof() ? vkt_now_ms() : 0;   /* DPROF: the ring's take joined inside the issue */
+                        st_ring_take();
+                        if (vkt_cs_dprof()) { T.pd_rjoin_ms += vkt_now_ms() - tj; T.pd_rjoin_n++; }
+                    }
                 }
                 for (int tries = 0; tries < 3; tries++) {
                     nfree = 0;
@@ -1946,13 +1981,21 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
                     int old = coli_vk_xb_sub_busy(T.sk % 2) ? (int)(T.sk % 2) : (int)((T.sk + 1) % 2);
                     if (cur && old == curh && cnt_b) old = !curh;   /* never the half being filled */
                     if (!coli_vk_xb_sub_busy(old)) break;
+                    double tj = vkt_cs_dprof() ? vkt_now_ms() : 0;   /* DPROF: an in-flight sub-batch joined for its slots */
                     st_join_half(old);
+                    if (vkt_cs_dprof()) { T.pd_rjoin_ms += vkt_now_ms() - tj; T.pd_rjoin_n++; }
                 }
                 if (T.big_fail) break;
                 if (nfree < gn) gn = nfree;
                 uint8_t gok[64], gpool[64];
                 for (int i = 0; i < gn; i++) gpool[i] = T.bpool ? T.bpool[gid[i]] : 0;
+                double tf = vkt_cs_dprof() ? vkt_now_ms() : 0;   /* DPROF: one fill group's wall (read + convert + upload) */
                 st_fill_group(layer, gid, gsl, gn, gok, gpool, cur ? curh : (int)(T.sk % 2));   /* the half they go to */
+                if (vkt_cs_dprof()) {
+                    double d = vkt_now_ms() - tf;
+                    T.pd_fill_ms += d; T.pd_fill_n++;
+                    if (d > T.pd_fill_max) T.pd_fill_max = d;
+                }
                 for (int i = 0; i < gn; i++) {
                     if (gok[i]) eslot[gid[i]] = gsl[i];
                     else if (gpool[i]) { cls[gid[i]] = BC_DEV; T.bpool[gid[i]] = 0; }   /* not copied: read in place */
@@ -1975,7 +2018,12 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
             if (T.big_fail) break;
             if (!cur) {   /* a new sub-batch in half sk % 2: the one there before is joined first */
                 curh = (int)(T.sk % 2);
-                if (coli_vk_xb_sub_busy(curh) && !st_join_half(curh)) break;
+                if (coli_vk_xb_sub_busy(curh)) {
+                    double tj = vkt_cs_dprof() ? vkt_now_ms() : 0;   /* DPROF: the half this sub-batch needs joined first */
+                    int jok = st_join_half(curh);
+                    if (vkt_cs_dprof()) { T.pd_rjoin_ms += vkt_now_ms() - tj; T.pd_rjoin_n++; }
+                    if (!jok) break;
+                }
                 cur = &T.hf[curh]; cur->n = cur->nslot = 0;
             }
             int take = cnt[e] - r0; if (take > half - rows_b) take = half - rows_b;
@@ -2027,6 +2075,7 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
 static int join_big(const float **rows) {
     double t0 = vkt_now_ms(), tc = t0 - T.t_issued;
     T.cpu_ms += tc;
+    if (vkt_cs_dprof() && T.p_t0 > 0) T.pd_kept_ms += tc;   /* DPROF: the issue's end -> the join's entry: the kept rows' compute */
     /* the host pool's pairs of few rows, while the device computes its batches */
     const int hn = T.hy_n;
     int hok = 1;
@@ -2252,7 +2301,13 @@ int vkt_stream_prefetch(int layer, int S) {
         int gn = nc - used < T.st_per ? nc - used : T.st_per, gsl[64]; uint8_t gok[64];
         if (gn > 64) gn = 64;
         for (int i = 0; i < gn; i++) gsl[i] = used + i;
+        double tf = vkt_cs_dprof() ? vkt_now_ms() : 0;   /* DPROF: the stage fill's wall -- the chain's staging role is the window around it */
         st_fill_group(layer, cand + used, gsl, gn, gok, NULL, 0);
+        if (vkt_cs_dprof()) {
+            double d = vkt_now_ms() - tf;
+            T.pdst_fill_ms += d; T.pdst_fill_n++;
+            if (d > T.pdst_fill_max) T.pdst_fill_max = d;
+        }
         for (int i = 0; i < gn; i++) if (gok[i]) { T.st[gsl[i]].pref = 1; got++; }
         used += gn;
     }
@@ -2693,7 +2748,13 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
     quiesce();
     T.dgrow_dec = S <= VKT_UP_ROWS;   /* decode growth: the running step's class (notes gate on it) */
     if (T.dgrow && !T.dgrow_armed && T.dgrow_dec) dgrow_arm();
-    if (T.st_ok && S >= T.gemm_rows && layer < T.main_layers) return issue_big(layer, x, S, K, idx, w, taken);
+    if (T.st_ok && S >= T.gemm_rows && layer < T.main_layers) {   /* DPROF: the prompt window's issue wall, the p_cpu mirror's head */
+        int pd = vkt_cs_dprof();
+        double ti = pd ? vkt_now_ms() : 0;
+        int r = issue_big(layer, x, S, K, idx, w, taken);
+        if (pd) { T.pd_issue_ms += vkt_now_ms() - ti; T.pd_issue_n++; }
+        return r;
+    }
     int E = T.c.experts, H = T.c.hidden, n = S * K;
     if (!grow_map(n)) return 0;
     if (T.csx && S == 1) {
@@ -2906,7 +2967,9 @@ static ColiVkExpert *cs_alias_expert(const VktAliasSrc *s) {
             return NULL;
         }
     ColiVkSlab *r;
+    double tim = vkt_cs_dprof() ? vkt_now_ms() : 0;   /* the import's own span: the alias churn question (create vs hit is the backend's) */
     if (!coli_vk_slab_import(s->slab, s->bytes, &r)) { T.cs_refuse++; return NULL; }
+    if (vkt_cs_dprof()) { T.cs_import_ms += vkt_now_ms() - tim; T.cs_import_n++; }
     ColiVkTensor *t[3] = {NULL, NULL, NULL};
     int ok = 1;
     for (int k = 0; ok && k < 3; k++)
@@ -4046,18 +4109,48 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
                                    * xb_expert are subsets of build (the lookup loop); release is a subset of
                                    * waited. resident bytes = resident entries * the tier's per-expert bytes. */
         ColiVkCsDiag cd; coli_vk_cs_diag(&cd);
-        fprintf(stderr, " | cs dprof: settle %.1f ms (%llu), build %.1f ms (%llu; alias %.1f, xb_expert %.1f), "
+        fprintf(stderr, " | cs dprof: settle %.1f ms (%llu), build %.1f ms (%llu; alias %.1f, import %.1f (%llu), xb_expert %.1f), "
                 "issue %.1f ms (%llu), fence %.1f ms, qread %.1f ms, device %.1f ms, release %.1f ms (%llu) | "
-                "slab import %llu create + %llu hit, unref-zero %llu (%.1f ms), alias buffers %llu destroyed (%.1f ms) | "
+                "slab import %llu create + %llu hit (create %.1f ms, hit %.1f ms), unref-zero %llu (%.1f ms), alias buffers %llu destroyed (%.1f ms) | "
                 "aliased %.1f MiB, resident %.1f MiB",
-                T.cs_settle_ms, T.cs_settle_n, T.cs_lookup_ms, T.cs_build_n, T.cs_alias_ms, T.cs_xbex_ms,
+                T.cs_settle_ms, T.cs_settle_n, T.cs_lookup_ms, T.cs_build_n, T.cs_alias_ms, T.cs_import_ms, T.cs_import_n, T.cs_xbex_ms,
                 T.cs_issue_ms, T.cs_issue_n, T.cs_fence_ms, T.cs_qread_ms, T.cs_dev_ms, T.cs_release_ms, T.cs_release_n,
-                cd.slab_creates, cd.slab_hits, cd.slab_zeros, cd.slab_zero_ms, cd.alias_buf_destroys, cd.alias_buf_destroy_ms,
+                cd.slab_creates, cd.slab_hits, cd.slab_create_ms, cd.slab_hit_ms, cd.slab_zeros, cd.slab_zero_ms,
+                cd.alias_buf_destroys, cd.alias_buf_destroy_ms,
                 (double)T.cs_alias_bytes / 1048576.0, (double)((unsigned long long)T.cs_res * (unsigned long long)T.exp_bytes) / 1048576.0);
+        /* The reconciliation printed, not left in the commit message (gap-wave1 inventory gap 3):
+         * over the decode class, cpu = settle + build + issue + residual and waited =
+         * fence + qread + release + residual. A negative residual says the books do not
+         * close (non-CS decode steps contribute to d_*, the serial CPU loop's compute);
+         * the mallocs and grow_* of vkt_issue_group are the residual's own content. */
+        fprintf(stderr, " | cs resid: cpu %.1f = settle %.1f + build %.1f + issue %.1f + %.1f; "
+                "waited %.1f = fence %.1f + qread %.1f + release %.1f + %.1f",
+                T.d_cpu_ms, T.cs_settle_ms, T.cs_lookup_ms, T.cs_issue_ms,
+                T.d_cpu_ms - T.cs_settle_ms - T.cs_lookup_ms - T.cs_issue_ms,
+                T.d_wait_ms, T.cs_fence_ms, T.cs_qread_ms, T.cs_release_ms,
+                T.d_wait_ms - T.cs_fence_ms - T.cs_qread_ms - T.cs_release_ms);
+        if (cd.xb_foreign_joins)   /* the fence/qread deltas assume one joining thread */
+            fprintf(stderr, ", %llu xb joins off the delta thread (fence/qread dirty)", cd.xb_foreign_joins);
     }
-    if (dprof && T.p_steps)   /* COLI_VK_CHAIN_DPROF: the prompt steps' span (S > VKT_UP_ROWS), issue to join: the host-MoE window's tier half */
-        fprintf(stderr, " | prompt dprof: %llu steps, waited %.1f ms, device %.1f ms, host %.1f ms",
-                T.p_steps, T.p_wait_ms, T.p_dev_ms, T.p_cpu_ms);
+    if (dprof && T.p_steps) {   /* COLI_VK_CHAIN_DPROF: the prompt steps' span (S > VKT_UP_ROWS), issue to join: the host-MoE window's tier half,
+                                * split now (gap-wave1 ttft F1/F3): host = issue wall (fill / joins / submit inside it,
+                                * the rest classify+pack) + kept (the issue's end to the join's entry, the kept rows' CPU
+                                * compute) + the join-side glue as residual. The stage fills run between steps, outside this
+                                * window -- they are the chain's staging role, beside its own line. */
+        fprintf(stderr, " | prompt dprof: %llu steps, waited %.1f ms, device %.1f ms, host %.1f ms "
+                "(issue %.1f in %llu calls [fill %.1f in %llu groups (mean %.0f us, max %.1f ms), joins %.1f (%llu), submit %.1f (%llu), classify+pack %.1f], "
+                "kept %.1f, join glue %.1f)",
+                T.p_steps, T.p_wait_ms, T.p_dev_ms, T.p_cpu_ms,
+                T.pd_issue_ms, T.pd_issue_n, T.pd_fill_ms, T.pd_fill_n,
+                T.pd_fill_n ? T.pd_fill_ms * 1e3 / (double)T.pd_fill_n : 0.0, T.pd_fill_max,
+                T.pd_rjoin_ms, T.pd_rjoin_n, T.pd_submit_ms, T.pd_submit_n,
+                T.pd_issue_ms - T.pd_fill_ms - T.pd_rjoin_ms - T.pd_submit_ms,
+                T.pd_kept_ms, T.p_cpu_ms - T.pd_issue_ms - T.pd_kept_ms);
+        if (T.pdst_fill_n)   /* the stage prefetch's fills: per-group wall, the 6.4 ms a sub-batch question */
+            fprintf(stderr, " | stage dprof: %llu fill groups, %.1f ms (mean %.0f us, max %.1f ms), prefetched %llu (%llu used)",
+                    T.pdst_fill_n, T.pdst_fill_ms,
+                    T.pdst_fill_ms * 1e3 / (double)T.pdst_fill_n, T.pdst_fill_max, T.pf_n, T.pf_used);
+    }
     if (T.failed)
         fprintf(stderr, " | failed: %llu refused by the pool, %llu copies to the device, %llu not taken by the batch",
                 T.f_pool, T.f_copy, T.f_sets);
