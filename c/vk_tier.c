@@ -329,6 +329,7 @@ static struct {
     unsigned long long pd_issue_n;
     double pd_fill_ms;                 /* st_fill_group's wall, inline in issue_big (⊂ pd_issue_ms) */
     unsigned long long pd_fill_n;
+    unsigned long long pd_fill_exp;     /* the experts those groups gathered (DPROF: the schedule's width) */
     double pd_fill_max;
     double pd_rjoin_ms;                /* st_join_half/st_ring_take inside issue_big (⊂ pd_issue_ms) */
     unsigned long long pd_rjoin_n;
@@ -2008,11 +2009,19 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
             if (nst_b >= T.st_per) SUBMIT_CURRENT();
             if (T.big_fail) break;
             if (eslot[e] < 0) {
-                /* this expert and the next ones without a slot, as many as the sub-batch has
-                 * room for, loaded and uploaded together; free slots first, joining the
-                 * oldest sub-batch in flight when there are not enough */
-                int room = T.st_per - nst_b, gid[64], gsl[64], gn = 0;
+                /* this expert and the next ones without a slot, loaded and uploaded together;
+                 * free slots first, joining the oldest sub-batch in flight when there are
+                 * not enough. The group's cap is the sub-batch's remaining room -- unless
+                 * COLI_VK_TIER_STREAM_GROUP widened it: then the group reaches past the
+                 * sub-batch into the step's later cold experts, which land filled and are
+                 * taken from their slots when their turn comes (the prefetched-slot state
+                 * the order scan already consumes). Only the schedule changes: one read
+                 * round, one conversion pass and one commit's fence per group instead of
+                 * one per sub-batch's worth -- the cs-timing2 fills ran 1.65 GB/s against
+                 * the ring worker's 7.97 GB/s on the same stream, a group a sub-batch. */
+                int room = T.st_group > 0 ? T.st_group : T.st_per - nst_b, gid[64], gsl[64], gn = 0;
                 if (room > 64) room = 64;
+                if (room < 1) room = 1;
                 for (int o2 = o; o2 < no && gn < room; o2++)
                     if (cls[order[o2]] == BC_STREAM && eslot[order[o2]] < 0) gid[gn++] = order[o2];
                 int nfree = 0;
@@ -2048,6 +2057,7 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
                 if (vkt_cs_dprof()) {
                     double d = vkt_now_ms() - tf;
                     T.pd_fill_ms += d; T.pd_fill_n++;
+                    T.pd_fill_exp += (unsigned long long)gn;
                     if (d > T.pd_fill_max) T.pd_fill_max = d;
                 }
                 for (int i = 0; i < gn; i++) {
@@ -4456,10 +4466,11 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
                                 * compute) + the join-side glue as residual. The stage fills run between steps, outside this
                                 * window -- they are the chain's staging role, beside its own line. */
         fprintf(stderr, " | prompt dprof: %llu steps, waited %.1f ms, device %.1f ms, host %.1f ms "
-                "(issue %.1f in %llu calls [fill %.1f in %llu groups (mean %.0f us, max %.1f ms), joins %.1f (%llu), submit %.1f (%llu), classify+pack %.1f], "
+                "(issue %.1f in %llu calls [fill %.1f in %llu groups of %.1f experts (mean %.0f us, max %.1f ms), joins %.1f (%llu), submit %.1f (%llu), classify+pack %.1f], "
                 "kept %.1f, join glue %.1f)",
                 T.p_steps, T.p_wait_ms, T.p_dev_ms, T.p_cpu_ms,
                 T.pd_issue_ms, T.pd_issue_n, T.pd_fill_ms, T.pd_fill_n,
+                T.pd_fill_n ? (double)T.pd_fill_exp / (double)T.pd_fill_n : 0.0,
                 T.pd_fill_n ? T.pd_fill_ms * 1e3 / (double)T.pd_fill_n : 0.0, T.pd_fill_max,
                 T.pd_rjoin_ms, T.pd_rjoin_n, T.pd_submit_ms, T.pd_submit_n,
                 T.pd_issue_ms - T.pd_fill_ms - T.pd_rjoin_ms - T.pd_submit_ms,
