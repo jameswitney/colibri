@@ -1006,6 +1006,12 @@ deepseek-v4-tiny-check-ring: deepseek-v4-tiny-generate
 	COLI_VULKAN=1 COLI_VK_TIER_STREAM_BYPASS=1 COLI_VK_TIER_STREAM_RING=1 COLI_VK_TIER_STREAM_RING_COLD=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
 		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
 		--fixture ./deepseek_v4_tiny
+# COLI_VK_TIER_STREAM_DEPTH's own leg (the prefill wave): the ring's bypass arm with
+# the stage pools deepened qd16-class (16 x 16 MiB) -- the same token-exact oracle over
+# the wider reads; the depth changes read parallelism only, and the boot line names it.
+	COLI_VULKAN=1 COLI_VK_TIER_STREAM_BYPASS=1 COLI_VK_TIER_STREAM_RING=1 COLI_VK_TIER_STREAM_DEPTH=16 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
 	$(PYTHON) tools/make_deepseek_v4_oracle.py --model "$(MODEL)" \
 		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
 		--output tests/deepseek_v4_oracle.json \

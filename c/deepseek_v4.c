@@ -14355,7 +14355,8 @@ static void v4_vkt_note(const ColiExpertView *view) {
  * (the RAM read is cheaper than the disk, and the hit keeps counting), and note_routed
  * keeps the .coli_usage history whatever loaded the expert -- only a fill's own lookup
  * is spared, and a routing's count was always the one that mattered. The pool is
- * 8 x 16 MiB, 4096-aligned, made once and kept for the process; the engine thread
+ * COLI_VK_TIER_STREAM_DEPTH stages of 16 MiB (8 by default), 4096-aligned, made once and
+ * kept for the process; the engine thread
  * alone hands buffers out (vkt_issue and vkt_stream_prefetch both fill on it) and
  * release hands them back, so there is no lock. Without the flag the engine wires no
  * load_batch and every fill leases exactly as before. Only BC_STREAM fills ever come
@@ -14363,8 +14364,25 @@ static void v4_vkt_note(const ColiExpertView *view) {
  * the CPU path leases on its own. */
 typedef struct { ColiExpertView view; unsigned char *buffer; int stage; int ring; } V4VkHold;
 enum { V4_VKT_STAGE_N = 8, V4_VKT_STAGE_CAP = 16u << 20 };
-static unsigned char *v4_vkt_stage[V4_VKT_STAGE_N];
-static unsigned char v4_vkt_stage_busy[V4_VKT_STAGE_N];
+/* COLI_VK_TIER_STREAM_DEPTH (default 8, 1..64): the stage pools' depth -- stages of
+ * V4_VKT_STAGE_CAP each, and the read queue's width with them, toward the fork's qd16
+ * ring class. Host RAM only: the device ring's width stays the tier's stream slots'
+ * (COLI_VK_TIER_STREAM_SLOTS stays authoritative for the device budget -- a deeper pool
+ * reads wider, it never holds more experts on the device than the slots have places),
+ * and the fill groups that drain it stay 64-wide at most (vk_tier.c's arrays). */
+static int v4_vkt_depth(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char *d = getenv("COLI_VK_TIER_STREAM_DEPTH");
+        n = d && *d ? atoi(d) : V4_VKT_STAGE_N;
+        if (n < 1) n = 1;
+        if (n > 64) n = 64;
+    }
+    return n;
+}
+static unsigned char **v4_vkt_stage;
+static unsigned char *v4_vkt_stage_busy;
+static int v4_vkt_stage_n;   /* the pool's width (v4_vkt_depth()), set when the pool is made */
 static int v4_vkt_stage_state;   /* 0 not made, 1 ready, -1 unusable (record or memory) */
 static int v4_vkt_bypass;
 static int v4_vkt_stage_init(ColiExpertStore *store) {
@@ -14377,20 +14395,29 @@ static int v4_vkt_stage_init(ColiExpertStore *store) {
                 XT_TAG, record / 1048576.0, V4_VKT_STAGE_CAP >> 20);
         return 0;
     }
-    for (int i = 0; i < V4_VKT_STAGE_N; i++) {
-        if (posix_memalign((void **)&v4_vkt_stage[i], 4096, V4_VKT_STAGE_CAP)) {
-            while (i > 0) compat_aligned_free(v4_vkt_stage[--i]);
-            fprintf(stderr, "%s tier deepseek_v4: no memory for the %d x %d MiB stage pool; "
-                    "the stream's fills take the store's lease as before\n",
-                    XT_TAG, V4_VKT_STAGE_N, V4_VKT_STAGE_CAP >> 20);
-            return 0;
+    const int n = v4_vkt_depth();
+    v4_vkt_stage = calloc((size_t)n, sizeof *v4_vkt_stage);
+    v4_vkt_stage_busy = calloc((size_t)n, 1);
+    if (v4_vkt_stage && v4_vkt_stage_busy) {
+        int i;
+        for (i = 0; i < n; i++)
+            if (posix_memalign((void **)&v4_vkt_stage[i], 4096, V4_VKT_STAGE_CAP)) break;
+        if (i >= n) {
+            v4_vkt_stage_n = n;
+            v4_vkt_stage_state = 1;
+            return 1;
         }
+        while (i > 0) compat_aligned_free(v4_vkt_stage[--i]);
     }
-    v4_vkt_stage_state = 1;
-    return 1;
+    free(v4_vkt_stage); free(v4_vkt_stage_busy);
+    v4_vkt_stage = NULL; v4_vkt_stage_busy = NULL;
+    fprintf(stderr, "%s tier deepseek_v4: no memory for the %d x %d MiB stage pool; "
+                    "the stream's fills take the store's lease as before\n",
+            XT_TAG, n, V4_VKT_STAGE_CAP >> 20);
+    return 0;
 }
 static int v4_vkt_stage_take(void) {
-    for (int i = 0; i < V4_VKT_STAGE_N; i++)
+    for (int i = 0; i < v4_vkt_stage_n; i++)
         if (!v4_vkt_stage_busy[i]) { v4_vkt_stage_busy[i] = 1; return i; }
     return -1;
 }
@@ -14446,7 +14473,8 @@ static int v4_vkt_load(void *ctx, int layer, int expert, VktExpertSrc *src, void
                 ? v4_vkt_stage_take() : -1;
     return v4_vkt_load_one(store, layer, expert, src, h, stage);
 }
-/* The group reader (vk_tier.h's load_batch): up to V4_VKT_STAGE_N experts a call -- the
+/* The group reader (vk_tier.h's load_batch): up to the stage pool's depth
+ * (COLI_VK_TIER_STREAM_DEPTH) experts a call -- the
  * pool bounds the bypassing reads, and with them the leases -- each expert read by its
  * own thread, a cold one into its own stage buffer and one the store holds leased (the
  * warm start and the prewarm read this way; cold disk reads want the queue depth).
@@ -14458,12 +14486,12 @@ static int v4_vkt_load_batch(void *ctx, int layer, const int *eids, int n,
     ColiExpertStore *store = ctx;
     if (n > 64) n = 64;
     if (n < 1) return 0;
-    int plan = n < V4_VKT_STAGE_N ? n : V4_VKT_STAGE_N, st[64];
+    int plan, st[64];
     if (v4_vkt_bypass && v4_vkt_stage_init(store)) {
         int free_n = 0;
-        for (int i = 0; i < V4_VKT_STAGE_N; i++) free_n += !v4_vkt_stage_busy[i];
+        for (int i = 0; i < v4_vkt_stage_n; i++) free_n += !v4_vkt_stage_busy[i];
         plan = 0;
-        for (int i = 0; i < n && plan < V4_VKT_STAGE_N; i++) {
+        for (int i = 0; i < n && plan < v4_vkt_stage_n; i++) {
             int stage = -1;
             if (!coli_v4_expert_store_in_ram(store, (ColiExpertKey){layer, eids[i]})) {
                 if (!free_n) break;   /* the pool bounds the batch; the rest come next call */
@@ -14473,13 +14501,15 @@ static int v4_vkt_load_batch(void *ctx, int layer, const int *eids, int n,
             }
             st[plan++] = stage;
         }
-    } else
+    } else {   /* no stage pool: every read leases, the batch's width only */
+        plan = n;
         for (int i = 0; i < plan; i++) st[i] = -1;
+    }
     if (!plan) return 0;
     void *hh[64];
     unsigned char ok[64];
     #pragma omp parallel for schedule(dynamic, 1) if (plan > 1) \
-            num_threads(plan > V4_VKT_STAGE_N ? V4_VKT_STAGE_N : plan)
+            num_threads(plan > v4_vkt_stage_n && v4_vkt_stage_n > 0 ? v4_vkt_stage_n : plan)
     for (int i = 0; i < plan; i++) {
         void *h = NULL;
         ok[i] = (unsigned char)v4_vkt_load_one(store, layer, eids[i], &srcs[i], &h, st[i]);
@@ -14505,10 +14535,11 @@ static int v4_vkt_load_batch(void *ctx, int layer, const int *eids, int n,
  * that slips through stays to the engine's inline fill at the step, like a failed
  * read: the partial ring is profit, the inline path is the fallback. The buffers are
  * made once and kept for the process, like the engine's own. */
-static unsigned char *v4_vkt_ring_stage[V4_VKT_STAGE_N];
-static unsigned char v4_vkt_ring_stage_busy[V4_VKT_STAGE_N];
+static unsigned char **v4_vkt_ring_stage;
+static unsigned char *v4_vkt_ring_stage_busy;
+static int v4_vkt_ring_stage_n;   /* the ring pool's width (v4_vkt_depth()), set when the pool is made */
 static void v4_vkt_ring_stage_back(int stage) {
-    if (stage >= 0 && stage < V4_VKT_STAGE_N) v4_vkt_ring_stage_busy[stage] = 0;
+    if (stage >= 0 && stage < v4_vkt_ring_stage_n) v4_vkt_ring_stage_busy[stage] = 0;
 }
 static int v4_vkt_ring_stage_state;
 static int v4_vkt_ring_stage_init(ColiExpertStore *store) {
@@ -14521,17 +14552,26 @@ static int v4_vkt_ring_stage_init(ColiExpertStore *store) {
                 XT_TAG, record / 1048576.0, V4_VKT_STAGE_CAP >> 20);
         return 0;
     }
-    for (int i = 0; i < V4_VKT_STAGE_N; i++) {
-        if (posix_memalign((void **)&v4_vkt_ring_stage[i], 4096, V4_VKT_STAGE_CAP)) {
-            while (i > 0) compat_aligned_free(v4_vkt_ring_stage[--i]);
-            fprintf(stderr, "%s tier deepseek_v4: no memory for the ring's %d x %d MiB stage pool; "
-                            "the ring's reads stay with the engine's fills\n",
-                    XT_TAG, V4_VKT_STAGE_N, V4_VKT_STAGE_CAP >> 20);
-            return 0;
+    const int n = v4_vkt_depth();
+    v4_vkt_ring_stage = calloc((size_t)n, sizeof *v4_vkt_ring_stage);
+    v4_vkt_ring_stage_busy = calloc((size_t)n, 1);
+    if (v4_vkt_ring_stage && v4_vkt_ring_stage_busy) {
+        int i;
+        for (i = 0; i < n; i++)
+            if (posix_memalign((void **)&v4_vkt_ring_stage[i], 4096, V4_VKT_STAGE_CAP)) break;
+        if (i >= n) {
+            v4_vkt_ring_stage_n = n;
+            v4_vkt_ring_stage_state = 1;
+            return 1;
         }
+        while (i > 0) compat_aligned_free(v4_vkt_ring_stage[--i]);
     }
-    v4_vkt_ring_stage_state = 1;
-    return 1;
+    free(v4_vkt_ring_stage); free(v4_vkt_ring_stage_busy);
+    v4_vkt_ring_stage = NULL; v4_vkt_ring_stage_busy = NULL;
+    fprintf(stderr, "%s tier deepseek_v4: no memory for the ring's %d x %d MiB stage pool; "
+                    "the ring's reads stay with the engine's fills\n",
+            XT_TAG, n, V4_VKT_STAGE_CAP >> 20);
+    return 0;
 }
 static int v4_vkt_ring_batch(void *ctx, int layer, const int *eids, int n,
                              VktExpertSrc *srcs, void **hs) {
@@ -14539,10 +14579,10 @@ static int v4_vkt_ring_batch(void *ctx, int layer, const int *eids, int n,
     if (n > 64) n = 64;
     if (n < 1 || !v4_vkt_ring_stage_init(store)) return 0;
     int st[64], plan = 0;
-    for (int i = 0; i < n && plan < V4_VKT_STAGE_N; i++) {
+    for (int i = 0; i < n && plan < v4_vkt_ring_stage_n; i++) {
         if (coli_v4_expert_store_in_ram(store, (ColiExpertKey){layer, eids[i]})) break;
         int stage = -1;
-        for (int j = 0; j < V4_VKT_STAGE_N; j++)
+        for (int j = 0; j < v4_vkt_ring_stage_n; j++)
             if (!v4_vkt_ring_stage_busy[j]) { v4_vkt_ring_stage_busy[j] = 1; stage = j; break; }
         if (stage < 0) break;   /* the pool bounds the batch; the rest come next call */
         st[plan++] = stage;
@@ -14551,7 +14591,7 @@ static int v4_vkt_ring_batch(void *ctx, int layer, const int *eids, int n,
     void *hh[64];
     unsigned char ok[64];
     #pragma omp parallel for schedule(dynamic, 1) if (plan > 1) \
-            num_threads(plan > V4_VKT_STAGE_N ? V4_VKT_STAGE_N : plan)
+            num_threads(plan > v4_vkt_ring_stage_n ? v4_vkt_ring_stage_n : plan)
     for (int i = 0; i < plan; i++) {
         V4VkHold *hold = calloc(1, sizeof *hold);
         ok[i] = 0; hh[i] = NULL;
@@ -14707,10 +14747,14 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
     free(lgu); free(ldn);   /* read during XT(init) only */
     if (!tier_on) return;
     atexit(XT(shutdown));
-    if (v4_vkt_bypass)
+    if (v4_vkt_bypass) {   /* the effective depth at boot: the env's, both pools' */
+        int depth = v4_vkt_depth();
         fprintf(stderr, "%s tier deepseek_v4: the stream's fills read past the expert cache "
-                "(%d stages of %d MiB, groups of %d in parallel; COLI_VK_TIER_STREAM_BYPASS)\n",
-                XT_TAG, V4_VKT_STAGE_N, V4_VKT_STAGE_CAP >> 20, V4_VKT_STAGE_N);
+                "(%d stages of %d MiB, groups of %d in parallel; COLI_VK_TIER_STREAM_BYPASS)%s\n",
+                XT_TAG, depth, V4_VKT_STAGE_CAP >> 20, depth,
+                depth != V4_VKT_STAGE_N ?
+                " -- COLI_VK_TIER_STREAM_DEPTH: host read depth only, the device ring's width stays COLI_VK_TIER_STREAM_SLOTS'" : "");
+    }
     g_v4_vkt = (ColiV4VkTier){store, v4_vkt_issue, v4_vkt_join, v4_vkt_note, v4_vkt_routed, v4_vkt_bank, NULL};
 #ifdef COLI_VULKAN
     if (!xt_cuda() && vkt_cs_armed())
