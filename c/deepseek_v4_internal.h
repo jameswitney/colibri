@@ -779,7 +779,10 @@ extern void (*coli_v4_expert_store_ram_gave)(void);
  *          called at the token's finish site after an issue that marked every valid
  *          selection taken and submitted nothing -- ONE expert-batch group (the
  *          residents' cached handles beside aliased store slabs) whose taken[] on
- *          return names the sites; 0 = every selection the CPU's. */
+ *          return names the sites; 0 = every selection the CPU's;
+ *   cs_served    whether the tier would mark (layer, expert) taken at a decode issue
+ *          with no read (a resident's cached ColiVkExpert handle): the pilot's skip
+ *          test, exactly the CS issue path's own. */
 typedef struct {
     ColiExpertStore *store;
     int (*issue)(int layer, const float *x, int S, int K, const int *idx, const float *w,
@@ -795,6 +798,7 @@ typedef struct {
     void (*bank)(int layer, const int *idx, int n);
     int (*issue_group)(int layer, const float *x, int S, int K, const int *idx, const float *w,
                        const VktAliasSrc *src, uint8_t *taken);
+    int (*cs_served)(int layer, int expert);
 } ColiV4VkTier;
 extern const ColiV4VkTier *coli_v4_vk_tier;
 
@@ -829,6 +833,33 @@ int coli_v4_expert_store_read_private(ColiExpertStore *store, ColiExpertKey key,
 extern int (*coli_v4_expert_store_device_tier)(int layer, int expert);
 
 #endif /* COLI_VULKAN || COLI_CUDA */
+
+/* COLI_VK_TIER_PILOT (the store unit's decode read-ahead, the fork's prefetch_hash_body
+ * class): at a chain host-step the NEXT hash layer's routed selection is already known --
+ * ffn.gate.tid2eid is keyed by token id alone, no route compute -- so its store reads can
+ * go out a full layer early and land under the attention device time. The pilot reads are
+ * warm-only (lookup + release on a reader pool of its own; the slot stays resident, the
+ * MoE entry's own lookup then hits RAM, and the hot store's single-flight load coalesces
+ * one that comes while the pilot's read is still on disk -- one read either way). All
+ * bookkeeping a demand lookup does (usage, history, rt_count, ehit, the request/hit/miss
+ * stats) is skipped on the pilot's threads, so a misprediction costs a slot, never a
+ * placement decision. Outside the tier guard above: the pilot lives in the store unit,
+ * which every build compiles. v4_pilot_classify is the DPROF-only marker at the loader's
+ * preload (hit/late/unpredicted); v4_pilot_quiesce drains before a store is destroyed;
+ * v4_pilot_report prints the pilot's own DPROF line. Unset: wanted() is 0, fire does
+ * nothing, zero cost. */
+int v4_pilot_wanted(void);
+int v4_pilot_depth(void);
+void v4_pilot_fire(ColiExpertStore *store, int layer, int token, int topk,
+                   const int64_t *tid2eid, int n_experts, int vocab_size);
+void v4_pilot_classify(int layer, int expert);
+void v4_pilot_quiesce(void);
+void v4_pilot_report(void);
+/* The tier's setup (the generate unit, inside the guard above) sets this so the pilot
+ * skips the experts whose cached device handles serve them with no read -- a pilot read
+ * of one of those would be pure disk traffic. NULL (no tier, the unit tests): nothing
+ * is skipped. */
+extern int (*v4_pilot_tier_served)(ColiExpertStore *store, int layer, int expert);
 #ifdef COLI_VULKAN
 /* The dense chain (deepseek_v4_chain.h, COLI_VK_CHAIN): a layer's attention state as its
  * units keep it, so the chain can mirror it on the device and write back what a forward
@@ -1304,6 +1335,17 @@ int coli_v4_test_force_streaming_direct(ColiExpertStore *store);
 
 ColiV4Session *coli_v4_test_session_bare_create(ColiV4Engine *engine);
 void coli_v4_test_session_bare_destroy(ColiV4Session *session);
+/* COLI_VK_TIER_PILOT's hooks (the store unit's reader pool): fire and quiesce
+ * directly (the chain's A1 submit is the engine's site), the DPROF counters the
+ * pilot's own line prints (which: 0 issued, 1 skip_served, 2 dropped, 3 landed,
+ * 4 failed, 5 hit, 6 late, 7 miss; -1 the pool's started flag), and an env-cache
+ * reset so a leg can arm the lever after earlier legs cached it off (the
+ * counters and the issued-set reset with it). */
+void coli_v4_test_pilot_fire(ColiExpertStore *store, int layer, int token, int topk,
+                             const int64_t *tid2eid, int n_experts, int vocab_size);
+void coli_v4_test_pilot_quiesce(void);
+unsigned long long coli_v4_test_pilot_stat(int which);
+void coli_v4_test_pilot_env_reset(void);
 #endif /* COLI_V4_TEST_HOOKS */
 
 #endif /* COLIBRI_DEEPSEEK_V4_INTERNAL_H */

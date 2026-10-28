@@ -5982,6 +5982,7 @@ static int moe_token_pipeline(float *output,
         int preload = selected < dual_loader_lanes()
             ? selected : dual_loader_lanes();
         for (int i = 0; i < preload; i++) {
+            v4_pilot_classify(weights->plan.layer, expert_ids[i]);   /* DPROF: the pilot's hit/late/unpredicted split (a rows-1 selection is whole here) */
             jobs[i].store = store;
             jobs[i].key = (ColiExpertKey){weights->plan.layer, expert_ids[i]};
             jobs[i].result = -1;
@@ -10358,6 +10359,14 @@ static V4ExpertSlot *hot_oldest_pool_victim(
     return last_resort;
 }
 
+/* Set on the decode read-ahead pilot's reader threads only (COLI_VK_TIER_PILOT,
+ * below): their lookups warm slots -- every bookkeeping a demand lookup does
+ * (usage, history, pins' repin cadence, rt_count, ehit/eheat, the request/hit/miss
+ * stats and their decode mirrors) is skipped where this is set, exactly as the
+ * prewarm fill skips it, so a warm read never moves a placement decision or a
+ * persisted history. Zero on every other thread: byte-identical books. */
+static __thread int v4_store_pilot_lookup;
+
 static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
                       ColiExpertView *view) {
     if (!store || !store->state || !view) {
@@ -10372,7 +10381,7 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         return -1;
     }
     pthread_mutex_lock(&state->mutex);
-    if (!policy->warming) {   /* the fill before the first request is not a use */
+    if (!policy->warming && !v4_store_pilot_lookup) {   /* the fill before the first request is not a use; neither is the pilot's warm read (COLI_VK_TIER_PILOT) */
     state->stats.requests++;
     if (state->decode_phase) state->stats.requests_decode++;
     policy->usage[(size_t)key.layer * state->experts_per_layer + key.expert]++;
@@ -10407,8 +10416,11 @@ retry_lookup:
     if (slot && slot->slab && slot->expert == key.expert) {
         slot->references++;
         state->active_leases++;
-        slot->used = ++state->clock; state->stats.hits++;
-        if (state->decode_phase) state->stats.hits_decode++;
+        slot->used = ++state->clock;
+        if (!v4_store_pilot_lookup) {   /* the pilot warms the slot; the demand read counts */
+            state->stats.hits++;
+            if (state->decode_phase) state->stats.hits_decode++;
+        }
         touch_lru_slot(state, slot);
         if (hot_is_pinned(policy, key.layer, key.expert) && !store->gpu)
             hot_pack_slot_locked(policy, state, record, slot);
@@ -10504,7 +10516,9 @@ retry_lookup:
     slot->expert = key.expert; slot->loading_expert = -1;
     slot->used = ++state->clock;
     touch_lru_slot(state, slot);
-    state->stats.misses++; state->stats.bytes_read += record->record_bytes;
+    if (!v4_store_pilot_lookup) {   /* a pilot read is a warm fill, not a demand miss */
+        state->stats.misses++; state->stats.bytes_read += record->record_bytes;
+    }
     hot_pack_slot_commit(policy, state, record, slot, v4_pack_buf);
     v4_pack_buf = NULL;
     memset(view, 0, sizeof(*view)); view->key = key;
@@ -10514,6 +10528,268 @@ retry_lookup:
     view->lease = slot;
     pthread_cond_broadcast(&state->load_ready);
     pthread_mutex_unlock(&state->mutex); return 0;
+}
+
+/* ---- the decode read-ahead pilot (COLI_VK_TIER_PILOT) ----------------------------
+ * The fork fired the NEXT hash-router layer's expert reads at the layer boundary
+ * (its prefetch_hash_body): ffn.gate.tid2eid is keyed by token id alone, so a
+ * layer's whole routed selection is known before that layer runs -- no route
+ * compute, no hidden state. The port's decode reads issue at the MoE entry
+ * instead, and their disk misses settle on the wall (the CS settle bucket); the
+ * pilot moves them one layer early: at layer i's host-step (the chain's A1
+ * submit, the device starting on layer i's attention) the chain calls
+ * v4_pilot_fire for layer i+COLI_VK_TIER_PILOT_DEPTH's selections of this unit's
+ * tokens, and the reads run here on a small pool of the pilot's own -- never the
+ * loader lanes, whose slots the entry's slide-join owns between a fire and the
+ * drain (a pilot job parked on one would deadlock the preload loop).
+ *
+ * Warm-only, harmless by construction: each read is a plain store lookup whose
+ * lease drops the moment it lands, the slot stays resident, and the MoE entry's
+ * own lookup finds it in RAM -- or, if the pilot's read is still on disk,
+ * lookup_hot's single-flight wait coalesces onto it (one read either way, never
+ * two slabs). A misprediction (the tier served the expert from a cached handle,
+ * the slot was evicted before the entry, or the prediction was never demanded)
+ * costs one slot in that layer's own partition -- victim policy and pins stay
+ * the store's -- and nothing else: the pilot threads set v4_store_pilot_lookup,
+ * so no usage, history, rt_count or stats move (a warm read never shifts a
+ * placement decision, whose residency is the one thing that can flip a token).
+ * Non-hash target layers and depths past the chain's layers fire nothing, the
+ * fork's fallback. */
+enum { V4_PILOT_LANES = 2, V4_PILOT_QUEUE = 32, V4_PILOT_TRACK = 64 };
+enum { V4_PILOT_PENDING = 1, V4_PILOT_READING = 2, V4_PILOT_LANDED = 3 };
+
+typedef struct {
+    ColiExpertKey key;
+    int state;   /* PENDING/READING (the entry's read coalesces) /LANDED */
+} V4PilotTrack;
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t work;   /* a queued key wakes a reader */
+    pthread_cond_t idle;   /* the queue is empty and no reader is mid-lookup */
+    pthread_t threads[V4_PILOT_LANES];
+    int lanes;             /* readers that started; 0 = the pool never came up */
+    int stop;
+    ColiExpertStore *store;   /* the pool is bound to one store; a rebind drains first */
+    ColiExpertKey queue[V4_PILOT_QUEUE];
+    int qh, qn;
+    int reading;           /* readers between the pop and the landed mark */
+    V4PilotTrack track[V4_PILOT_TRACK];   /* the issued set, a ring: classify reads it */
+    int th;
+    /* DPROF (COLI_VK_CHAIN_DPROF): predictions issued, tier-served skips, queue
+     * drops, reads landed, their read wall, and the entry's split of its loader
+     * reads into pilot-hit / pilot-in-flight (late) / unpredicted. */
+    unsigned long long issued, skip_served, dropped, landed, failed;
+    unsigned long long hit, late, miss;
+    double read_ms;
+} V4Pilot;
+
+static V4Pilot g_v4_pilot = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .work = PTHREAD_COND_INITIALIZER,
+    .idle = PTHREAD_COND_INITIALIZER,
+};
+/* Set once the pool is up, read lock-free by the classify marker: unset or no
+ * fire yet and the pilot costs every caller one relaxed load. */
+static int g_v4_pilot_started;
+
+int (*v4_pilot_tier_served)(ColiExpertStore *store, int layer, int expert);
+
+/* the env caches (read once); the test hook resets them so a leg can arm the
+ * lever after earlier legs cached it off */
+static int g_v4_pilot_on = -1, g_v4_pilot_depth_cache = -1, g_v4_pilot_dprof_cache = -1;
+static void v4_pilot_env_cache_reset(void) {
+    g_v4_pilot_on = g_v4_pilot_depth_cache = g_v4_pilot_dprof_cache = -1;
+}
+
+int v4_pilot_wanted(void) {
+    if (g_v4_pilot_on < 0) {
+        const char *e = getenv("COLI_VK_TIER_PILOT");
+        g_v4_pilot_on = e && *e && *e != '0' ? 1 : 0;
+    }
+    return g_v4_pilot_on;
+}
+
+int v4_pilot_depth(void) {
+    if (g_v4_pilot_depth_cache < 0) {
+        const char *e = getenv("COLI_VK_TIER_PILOT_DEPTH");
+        long n = e && *e ? strtol(e, NULL, 10) : 1;
+        if (n < 1) n = 1;
+        if (n > 8) n = 8;   /* the chain's layer count bounds the useful span */
+        g_v4_pilot_depth_cache = (int)n;
+    }
+    return g_v4_pilot_depth_cache;
+}
+
+/* The DPROF gate is the campaign's one knob (COLI_VK_CHAIN_DPROF), cached here
+ * for this unit's own counters -- the same env the tier's cs lines read. */
+static int v4_pilot_dprof(void) {
+    if (g_v4_pilot_dprof_cache < 0) {
+        const char *e = getenv("COLI_VK_CHAIN_DPROF");
+        g_v4_pilot_dprof_cache = e && *e && *e != '0' ? 1 : 0;
+    }
+    return g_v4_pilot_dprof_cache;
+}
+
+static void v4_pilot_track_mark(ColiExpertKey key, int state) {
+    /* called under the pool mutex */
+    for (int i = 0; i < V4_PILOT_TRACK; i++)
+        if (g_v4_pilot.track[i].key.layer == key.layer &&
+            g_v4_pilot.track[i].key.expert == key.expert) {
+            g_v4_pilot.track[i].state = state;
+            return;
+        }
+}
+
+static void *v4_pilot_reader(void *unused) {
+    (void)unused;
+    v4_store_pilot_lookup = 1;   /* this thread's lookups warm, they never count */
+    pthread_mutex_lock(&g_v4_pilot.mutex);
+    for (;;) {
+        while (!g_v4_pilot.qn && !g_v4_pilot.stop)
+            pthread_cond_wait(&g_v4_pilot.work, &g_v4_pilot.mutex);
+        if (g_v4_pilot.stop && !g_v4_pilot.qn) break;
+        ColiExpertKey key = g_v4_pilot.queue[g_v4_pilot.qh];
+        g_v4_pilot.qh = (g_v4_pilot.qh + 1) % V4_PILOT_QUEUE;
+        g_v4_pilot.qn--;
+        g_v4_pilot.reading++;
+        v4_pilot_track_mark(key, V4_PILOT_READING);
+        ColiExpertStore *store = g_v4_pilot.store;
+        int dprof = v4_pilot_dprof();
+        struct timespec t0, t1;
+        if (dprof) clock_gettime(CLOCK_MONOTONIC, &t0);
+        pthread_mutex_unlock(&g_v4_pilot.mutex);
+        ColiExpertView view;
+        int ok = coli_expert_lookup(store, key, &view) == 0;
+        if (ok) coli_expert_release(store, &view);   /* warm-only: the slot stays */
+        pthread_mutex_lock(&g_v4_pilot.mutex);
+        if (dprof) {
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            g_v4_pilot.read_ms += (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+                                  (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+            if (ok) g_v4_pilot.landed++;
+            else g_v4_pilot.failed++;
+        }
+        v4_pilot_track_mark(key, ok ? V4_PILOT_LANDED : V4_PILOT_PENDING);
+        g_v4_pilot.reading--;
+        if (!g_v4_pilot.qn && !g_v4_pilot.reading)
+            pthread_cond_broadcast(&g_v4_pilot.idle);
+    }
+    pthread_mutex_unlock(&g_v4_pilot.mutex);
+    return NULL;
+}
+
+static void v4_pilot_shutdown(void) {
+    pthread_mutex_lock(&g_v4_pilot.mutex);
+    g_v4_pilot.stop = 1;
+    pthread_cond_broadcast(&g_v4_pilot.work);
+    pthread_mutex_unlock(&g_v4_pilot.mutex);
+    for (int i = 0; i < g_v4_pilot.lanes; i++)
+        pthread_join(g_v4_pilot.threads[i], NULL);
+    g_v4_pilot.lanes = 0;
+}
+
+/* Bring the pool up on the first fire (and rebind it, drained, if another
+ * store's forward fires it -- one engine a process in practice, the two chains
+ * of a dev2 setup sharing the one store). */
+static void v4_pilot_pool_start(ColiExpertStore *store) {
+    pthread_mutex_lock(&g_v4_pilot.mutex);
+    if (g_v4_pilot.store != store) {
+        while (g_v4_pilot.qn || g_v4_pilot.reading)
+            pthread_cond_wait(&g_v4_pilot.idle, &g_v4_pilot.mutex);
+        g_v4_pilot.store = store;
+    }
+    if (!g_v4_pilot.lanes && !g_v4_pilot.stop) {
+        for (int i = 0; i < V4_PILOT_LANES; i++)
+            if (pthread_create(&g_v4_pilot.threads[i], NULL,
+                               v4_pilot_reader, NULL) == 0)
+                g_v4_pilot.lanes++;
+        if (g_v4_pilot.lanes) {
+            atexit(v4_pilot_shutdown);
+            __atomic_store_n(&g_v4_pilot_started, 1, __ATOMIC_RELEASE);
+        }
+    }
+    pthread_mutex_unlock(&g_v4_pilot.mutex);
+}
+
+void v4_pilot_quiesce(void) {
+    if (!__atomic_load_n(&g_v4_pilot_started, __ATOMIC_RELAXED)) return;
+    pthread_mutex_lock(&g_v4_pilot.mutex);
+    while (g_v4_pilot.qn || g_v4_pilot.reading)
+        pthread_cond_wait(&g_v4_pilot.idle, &g_v4_pilot.mutex);
+    pthread_mutex_unlock(&g_v4_pilot.mutex);
+}
+
+void v4_pilot_fire(ColiExpertStore *store, int layer, int token, int topk,
+                   const int64_t *tid2eid, int n_experts, int vocab_size) {
+    if (!v4_pilot_wanted() || !store || !tid2eid || topk < 1 || n_experts < 1 ||
+        layer < 0 || token < 0 || token >= vocab_size)
+        return;
+    v4_pilot_pool_start(store);
+    pthread_mutex_lock(&g_v4_pilot.mutex);
+    if (!g_v4_pilot.lanes) {   /* the pool never came up: current behaviour */
+        pthread_mutex_unlock(&g_v4_pilot.mutex);
+        return;
+    }
+    int dprof = v4_pilot_dprof();
+    for (int rank = 0; rank < topk; rank++) {
+        int64_t id = tid2eid[(size_t)token * topk + rank];
+        if (id < 0 || id >= n_experts) continue;
+        ColiExpertKey key = {layer, (int)id};
+        if (v4_pilot_tier_served && v4_pilot_tier_served(store, layer, (int)id)) {
+            if (dprof) g_v4_pilot.skip_served++;   /* the handle serves it: no read to warm */
+            continue;
+        }
+        int queued = 0;
+        for (int i = 0; i < g_v4_pilot.qn; i++)   /* one read a key: re-fires ride the first */
+            if (g_v4_pilot.queue[(g_v4_pilot.qh + i) % V4_PILOT_QUEUE].layer == layer &&
+                g_v4_pilot.queue[(g_v4_pilot.qh + i) % V4_PILOT_QUEUE].expert == (int)id)
+                { queued = 1; break; }
+        if (queued) continue;
+        if (g_v4_pilot.qn >= V4_PILOT_QUEUE) {
+            if (dprof) g_v4_pilot.dropped++;   /* a full queue is a late prediction, not a loss */
+            continue;
+        }
+        g_v4_pilot.queue[(g_v4_pilot.qh + g_v4_pilot.qn) % V4_PILOT_QUEUE] = key;
+        g_v4_pilot.qn++;
+        g_v4_pilot.track[g_v4_pilot.th] = (V4PilotTrack){key, V4_PILOT_PENDING};
+        g_v4_pilot.th = (g_v4_pilot.th + 1) % V4_PILOT_TRACK;
+        if (dprof) g_v4_pilot.issued++;
+        pthread_cond_signal(&g_v4_pilot.work);
+    }
+    pthread_mutex_unlock(&g_v4_pilot.mutex);
+}
+
+void v4_pilot_classify(int layer, int expert) {
+    if (!__atomic_load_n(&g_v4_pilot_started, __ATOMIC_RELAXED) ||
+        !v4_pilot_dprof())
+        return;
+    pthread_mutex_lock(&g_v4_pilot.mutex);
+    int state = 0;
+    for (int i = 0; i < V4_PILOT_TRACK; i++)
+        if (g_v4_pilot.track[i].key.layer == layer &&
+            g_v4_pilot.track[i].key.expert == expert) {
+            state = g_v4_pilot.track[i].state;
+            break;
+        }
+    if (state == V4_PILOT_LANDED) g_v4_pilot.hit++;      /* the entry's read is a RAM hit */
+    else if (state) g_v4_pilot.late++;                   /* in flight: the entry coalesces on it */
+    else g_v4_pilot.miss++;                              /* no prediction: a cold read as today */
+    pthread_mutex_unlock(&g_v4_pilot.mutex);
+}
+
+void v4_pilot_report(void) {
+    if (!v4_pilot_dprof()) return;
+    pthread_mutex_lock(&g_v4_pilot.mutex);
+    unsigned long long issued = g_v4_pilot.issued;
+    if (issued || g_v4_pilot.hit || g_v4_pilot.late || g_v4_pilot.miss)
+        fprintf(stderr, "v4_cs pilot dprof: %llu predictions issued (%llu tier-served "
+                        "skipped, %llu dropped), %llu landed (%.1f ms reads, %llu failed); "
+                        "entry reads %llu hit + %llu late + %llu unpredicted\n",
+                issued, g_v4_pilot.skip_served, g_v4_pilot.dropped,
+                g_v4_pilot.landed, g_v4_pilot.read_ms, g_v4_pilot.failed,
+                g_v4_pilot.hit, g_v4_pilot.late, g_v4_pilot.miss);
+    pthread_mutex_unlock(&g_v4_pilot.mutex);
 }
 
 #ifdef COLI_V4_TEST_HOOKS
@@ -10527,6 +10803,46 @@ int coli_v4_test_expert_slot_index(ColiExpertStore *store, ColiExpertKey key) {
     int result = slot ? (int)(slot - state->slots) : -1;
     pthread_mutex_unlock(&state->mutex);
     return result;
+}
+
+/* COLI_VK_TIER_PILOT's own hooks (tests): fire/quiesce direct (the chain's A1
+ * submit is the engine's site), the counters the DPROF line prints, and an
+ * env-cache reset so a test can arm the lever after earlier legs cached it off.
+ * stat: 0 issued, 1 skip_served, 2 dropped, 3 landed, 4 failed, 5 hit, 6 late,
+ * 7 miss; -1 the pool's started flag. */
+void coli_v4_test_pilot_fire(ColiExpertStore *store, int layer, int token, int topk,
+                             const int64_t *tid2eid, int n_experts, int vocab_size) {
+    v4_pilot_fire(store, layer, token, topk, tid2eid, n_experts, vocab_size);
+}
+void coli_v4_test_pilot_quiesce(void) { v4_pilot_quiesce(); }
+unsigned long long coli_v4_test_pilot_stat(int which) {
+    if (which < 0) return (unsigned long long)__atomic_load_n(
+        &g_v4_pilot_started, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&g_v4_pilot.mutex);
+    unsigned long long value =
+        which == 0 ? g_v4_pilot.issued :
+        which == 1 ? g_v4_pilot.skip_served :
+        which == 2 ? g_v4_pilot.dropped :
+        which == 3 ? g_v4_pilot.landed :
+        which == 4 ? g_v4_pilot.failed :
+        which == 5 ? g_v4_pilot.hit :
+        which == 6 ? g_v4_pilot.late :
+        which == 7 ? g_v4_pilot.miss : 0;
+    pthread_mutex_unlock(&g_v4_pilot.mutex);
+    return value;
+}
+void coli_v4_test_pilot_env_reset(void) {
+    /* the wanted/depth/dprof caches re-read on the next call; the pool, if a
+     * earlier leg started it, keeps its readers (they only read keys handed
+     * them, and a later fire rebinds the store after draining) */
+    pthread_mutex_lock(&g_v4_pilot.mutex);
+    g_v4_pilot.issued = g_v4_pilot.skip_served = g_v4_pilot.dropped = 0;
+    g_v4_pilot.landed = g_v4_pilot.failed = 0;
+    g_v4_pilot.hit = g_v4_pilot.late = g_v4_pilot.miss = 0;
+    g_v4_pilot.read_ms = 0.0;
+    memset(g_v4_pilot.track, 0, sizeof g_v4_pilot.track);
+    pthread_mutex_unlock(&g_v4_pilot.mutex);
+    v4_pilot_env_cache_reset();
 }
 
 void coli_v4_test_reset_direct_io_stats(void) {
@@ -11778,8 +12094,10 @@ void coli_v4_engine_destroy(ColiV4Engine *engine) {
     free(engine->head_cache.data);
     engine->head_cache.data = NULL;
     if (engine->owns_experts && engine->experts && engine->experts->ops &&
-        engine->experts->ops->destroy)
+        engine->experts->ops->destroy) {
+        v4_pilot_quiesce();   /* COLI_VK_TIER_PILOT's warm reads must drop their leases first */
         engine->experts->ops->destroy(engine->experts);
+    }
     engine->experts = NULL;
     if (engine->owns_index && engine->target_index) {
 #ifdef COLI_V4_TEST_HOOKS
@@ -14286,8 +14604,20 @@ static int v4_vkt_join_merged(const float **rows, const float **sum) {
     return vkt_join_merged(rows, sum);
 }
 #endif
+/* COLI_VK_TIER_PILOT's binding (the store unit's reader pool asks through the
+ * pointer): only this store's tier, and only its cached handles. */
+static int v4_vkt_pilot_served(ColiExpertStore *store, int layer, int expert) {
+    return g_v4_vkt.store == store && g_v4_vkt.cs_served &&
+           g_v4_vkt.cs_served(layer, expert);
+}
 static int v4_vkt_join(const float **rows) { return XT(join)(rows); }
 static void v4_vkt_routed(ColiExpertKey key) { coli_v4_expert_store_note_routed(g_v4_vkt.store, key); }
+/* The pilot's skip test, the CS issue path's own taken rule (a resident's cached
+ * ColiVkExpert handle: no read): reads those selections would warm nothing the
+ * entry ever reads. */
+static int v4_vkt_cs_served(int layer, int expert) {
+    return XT(cs_served)(layer, expert);
+}
 /* The VRAM bank's refill (COLI_VK_TIER_BANK_LAYER), the engine-thread seam: the routed
  * ids of the step about to issue, post-router pre-issue -- the bank fills its missing
  * experts before the tier serves the step (vk_tier.h's vkt_bank_fill). */
@@ -14736,7 +15066,8 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
         fprintf(stderr, "%s tier deepseek_v4: the stream's fills read past the expert cache "
                 "(%d stages of %d MiB, groups of %d in parallel; COLI_VK_TIER_STREAM_BYPASS)\n",
                 XT_TAG, V4_VKT_STAGE_N, V4_VKT_STAGE_CAP >> 20, V4_VKT_STAGE_N);
-    g_v4_vkt = (ColiV4VkTier){store, v4_vkt_issue, v4_vkt_join, NULL, v4_vkt_note, v4_vkt_routed, v4_vkt_bank, NULL};
+    g_v4_vkt = (ColiV4VkTier){store, v4_vkt_issue, v4_vkt_join, NULL, v4_vkt_note, v4_vkt_routed, v4_vkt_bank, NULL, v4_vkt_cs_served};
+    v4_pilot_tier_served = v4_vkt_pilot_served;   /* COLI_VK_TIER_PILOT: the tier's residents are not the pilot's to warm */
 #ifdef COLI_VULKAN
     if (!xt_cuda() && vkt_cs_armed()) {
         g_v4_vkt.issue_group = v4_vkt_issue_group;   /* CS-1b: only an armed Vulkan tier defers; every other link keeps today's path whole */
@@ -14799,6 +15130,7 @@ static void v4_vk_tier_report(const char *scope, unsigned long long hits,
                 g_v4_cs_src_n, v4_cs_bytes(g_v4_cs_src_b, ha, sizeof ha),
                 v4_cs_bytes((double)rec, hc, sizeof hc));
     }
+    v4_pilot_report();   /* DPROF: the read-ahead pilot's own line, the settle bucket's other side */
 }
 #endif /* COLI_VULKAN || COLI_CUDA */
 
@@ -15611,6 +15943,7 @@ int main(int argc, char **argv) {
     free(attention);
     free(generated_ids); free(prompt_ids);
     free(hidden); free(next); free(state);
+    v4_pilot_quiesce();   /* COLI_VK_TIER_PILOT's warm reads must drop their leases first */
     experts->ops->destroy(experts);
     coli_st_index_close(index);
     return 0;

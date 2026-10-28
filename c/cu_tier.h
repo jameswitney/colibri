@@ -34,6 +34,7 @@ int  cut_join(const float **rows);
 int  cut_join_merged(const float **rows, const float **sum);
 int cut_join_sum(const float **rows, const float *w, const float **sum);
 int  cut_resident(int layer, int eid);
+int  cut_cs_served(int layer, int eid);   /* vkt_cs_served's CUDA twin: the CS defer's taken rule */
 void cut_begin_forward(void);
 void cut_report(const char *scope, unsigned long long ram_hits, unsigned long long disk_loads);
 size_t cut_expert_bytes(int hidden, int inter, VktFmt gate_up, VktFmt down);
@@ -91,6 +92,7 @@ static inline int  cut_join(const float **r){(void)r;return 0;}
 static inline int  cut_join_merged(const float **r, const float **s){(void)r;*s=0;return 0;}
 static inline int  cut_join_sum(const float **r, const float *w, const float **s){(void)r;(void)w;*s=0;return 0;}
 static inline int  cut_resident(int l,int e){(void)l;(void)e;return 0;}
+static inline int  cut_cs_served(int l,int e){(void)l;(void)e;return 0;}
 static inline void cut_begin_forward(void){}
 static inline void cut_report(const char *s,unsigned long long r,unsigned long long d){(void)s;(void)r;(void)d;}
 static inline size_t cut_expert_bytes(int h,int i,VktFmt a,VktFmt b){(void)h;(void)i;(void)a;(void)b;return 0;}
