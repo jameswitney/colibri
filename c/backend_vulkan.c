@@ -4581,6 +4581,21 @@ typedef struct XbCtx {
         VkDescriptorPool pool; VkDescriptorSet set;
         unsigned long long steps, sums; double sum_ms;
     } st;
+    /* the decode group's row sum (COLI_VK_TIER_CS_DEVSUM): a tail dispatch riding the
+     * NEXT single batch's submit (armed by coli_vk_xb_sum_arm, read at that batch's join
+     * by coli_vk_xb_join_sum) that sums the batch's own y rows -- each bf16 rounded,
+     * added in row order, the finish site's host merge -- so one row reads back, not n.
+     * want: armed for the next issue (consumed by it); rec: the tail is recorded in that
+     * submit; done: it ran, the join hands dsum.out out beside the rows (still valid).
+     * tried: the pipeline is made once, on the first arm -- apart from the grouped
+     * route's init, which a card without its route never reaches. */
+    struct {
+        int want, n, rec, done, tried;
+        XbBuf off, out;
+        VkShaderModule sh; VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkPipeline pipe;
+        VkDescriptorPool pool; VkDescriptorSet set;
+        unsigned long long sums; double sum_ms;
+    } dsum;
 } XbCtx;
 static XbCtx g_xb[2];
 static int xb_dev_ready(const XbCtx *X) { return X->d ? G2.ready : G.ready; }
@@ -5673,7 +5688,7 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
  * *ngemm: how many experts took the GEMM route. 0 = nothing was submitted. */
 static int xb_record_submit(XbCtx *X, VkCommandBuffer cmd, VkFence fence, VkQueryPool qp, ColiVkExpert *const *ex,
                             const int *rows, int count, const size_t *off, int v4, int *ngemm_out,
-                            int slot, size_t x0, size_t i0, size_t y0, const int *amap) {
+                            int slot, size_t x0, size_t i0, size_t y0, const int *amap, int tail) {
     const int D = X->D, I = X->I;
     const size_t a = X->align, dr = (size_t)D * 4;
     if (vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) return 0;
@@ -5805,6 +5820,16 @@ static int xb_record_submit(XbCtx *X, VkCommandBuffer cmd, VkFence fence, VkQuer
         }
     }
 recorded:
+    if (tail) {   /* COLI_VK_TIER_CS_DEVSUM: the decode group's row sum rides the batch's own submit, one fence for both */
+        VkMemoryBarrier tb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &tb, 0, NULL, 0, NULL);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->dsum.pipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->dsum.pl, 0, 1, &X->dsum.set, 0, NULL);
+        int pc[2] = {X->dsum.n, D};
+        vkCmdPushConstants(cmd, X->dsum.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+        vkCmdDispatch(cmd, (uint32_t)((D + 255) / 256), 1, 1);
+    }
     /* the host reads y after the fence */
     VkMemoryBarrier hb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
@@ -5830,6 +5855,10 @@ static int xb_busy(XbCtx *X) { return X->inflight || X->sub[0].inflight || X->su
 static int xb_issue(XbCtx *X, ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows,
                     const float *wrows) {
     if (!X->ready || xb_busy(X) || count < 1) return 0;
+    /* the tail sum's arm is consumed by THIS issue, success or failure: nothing after
+     * it may carry a stale arm (coli_vk_xb_sum_arm armed it for this group alone) */
+    int tail = X->dsum.want;
+    X->dsum.want = X->dsum.rec = X->dsum.done = 0;
     const size_t a = X->align, dr = (size_t)X->D * 4;
     /* COLI_VK_ACT_SWIGLU_V4: each expert's row weights follow its x rows */
     const int v4 = X->act == COLI_VK_ACT_SWIGLU_V4 && X->p_v4;
@@ -5858,10 +5887,25 @@ static int xb_issue(XbCtx *X, ColiVkExpert *const *ex, const int *rows, int coun
         }
     free(first);
     X->nrows = total;
+    if (tail && (!X->dsum.pipe || total != X->dsum.n)) tail = 0;   /* a refused arm: the join's row path */
+    if (tail) {   /* the tail's row table: y's offsets in floats, its descriptors over the scratch as it is now */
+        uint32_t *ro = X->dsum.off.ptr;
+        for (int j = 0; j < total; j++) ro[j] = (uint32_t)(X->yoff[j] >> 2);
+        VkDescriptorBufferInfo bi[3] = {{X->y.buf, 0, X->y.region}, {X->dsum.off.buf, 0, (size_t)total * 4},
+                                        {X->dsum.out.buf, 0, (size_t)X->D * 4}};
+        VkWriteDescriptorSet wr[3];
+        for (int b = 0; b < 3; b++)
+            wr[b] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = X->dsum.set,
+                .dstBinding = (uint32_t)b, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pBufferInfo = &bi[b]};
+        vkUpdateDescriptorSets(X->dev, 3, wr, 0, NULL);
+        X->dsum.rec = 1;
+    }
     int ngemm = 0;
-    int ok = xb_record_submit(X, X->cmd, X->fence, X->qpool, ex, rows, count, off, v4, &ngemm, 0, 0, 0, 0, NULL);
+    int ok = xb_record_submit(X, X->cmd, X->fence, X->qpool, ex, rows, count, off, v4, &ngemm, 0, 0, 0, 0, NULL, tail);
     free(off);
     if (!ok) return 0;
+    X->dsum.done = tail;
     X->inflight = 1; async_begin(X->d);
     X->batches++; X->experts += (unsigned long long)count; X->rows += (unsigned long long)total;
     X->gemm_experts += (unsigned long long)ngemm;
@@ -5890,7 +5934,13 @@ static int dev2_fault(void) {
     fprintf(stderr, "[VK] COLI_VK_DEV2_FAULT: batch #%ld on the second device fails\n", at);
     return 1;
 }
-static int xb_join(XbCtx *X, const float **yrows, double *device_ms) {
+/* xb_join; when the batch carried the tail sum (coli_vk_xb_sum_arm, COLI_VK_TIER_CS_DEVSUM)
+ * *sum = its ONE merged row beside the rows (still handed out: the tail only adds a
+ * dispatch, the y rows it read stay valid until the next issue); *sum = NULL and the
+ * rows alone on every other join. The sum's own device time is inside the batch's
+ * timestamp span (the dispatch rides its submit). */
+static int xb_join2(XbCtx *X, const float **yrows, const float **sum, double *device_ms) {
+    if (sum) *sum = NULL;
     if (!X->inflight) return 0;
     X->inflight = 0;
     int cd = cs_dprof_on();
@@ -5905,6 +5955,7 @@ static int xb_join(XbCtx *X, const float **yrows, double *device_ms) {
         coli_vk_degrade(COLI_VK_DEGRADE, "expert batch fence", "the batch's wait failed: the tier stops");
         X->ready = 0;
         if (X->d) __atomic_store_n(&G2.ready, 0, __ATOMIC_RELEASE);   /* lost: nothing else runs there */
+        X->dsum.done = X->dsum.want = X->dsum.rec = 0;
         return 0;
     }
     async_end(X->d);
@@ -5921,8 +5972,16 @@ static int xb_join(XbCtx *X, const float **yrows, double *device_ms) {
     }
     X->dev_ms += ms;
     if (device_ms) *device_ms = ms;
+    if (sum && X->dsum.done) {   /* the tail ran: one merged row back, its rows beside it */
+        *sum = X->dsum.out.ptr;
+        X->dsum.sums++; X->dsum.done = 0;
+    }
+    X->dsum.want = X->dsum.rec = 0;
     for (int j = 0; j < X->nrows; j++) yrows[j] = (const float *)((const uint8_t *)X->y.ptr + X->yoff[j]);
     return 1;
+}
+static int xb_join(XbCtx *X, const float **yrows, double *device_ms) {
+    return xb_join2(X, yrows, NULL, device_ms);
 }
 int coli_vk_xb_join(const float **yrows, double *device_ms) { return xb_join(&g_xb[0], yrows, device_ms); }
 int coli_vk_xb_join_dev(int dev, const float **yrows, double *device_ms) {
@@ -6087,7 +6146,7 @@ int coli_vk_xb_sub_issue(int h, ColiVkExpert *const *ex, const int *rows, int co
     free(first);
     X->sub[h].nrows = total;
     int ngemm = 0;
-    int ok = xb_record_submit(X, X->sub[h].cmd, X->sub[h].fence, X->sub[h].qp, ex, rows, count, off, v4, &ngemm, 1 + h, x0, i0, y0, NULL);
+    int ok = xb_record_submit(X, X->sub[h].cmd, X->sub[h].fence, X->sub[h].qp, ex, rows, count, off, v4, &ngemm, 1 + h, x0, i0, y0, NULL, 0);
     free(off);
     if (!ok) return 0;
     X->sub[h].inflight = 1; async_begin(X->d);
@@ -6143,6 +6202,51 @@ static int st_buf(XbCtx *X, XbBuf *b, size_t bytes, uint32_t memtype) {
     b->region = r;
     return 1;
 }
+/* the decode group's tail-sum pipeline (expert_sum_dec.spv), made on the first arm:
+ * shader, layout, pipeline, one set of three storage buffers. 0 (once, never retried):
+ * the shader is absent or the device refused -- the group keeps the join's row path. */
+static int xb_dsum_init(XbCtx *X) {
+    if (X->dsum.tried) return X->dsum.pipe != VK_NULL_HANDLE;
+    X->dsum.tried = 1;
+    char ds[1100];
+    derive_dir_file(X->spv, "expert_sum_dec.spv", ds, sizeof ds);
+    if (!(X->dsum.sh = load_spv(X->dev, ds)) ||
+        !xb_layout(X, 3, 0u, 2 * sizeof(int), &X->dsum.dsl, &X->dsum.pl) ||
+        !xb_pipeline(X, X->dsum.sh, X->dsum.pl, NULL, &X->dsum.pipe)) { X->dsum.pipe = VK_NULL_HANDLE; return 0; }
+    VkDescriptorPoolSize ps3 = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+    VkDescriptorPoolCreateInfo dp3 = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps3};
+    if (vkCreateDescriptorPool(X->dev, &dp3, NULL, &X->dsum.pool) != VK_SUCCESS) {
+        X->dsum.pool = VK_NULL_HANDLE; X->dsum.pipe = VK_NULL_HANDLE; return 0;
+    }
+    VkDescriptorSetAllocateInfo da3 = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = X->dsum.pool, .descriptorSetCount = 1, .pSetLayouts = &X->dsum.dsl};
+    if (vkAllocateDescriptorSets(X->dev, &da3, &X->dsum.set) != VK_SUCCESS) {
+        vkDestroyDescriptorPool(X->dev, X->dsum.pool, NULL);
+        X->dsum.pool = VK_NULL_HANDLE; X->dsum.set = VK_NULL_HANDLE; X->dsum.pipe = VK_NULL_HANDLE;
+        return 0;
+    }
+    return 1;
+}
+/* COLI_VK_TIER_CS_DEVSUM: arm the NEXT single batch's submit on the primary device
+ * with the tail dispatch that sums its n rows on the device (expert_sum_dec.spv) -- the
+ * finish site's host merge (each row bf16 rounded, added in row order) done on the
+ * device, one row back instead of n. The arm is consumed by that issue whatever it
+ * does (a refused tail leaves the join's row path, the rows always valid); 0: the
+ * pipeline, the scratch or the row count refused. */
+int coli_vk_xb_sum_arm(int n) {
+    XbCtx *X = &g_xb[0];
+    if (!X->ready || xb_busy(X) || n < 1 || !xb_dsum_init(X)) return 0;
+    if (!st_buf(X, &X->dsum.off, (size_t)n * 4, X->mt_host) ||
+        !st_buf(X, &X->dsum.out, (size_t)X->D * 4, X->mt_cached)) return 0;
+    X->dsum.n = n;
+    X->dsum.want = 1;
+    return 1;
+}
+/* the armed join: xb_join's contract and, when the tail ran, its one merged row */
+int coli_vk_xb_join_sum(const float **yrows, const float **sum, double *device_ms) {
+    return xb_join2(&g_xb[0], yrows, sum, device_ms);
+}
 float *coli_vk_xb_step_begin(int S, int K, const float *x) {
     XbCtx *X = &g_xb[0];
     if (!X->ready || !X->st.pipe || !X->grp_rows || xb_busy(X) || S < 1 || K < 1) return NULL;
@@ -6181,7 +6285,7 @@ int coli_vk_xb_sub_issue_step(int h, ColiVkExpert *const *ex, const int *rows, i
     X->sub[h].nrows = 0;   /* the rows are in ys already: nothing to copy at the join */
     int ngemm = 0;
     int ok = xb_record_submit(X, X->sub[h].cmd, X->sub[h].fence, X->sub[h].qp, ex, rows, count, off, 0, &ngemm,
-                              1 + h, x0, i0, y0, assign);
+                              1 + h, x0, i0, y0, assign, 0);
     free(off);
     if (!ok) return 0;
     X->sub[h].inflight = 1; async_begin(X->d);
@@ -6264,8 +6368,9 @@ static void xb_shutdown(XbCtx *X) {
         if (X->sh_grp_bd[v]) vkDestroyShaderModule(X->dev, X->sh_grp_bd[v], NULL);
     }
     if (X->grp_pool) vkDestroyDescriptorPool(X->dev, X->grp_pool, NULL);
-    XbBuf *sb[8] = {&X->st.xt, &X->st.ys, &X->st.out, &X->st.w, &X->st.use, &X->grp_map[0], &X->grp_map[1], &X->grp_map[2]};
-    for (int k = 0; k < 8; k++) if (sb[k]->buf) { vkDestroyBuffer(X->dev, sb[k]->buf, NULL); vkFreeMemory(X->dev, sb[k]->mem, NULL); }
+    XbBuf *sb[10] = {&X->st.xt, &X->st.ys, &X->st.out, &X->st.w, &X->st.use, &X->grp_map[0], &X->grp_map[1], &X->grp_map[2],
+                     &X->dsum.off, &X->dsum.out};
+    for (int k = 0; k < 10; k++) if (sb[k]->buf) { vkDestroyBuffer(X->dev, sb[k]->buf, NULL); vkFreeMemory(X->dev, sb[k]->mem, NULL); }
     for (int k = 0; k < 15; k++) {
         XbBuf *cb = k < 3 ? &X->cgv_ids[k] : k < 6 ? &X->cgv_tab[k - 3] : k < 9 ? &X->cbd_ids[k - 6] : k < 12 ? &X->cbd_tab[k - 9] : &X->cbd_h[k - 12];
         if (cb->buf) { vkDestroyBuffer(X->dev, cb->buf, NULL); vkFreeMemory(X->dev, cb->mem, NULL); }
@@ -6275,6 +6380,11 @@ static void xb_shutdown(XbCtx *X) {
     if (X->st.pool) vkDestroyDescriptorPool(X->dev, X->st.pool, NULL);
     if (X->st.pl) vkDestroyPipelineLayout(X->dev, X->st.pl, NULL);
     if (X->st.dsl) vkDestroyDescriptorSetLayout(X->dev, X->st.dsl, NULL);
+    if (X->dsum.pipe) vkDestroyPipeline(X->dev, X->dsum.pipe, NULL);
+    if (X->dsum.sh) vkDestroyShaderModule(X->dev, X->dsum.sh, NULL);
+    if (X->dsum.pool) vkDestroyDescriptorPool(X->dev, X->dsum.pool, NULL);
+    if (X->dsum.pl) vkDestroyPipelineLayout(X->dev, X->dsum.pl, NULL);
+    if (X->dsum.dsl) vkDestroyDescriptorSetLayout(X->dev, X->dsum.dsl, NULL);
     for (int v = 0; v < 2; v++) {
         if (X->p_gv[v]) vkDestroyPipeline(X->dev, X->p_gv[v], NULL);
         if (X->sh_gv[v]) vkDestroyShaderModule(X->dev, X->sh_gv[v], NULL);

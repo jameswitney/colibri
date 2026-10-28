@@ -2671,12 +2671,151 @@ static void cs_grow(void) {
     unsetenv("COLI_VK_TIER_DECODE_GROW_RESERVE_GB");
     unsetenv("COLI_VK_TIER_EXPERTS");
 }
+/* COLI_VK_TIER_CS_DEVSUM: the whole group's rows summed ON THE DEVICE -- each bf16
+ * rounded, added in rank order from 0, exactly the finish site's host merge
+ * (deepseek_v4.c's output[i] += coli_bf16_round(dev[k][i])) -- read back as ONE row.
+ * The gate is bit-for-bit: each group's device-merged row equals the host merge of the
+ * SAME group's rows (memcmp), and the two legs' host merges equal each other (the
+ * device rows are deterministic). The unarmed control joins with no merged row at
+ * all; a group with a selection left the CPU's (a refused alias: not whole) keeps the
+ * rows path, its rows against the reference as cs_group's; the alias cache composes
+ * (armed throughout, the keepalive books unaffected by the tail). */
+static void cs_devsum(void) {
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    enum { T = 4 };
+    static const int routes[][K] = {{0, 1, 2}, {0, 1, 3}, {1, 2, 4}, {0, 2, 3}};
+    float w[K] = {0.5f, 0.3f, 0.2f};
+    static float first[T][HF_MAX];   /* the unarmed control's host merges, the armed leg's second yardstick */
+    for (int leg = 0; leg < 2; leg++) {
+        rng = 7;
+        model_make(f, f); g_act = VKT_ACT_SWIGLU_V4; g_limit = 10.0f;
+        float xq[T][H];
+        for (int t = 0; t < T; t++) {   /* fixed inputs: the same rng stream both legs */
+            for (int i = 0; i < H; i++) xq[t][i] = frnd() * 4.0f;
+            qdq128(xq[t], H);
+        }
+        uint32_t hist[L][E], *hrows[L];
+        for (int l = 0; l < L; l++) { hrows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = 0; }
+        hist[0][0] = 100; hist[0][1] = 90;   /* two resident places: layer 0's experts 0 and 1 */
+        setenv("COLI_VK_TIER_EXPERTS", "1", 1);
+        setenv("COLI_VK_TIER_SYNC", "1", 1);
+        setenv("COLI_VK_TIER_RATE", "64", 1);
+        setenv("COLI_VK_TIER_CS_ALIAS_CACHE", "1", 1);   /* composes: the tail changes nothing of the keepalive */
+        if (leg) setenv("COLI_VK_TIER_CS_DEVSUM", "1", 1); else unsetenv("COLI_VK_TIER_CS_DEVSUM");
+        set_budget(2, f, f);
+        VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU_V4, 10.0f);
+        CHECK(vkt_init(&vc, hrows), "cs devsum: the tier did not start (%s)", leg ? "armed" : "unarmed");
+        int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+        for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+        vkt_put_done();
+        CHECK(n == 2, "cs devsum: %d warm of 2 planned (%s)", n, leg ? "armed" : "unarmed");
+        VktAliasSrc asrc[E]; void *slabs[E];
+        for (int e = 0; e < E; e++) slabs[e] = NULL;
+        for (int e = 2; e <= 4; e++)
+            CHECK(cs_alias_slab(0, e, &asrc[e], &slabs[e]), "cs devsum: alias slab for expert %d", e);
+        float merged[T][H];
+        int summed = 0;
+        for (int t = 0; t < T; t++) {
+            VktAliasSrc src[K];
+            for (int k = 0; k < K; k++) { int e = routes[t][k]; src[k] = e >= 2 ? asrc[e] : (VktAliasSrc){0}; }
+            uint8_t taken[K];
+            vkt_begin_forward();
+            (void)vkt_issue_w(0, xq[t], 1, K, routes[t], w, taken);
+            int took = vkt_issue_group(0, xq[t], 1, K, routes[t], w, src, taken);
+            CHECK(took == K, "cs devsum: group %d did not fly whole (%d of %d)", t, took, K);
+            for (int k = 0; k < K; k++)
+                if (!taken[k]) { VktExpertSrc s = src_of(&ex[0][routes[t][k]]); vkt_note(0, routes[t][k], &s); }
+            const float *dev[K], *sum = NULL;
+            CHECK(vkt_join_merged(dev, &sum), "cs devsum: join %d failed (%s)", t, leg ? "armed" : "unarmed");
+            if (leg) CHECK(sum != NULL, "cs devsum: group %d carried no device sum", t);
+            else CHECK(!sum, "cs devsum: the unarmed control handed back a merged row");
+            summed += sum != NULL;
+            memset(merged[t], 0, sizeof merged[t]);
+            for (int k = 0; k < K; k++)   /* the finish site's host merge, itself */
+                if (taken[k])
+                    for (int i = 0; i < H; i++) merged[t][i] += bf16r(dev[k][i]);
+            if (sum)
+                CHECK(memcmp(sum, merged[t], (size_t)H * sizeof(float)) == 0,
+                      "cs devsum: group %d's merged row is not bit-for-bit the host merge", t);
+            if (!leg) memcpy(first[t], merged[t], sizeof first[t]);
+            else CHECK(memcmp(merged[t], first[t], (size_t)H * sizeof(float)) == 0,
+                       "cs devsum: group %d's host merge moved between the legs", t);
+        }
+        char line[4096]; report_line(line, sizeof line);
+        const char *dm = strstr(line, "device-merged (");
+        if (leg) {
+            unsigned long long gn = 0, gr = 0;
+            if (dm) {   /* the count sits before the keyword: \"... refusals), 4 device-merged (12 rows)\" */
+                const char *p = dm;
+                while (p > line && p[-1] == ' ') p--;   /* the count's space, then its digits */
+                while (p > line && p[-1] >= '0' && p[-1] <= '9') p--;
+                gn = strtoull(p, NULL, 10);
+                sscanf(dm, "device-merged (%llu rows)", &gr);
+            }
+            printf("  cs devsum (armed): %d groups merged on the device, books %llu (%llu rows)\n", summed, gn, gr);
+            CHECK(gn == (unsigned long long)T && gr == (unsigned long long)T * K,
+                  "cs devsum: the books say %llu merged (%llu rows), not %d (%d)", gn, gr, T, T * K);
+        } else {
+            printf("  cs devsum (unarmed): %d groups, no merged row, books \"%s\"\n", summed, dm ? dm : "no clause");
+            CHECK(!dm, "cs devsum: the unarmed control engaged the device sum");
+        }
+        vkt_shutdown();
+        for (int e = 0; e < E; e++) free(slabs[e]);
+        model_free();
+    }
+    /* the not-whole group: expert 5 has no slab and no resident place, so its selection
+     * stays the CPU's and the tail must not fly (the host merge has a raw CPU row among
+     * the rounded device ones -- a device sum would reassociate it) */
+    rng = 7;
+    model_make(f, f); g_act = VKT_ACT_SWIGLU_V4; g_limit = 10.0f;
+    float xq[H];
+    for (int i = 0; i < H; i++) xq[i] = frnd() * 4.0f;
+    qdq128(xq, H);
+    uint32_t hist[L][E], *hrows[L];
+    for (int l = 0; l < L; l++) { hrows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = 0; }
+    hist[0][0] = 100; hist[0][1] = 90;
+    setenv("COLI_VK_TIER_CS_DEVSUM", "1", 1);
+    set_budget(2, f, f);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU_V4, 10.0f);
+    CHECK(vkt_init(&vc, hrows), "cs devsum: the mixed group's tier did not start");
+    int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+    for (int i = 0; i < n; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+    vkt_put_done();
+    {
+        static const int mix[K] = {0, 1, 5};
+        VktAliasSrc src[K];
+        for (int k = 0; k < K; k++) src[k] = (VktAliasSrc){0};   /* no slabs here: 0 and 1 resident, 5 the CPU's */
+        uint8_t taken[K];
+        vkt_begin_forward();
+        (void)vkt_issue_w(0, xq, 1, K, mix, w, taken);
+        int took = vkt_issue_group(0, xq, 1, K, mix, w, src, taken);
+        CHECK(took == 2 && !taken[2], "cs devsum: the mixed group took %d (expert 5 should be the CPU's)", took);
+        const float *dev[K], *sum = (const float *)1;
+        CHECK(vkt_join_merged(dev, &sum), "cs devsum: the mixed group's join failed");
+        CHECK(!sum, "cs devsum: a group with a CPU row carried a device sum");
+        float y[HF_MAX];
+        double worst = 0;
+        for (int k = 0; k < 2; k++) {
+            expert_v4(&ex[0][mix[k]], xq, w[k], 10.0f, y);
+            float dr[HF_MAX];
+            for (int i = 0; i < H; i++) dr[i] = bf16r(dev[k][i]);
+            double r = rel(dr, y, H);
+            if (!(r <= worst)) worst = r;
+        }
+        CHECK(no_nan(worst) < 2e-2, "cs devsum: the mixed group's rows off the reference (%.3g)", no_nan(worst));
+        printf("  cs devsum (mixed): %d on the device, expert 5 the CPU's, no merged row, worst %.2e\n", took, no_nan(worst));
+    }
+    vkt_shutdown(); model_free();
+    unsetenv("COLI_VK_TIER_CS_DEVSUM");
+    unsetenv("COLI_VK_TIER_CS_ALIAS_CACHE");
+}
 static void cs_group(void) {
     cs_group_v4(1);   /* the v4 MXFP4 class: aliased + resident selections in one group, < 2e-2 */
     cs_group_v4(0);
     cs_group_i8(1);   /* the non-fp4 rows: the resident selections through the same group, < 2e-3 */
     cs_group_i8(0);
     cs_grow();        /* EXPERTS + DECODE_GROW: the aliased selections still install, > 2e-2 */
+    cs_devsum();      /* CS_DEVSUM: the whole group's rows merge on the device, bit-for-bit the host merge */
     unsetenv("COLI_VK_TIER_SYNC");   /* the suite's next cases (the stream ring) expect it unset */
 }
 

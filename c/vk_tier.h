@@ -349,6 +349,11 @@ int  vkt_wants(int layer, int eid);
 int  vkt_issue_group(int layer, const float *x, int S, int K, const int *idx, const float *w,
                      const VktAliasSrc *src, uint8_t *taken);
 int  vkt_join(const float **rows);
+/* vkt_join; for a CS group that carried the device-sum tail (COLI_VK_TIER_CS_DEVSUM),
+ * *sum = its ONE merged row (each row bf16 rounded, added in rank order -- the finish
+ * site's host merge, bit-for-bit) beside the rows, which stay valid; *sum = NULL on
+ * every other join. */
+int  vkt_join_merged(const float **rows, const float **sum);
 /* vkt_join; for a big step that ran wholly on the device, *sum = its S routed rows (the
  * rank-order sum of w[s*K+k] * expert(s, k) as an fma chain from 0, the engines' loop),
  * summed on the device; else *sum = NULL. w as vkt_issue_w's (NULL = 1). */
@@ -503,6 +508,7 @@ static inline int  vkt_issue(int l,const float *x,int S,int K,const int *i,uint8
 static inline int  vkt_issue_w(int l,const float *x,int S,int K,const int *i,const float *w,uint8_t *t){(void)l;(void)x;(void)S;(void)K;(void)i;(void)w;(void)t;return 0;}
 static inline int  vkt_wants(int l,int e){(void)l;(void)e;return 0;}
 static inline int  vkt_join(const float **r){(void)r;return 0;}
+static inline int  vkt_join_merged(const float **r, const float **s){(void)r;*s=0;return 0;}
 static inline int  vkt_join_sum(const float **r, const float *w, const float **s){(void)r;(void)w;*s=0;return 0;}
 static inline int  vkt_resident(int l,int e){(void)l;(void)e;return 0;}
 static inline void vkt_begin_forward(void){}

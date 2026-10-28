@@ -326,6 +326,13 @@ static struct {
     double cs_release_ms;              /* D: cs_ex_release's span, inside the join's waited */
     unsigned long long cs_release_n;
     unsigned long long cs_alias_bytes; /* E: aliased tensor bytes (weights + scales) built */
+    /* CS device-sum (COLI_VK_TIER_CS_DEVSUM, armed only with COLI_VK_TIER_EXPERTS): the
+     * group's rows summed on the device by a tail dispatch riding its own submit, one
+     * row back at the join in place of the k-row readback + host bf16 merge. cs_devsum
+     * the arm, cs_sum this group carries the tail, the books count the groups that
+     * read a merged row (and the rows they did not read back). */
+    int cs_devsum, cs_sum;
+    unsigned long long cs_sum_n, cs_sum_rows;
     /* PROMPT dprof (COLI_VK_CHAIN_DPROF, the prompt class S > VKT_UP_ROWS): the p_*
      * mirror's host side split. pd_* nest inside one step's window: issue is the
      * issue_big wall (fill/joins/submit are disjoint spans inside it, the rest of
@@ -3188,7 +3195,7 @@ int vkt_issue_group(int layer, const float *x, int S, int K, const int *idx, con
     if (!ex || !res) { free(ex); free(res); T.cs_pending = T.inflight = 0; return 0; }
     /* the entries: a resident's cached handle, else the aliased expert; a refusal (no
      * source, the import, the batch's cap) leaves the selection the CPU's */
-    int ng = 0, total = 0;
+    int ng = 0, total = 0, d2sel = 0;
     double tb = vkt_cs_dprof() ? vkt_now_ms() : 0;
     for (int i = 0; i < n; i++) {
         T.map[i] = -1;
@@ -3199,7 +3206,7 @@ int vkt_issue_group(int layer, const float *x, int S, int K, const int *idx, con
         if (e < 0 || e >= E) continue;
         if (total >= T.max_dev_rows) { T.cs_fallback++; continue; }   /* the batch is as large as it gets */
         VSlot *v = slot(layer, e);
-        if (v->state == VS_RESIDENT && v->ex) { ex[i] = v->ex; res[i] = 1; }
+        if (v->state == VS_RESIDENT && v->ex) { ex[i] = v->ex; res[i] = 1; if (v->dev) d2sel = 1; }
         else if (src && src[i].slab) {
             double ta = vkt_cs_dprof() ? vkt_now_ms() : 0;
             int ahit = 0;
@@ -3229,6 +3236,12 @@ int vkt_issue_group(int layer, const float *x, int S, int K, const int *idx, con
         ng++; total++;
     }
     if (vkt_cs_dprof()) { T.cs_lookup_ms += vkt_now_ms() - tb; T.cs_build_n++; }
+    /* the device sum's arm (COLI_VK_TIER_CS_DEVSUM): only a group that flies whole
+     * (ng == n: no selection the CPU's, the join would merge a host row among the
+     * device's) on the primary device alone (no dev2 resident: the two devices' rows
+     * are contiguous runs, not k order, and a cross-device sum reassociates), with no
+     * hybrid host rows -- the host merge's bf16 rounds and rank order, bit-for-bit */
+    T.cs_sum = T.cs_devsum && !T.hy_n && !d2sel && ng == n && coli_vk_xb_sum_arm(n) ? 1 : 0;
     int took = 0;
     if (ng) {
         /* the primary device's groups first, then the second's, as issue() orders them:
@@ -3279,7 +3292,13 @@ int vkt_issue_group(int layer, const float *x, int S, int K, const int *idx, con
     return took;
 }
 
-int vkt_join(const float **rows) {
+int vkt_join(const float **rows) { return vkt_join_merged(rows, NULL); }
+/* vkt_join; for a CS group that carried the device-sum tail (COLI_VK_TIER_CS_DEVSUM),
+ * *sum = its ONE merged row (each row bf16 rounded, added in rank order -- the finish
+ * site's host merge, bit-for-bit) beside the rows, which stay valid; *sum = NULL on
+ * every other join, the rows as vkt_join gives them. */
+int vkt_join_merged(const float **rows, const float **sum) {
+    if (sum) *sum = NULL;
     if (!T.inflight) return 0;
     T.cs_pending = 0;   /* whatever a join retires, no step is owed a group any more */
     if (T.big) {
@@ -3305,7 +3324,8 @@ int vkt_join(const float **rows) {
     int csd = vkt_cs_dprof() && T.csx && T.S == 1;
     ColiVkCsDiag db, da;
     if (csd) coli_vk_cs_diag(&db);
-    int ok = !T.d0_inflight || coli_vk_xb_join(T.by, &dms);
+    const float *dsum = NULL;
+    int ok = !T.d0_inflight || (T.cs_sum ? coli_vk_xb_join_sum(T.by, &dsum, &dms) : coli_vk_xb_join(T.by, &dms));
     if (csd) coli_vk_cs_diag(&da);
     int ok1 = !T.d2_inflight || coli_vk_xb_join_dev(1, T.by + T.d2_rows0, &dms1);
     if (csd) {
@@ -3337,6 +3357,12 @@ int vkt_join(const float **rows) {
         if (T.share < 0.05f) T.share = 0.05f;
     }
     T.inflight = 0;
+    if (dsum) {   /* the group read ONE merged row: the books count the rows not read back */
+        T.cs_sum_n++;
+        T.cs_sum_rows += (unsigned long long)(T.S * T.K);
+        if (sum) *sum = dsum;
+    }
+    T.cs_sum = 0;
     int n = T.S * T.K;
     for (int i = 0; i < n; i++)
         rows[i] = !(ok && ok1 && hok) ? NULL : T.map[i] >= 0 ? T.by[T.map[i]]
@@ -4172,6 +4198,18 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
                 T.cs_scan_skip = se && *se && atoi(se) != 0 ? 1 : 0;
             }
         }
+        /* CS device-sum (COLI_VK_TIER_CS_DEVSUM, off unless asked): the group's rows
+         * merge on the device (each bf16 rounded, added in row order -- the finish
+         * site's host merge bit-for-bit), one row back at the join. Only a group that
+         * flies whole on the primary device carries the tail; every other group keeps
+         * the rows path, so the arm changes bytes nowhere else. */
+        T.cs_devsum = 0;
+        if (T.csx) {
+            const char *de = getenv("COLI_VK_TIER_CS_DEVSUM");
+            T.cs_devsum = de && *de && atoi(de) != 0 ? 1 : 0;
+            if (T.cs_devsum)
+                fprintf(stderr, VKT_TAG " tier %s: cs device-sum armed: a whole primary-device group's rows merge on the device, one row reads back\n", eng);
+        }
         /* tier adaptive (COLI_VK_TIER_ADAPTIVE): the fork-parity live guard, off unless
          * asked. Its reserve defaults to the boot's (COLI_VK_TIER_RESERVE_GB); the margin
          * is the hysteresis above it before a grow; _GB caps the grown bytes (0 = none).
@@ -4439,9 +4477,12 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     if (dprof && T.d_routed)   /* COLI_VK_CHAIN_DPROF: the decode steps' wait/device/CPU split, promote's bytes */
         fprintf(stderr, " | decode dprof: waited %.1f ms, device %.1f ms, CPU %.1f ms, promoted %.1f MiB",
                 T.d_wait_ms, T.d_dev_ms, T.d_cpu_ms, (double)T.d_up_bytes / 1048576.0);
-    if (T.cs_groups)   /* COLI_VK_TIER_EXPERTS: the finish-site group's own books (one group a layer-token) */
+    if (T.cs_groups) {   /* COLI_VK_TIER_EXPERTS: the finish-site group's own books (one group a layer-token) */
         fprintf(stderr, " | cs: %llu groups, %llu resident + %llu aliased entries on the device, %llu cpu-fallback (%llu alias refusals)",
                 T.cs_groups, T.cs_res, T.cs_alias, T.cs_fallback, T.cs_refuse);
+        if (T.cs_sum_n)   /* CS_DEVSUM: the groups whose join read one merged row, and the rows they did not */
+            fprintf(stderr, ", %llu device-merged (%llu rows)", T.cs_sum_n, T.cs_sum_rows);
+    }
     if (T.cs_cache) {   /* CS-1c: the alias keepalive cache's standing (entries, pinned bytes, reuse; forgotten = vkt_slab_forget's invalidations, the VA-reuse guard) */
         char hc[32];
         fprintf(stderr, " | cs alias cache: %d entries, %zu bytes (%s), %llu hits, %llu misses, %llu evictions, %llu forgotten",

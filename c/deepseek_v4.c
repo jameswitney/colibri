@@ -5784,13 +5784,26 @@ static int v4_vk_token_finish(V4VkToken *vk, float *output, ColiExpertStore *sto
         c++;
     }
     free(read);
-    int joined = !vk->n || (dev && tier && tier->join(dev));
+    /* COLI_VK_TIER_CS_DEVSUM: a whole-flying group may carry a device-merged row (its
+     * k rows summed there, each bf16 rounded in rank order -- the loop below's own
+     * semantics, bit-for-bit); the join hands it out beside the rows. */
+    const float *dsum = NULL;
+    int joined = !vk->n || (dev && tier && tier->join_merged ? tier->join_merged(dev, &dsum)
+                                                             : (dev && tier && tier->join(dev)));
+    if (dsum) {   /* the merged row stands for every taken k: the group flew whole (no
+                  * row below was computed) and this add is that loop, collapsed */
+        int whole = 1;
+        for (int k = 0; k < vk->full; k++) whole &= vk->taken[k] != 0;
+        if (!whole) dsum = NULL;   /* cannot happen (the tail only flies on a whole group); never merge it wrong */
+    }
     vk->joined = 1;
     float *redo = joined ? NULL : malloc((size_t)d * sizeof(*redo));
     if (!result && !joined && !redo)
         result = moe_fail("layer %d: out of memory recomputing the device's experts", layer);
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
-    for (int k = 0, c = 0; !result && k < vk->full; k++) {
+    if (!result && joined && dsum) {
+        for (int i = 0; i < d; i++) output[i] += dsum[i];   /* ONE row, not k: the merge already happened on the device */
+    } else for (int k = 0, c = 0; !result && k < vk->full; k++) {
         if (!vk->taken[k]) {
             const float *src = rows + (size_t)c++ * d;
             for (int i = 0; i < d; i++) output[i] += src[i];
@@ -14267,6 +14280,11 @@ static int v4_vkt_issue_group(int layer, const float *x, int S, int K, const int
     if (g_xt_cuda || !v4_vkt_thread()) return 0;
     return vkt_issue_group(layer, x, S, K, idx, w, src, taken);
 }
+/* COLI_VK_TIER_CS_DEVSUM: the finish-site join that may hand back the device-merged
+ * row; the rows stay valid beside it (the standing merge path is the fallback). */
+static int v4_vkt_join_merged(const float **rows, const float **sum) {
+    return vkt_join_merged(rows, sum);
+}
 #endif
 static int v4_vkt_join(const float **rows) { return XT(join)(rows); }
 static void v4_vkt_routed(ColiExpertKey key) { coli_v4_expert_store_note_routed(g_v4_vkt.store, key); }
@@ -14718,10 +14736,12 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
         fprintf(stderr, "%s tier deepseek_v4: the stream's fills read past the expert cache "
                 "(%d stages of %d MiB, groups of %d in parallel; COLI_VK_TIER_STREAM_BYPASS)\n",
                 XT_TAG, V4_VKT_STAGE_N, V4_VKT_STAGE_CAP >> 20, V4_VKT_STAGE_N);
-    g_v4_vkt = (ColiV4VkTier){store, v4_vkt_issue, v4_vkt_join, v4_vkt_note, v4_vkt_routed, v4_vkt_bank, NULL};
+    g_v4_vkt = (ColiV4VkTier){store, v4_vkt_issue, v4_vkt_join, NULL, v4_vkt_note, v4_vkt_routed, v4_vkt_bank, NULL};
 #ifdef COLI_VULKAN
-    if (!xt_cuda() && vkt_cs_armed())
+    if (!xt_cuda() && vkt_cs_armed()) {
         g_v4_vkt.issue_group = v4_vkt_issue_group;   /* CS-1b: only an armed Vulkan tier defers; every other link keeps today's path whole */
+        g_v4_vkt.join_merged = v4_vkt_join_merged;   /* CS_DEVSUM: the tier decides per group whether a merged row exists */
+    }
 #endif
     int all = c->num_hidden_layers * c->n_routed_experts;
     int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));

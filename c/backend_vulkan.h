@@ -430,6 +430,15 @@ int   coli_vk_xb_sub_issue_step(int h, ColiVkExpert *const *ex, const int *rows,
                                 const float *wrows);   /* wrows: as coli_vk_xb_sub_issue's (a batch off the grouped route) */
 const float *coli_vk_xb_step_sum(const float *w, const uint8_t *use, double *device_ms);
 void  coli_vk_xb_step_end(void);
+/* The decode group's row sum (COLI_VK_TIER_CS_DEVSUM): arm the NEXT single batch's
+ * submit on the primary device with a tail dispatch (expert_sum_dec.spv) that sums its
+ * n rows on the device -- each bf16 rounded, added in row order, the finish site's host
+ * merge (deepseek_v4.c) -- so its join reads ONE row back, not n. The arm is consumed
+ * by that issue whatever it does; a refused one (no pipeline, no scratch) leaves the
+ * join's row path. coli_vk_xb_join_sum is that join: the rows as coli_vk_xb_join gives
+ * them and, when the tail ran, *sum its merged row (else *sum NULL). */
+int   coli_vk_xb_sum_arm(int n);
+int   coli_vk_xb_join_sum(const float **yrows, const float **sum, double *device_ms);
 /* Sub-batches, for a prefill step too big for one batch (vk_tier.c's streaming): batch k
  * of a step goes to half k % 2 of the scratch, so two run at once and the host fills one
  * while the device computes the other. _reserve sizes each half for a batch of up to

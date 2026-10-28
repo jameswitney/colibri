@@ -31,6 +31,7 @@ int  cut_issue_group(int layer, const float *x, int S, int K, const int *idx, co
 int  cut_cs_armed(void);
 int  cut_wants(int layer, int eid);
 int  cut_join(const float **rows);
+int  cut_join_merged(const float **rows, const float **sum);
 int cut_join_sum(const float **rows, const float *w, const float **sum);
 int  cut_resident(int layer, int eid);
 void cut_begin_forward(void);
@@ -87,6 +88,7 @@ static inline int  cut_issue_group(int l,const float *x,int S,int K,const int *i
 static inline int  cut_cs_armed(void){return 0;}
 static inline int  cut_wants(int l,int e){(void)l;(void)e;return 0;}
 static inline int  cut_join(const float **r){(void)r;return 0;}
+static inline int  cut_join_merged(const float **r, const float **s){(void)r;*s=0;return 0;}
 static inline int  cut_join_sum(const float **r, const float *w, const float **s){(void)r;(void)w;*s=0;return 0;}
 static inline int  cut_resident(int l,int e){(void)l;(void)e;return 0;}
 static inline void cut_begin_forward(void){}
