@@ -4765,6 +4765,11 @@ typedef struct XbCtx {
     VkPipelineLayout pl6, pl4, pl3;
     VkPipeline p_gu, p_mv, p_act, p_mm[VK_GEMM_SLOTS], p_coop[VK_COOP_SLOTS];
     VkPipeline p_gu_bd, p_mv_bd;   /* the block formats' GEMVs (bd_shaders), NULL without them */
+    /* COLI_VK_V4_S1GEMV: the fork's dedicated fmt-15 S=1 GEMV (qmatmul_s1_mx.spv) on
+     * the down of a decode row -- optional at run time like the block pair, and armed
+     * only past xb_s1gemv_parity (the bitwise-vs-generic gate; s1_ok is that verdict) */
+    VkShaderModule sh_s1; VkPipeline p_s1; int s1_ok;
+    unsigned long long s1_gemvs;   /* down dispatches the dedicated GEMV took */
     VkPipeline p_mm_bd[64]; uint8_t mm_bd_tried[64];   /* their tiled GEMM (qmatmul_gemm_bd.spv), a pipeline per ggml type, made on first use */
     VkDescriptorPool *dpools; int ndpools;
     VkDescriptorPool act_pool; VkDescriptorSet act_set;
@@ -5567,6 +5572,112 @@ static int xb_cbd_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
     return 1;
 }
 
+/* COLI_VK_V4_S1GEMV's pick for one down GEMV (the fork's ds4vk_expert_s1gemv_pick):
+ * the dedicated pipeline only for a single row over a staged input (I <= 6144, % 8,
+ * matching xsh) of fmt 15 with 8-aligned groups, and only on a context whose parity
+ * gate passed. g_s1_forced is the tests' in-process override (-1 the lever's own
+ * state), the fork's force hook: a static env cache would poison the switching. */
+static int g_s1_forced = -1;
+static VkPipeline xb_s1gemv_pick(const XbCtx *X, const ColiVkTensor *t, int rows) {
+    if (g_s1_forced == 0) return X->p_mv;
+    if (!X->p_s1 || !X->s1_ok || rows != 1 || t->fmt != 15 || t->I > 6144 ||
+        (t->I & 7) || t->rowWords != t->I >> 3 || !t->gs || (t->gs & 7)) return X->p_mv;
+    return X->p_s1;
+}
+/* The S=1 kernel's parity leg, run once at the lever's arm before anything may take
+ * the pipeline: the same random fmt-15 weights through the generic qmatmul dispatch
+ * and the dedicated GEMV, bit for bit (the fork's test-vk-dsv4-experts discipline).
+ * The scale bytes cycle through every ue8m0 code, 0 and 0xff included. 1 = exact; on
+ * the first differing row it says which and returns 0. */
+static int xb_s1gemv_parity(XbCtx *X) {
+    enum { PI = 2048, PO = 256, PGS = 32 };   /* I % 8, groups of 32: what the pick gates */
+    const int rw = PI >> 3, ng = PI / PGS;
+    XbBuf bx, bw, bs, by[2];
+    memset(&bx, 0, sizeof bx); memset(&bw, 0, sizeof bw); memset(&bs, 0, sizeof bs);
+    memset(by, 0, sizeof by);
+    VkDescriptorPool dp = VK_NULL_HANDLE;
+    VkDescriptorSet sets[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    int ok = 0;
+    if (!xb_buf(X, &bx, (size_t)PI * 4, X->mt_host, 1) ||
+        !xb_buf(X, &bw, (size_t)PO * rw * 4, X->mt_host, 1) ||
+        !xb_buf(X, &bs, (size_t)PO * ng, X->mt_host, 1) ||
+        !xb_buf(X, &by[0], (size_t)PO * 4, X->mt_cached, 1) ||
+        !xb_buf(X, &by[1], (size_t)PO * 4, X->mt_cached, 1)) goto out;
+    {   /* a fixed pattern: reproducible from the stderr line alone */
+        uint32_t r = 0x1234567u;
+        float *x = bx.ptr; uint32_t *w = bw.ptr; uint8_t *sc = bs.ptr;
+        for (int i = 0; i < PI; i++) { r = r * 1664525u + 1013904223u; x[i] = (float)(int)(r >> 20) * (1.f / 2048.f) - 1.f; }
+        for (int i = 0; i < PO * rw; i++) { r = r * 1664525u + 1013904223u; w[i] = r; }
+        for (int i = 0; i < PO * ng; i++) sc[i] = (uint8_t)(i * 7 + 13);
+        memset(by[0].ptr, 0, (size_t)PO * 4); memset(by[1].ptr, 0, (size_t)PO * 4);
+    }
+    {   /* two sets off the batch's own dsl4: same X/W/Sc, Y each its own */
+        VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 4}};
+        VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = 2, .poolSizeCount = 2, .pPoolSizes = ps};
+        if (vkCreateDescriptorPool(X->dev, &dpi, NULL, &dp) != VK_SUCCESS) goto out;
+        VkDescriptorSetLayout ls[2] = {X->dsl4, X->dsl4};
+        VkDescriptorSetAllocateInfo dai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = dp, .descriptorSetCount = 2, .pSetLayouts = ls};
+        if (vkAllocateDescriptorSets(X->dev, &dai, sets) != VK_SUCCESS) goto out;
+        for (int s = 0; s < 2; s++) {
+            VkDescriptorBufferInfo bi[4] = {{bx.buf, 0, bx.region}, {bw.buf, 0, bw.region},
+                                            {bs.buf, 0, bs.region}, {by[s].buf, 0, by[s].region}};
+            VkWriteDescriptorSet w[4];
+            for (int b = 0; b < 4; b++)
+                w[b] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = sets[s],
+                    .dstBinding = (uint32_t)b, .descriptorCount = 1,
+                    .descriptorType = (b == 0 || b == 3) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+                                                          : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    .pBufferInfo = &bi[b]};
+            vkUpdateDescriptorSets(X->dev, 4, w, 0, NULL);
+        }
+    }
+    {   /* the generic dispatch exactly as the batch records it, then the dedicated one */
+        if (vkResetCommandBuffer(X->cmd, 0) != VK_SUCCESS) goto out;
+        VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+        if (vkBeginCommandBuffer(X->cmd, &bi) != VK_SUCCESS) goto out;
+        struct PC pc = {15, 1, PI, PO, rw, PGS};
+        uint32_t dyn[2] = {0, 0};
+        vkCmdBindPipeline(X->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->p_mv);
+        vkCmdBindDescriptorSets(X->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->pl4, 0, 1, &sets[0], 2, dyn);
+        vkCmdPushConstants(X->cmd, X->pl4, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        vkCmdDispatch(X->cmd, (uint32_t)((PO + 7) / 8), 1, 1);
+        xb_barrier(X->cmd);
+        vkCmdBindPipeline(X->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->p_s1);
+        vkCmdBindDescriptorSets(X->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->pl4, 0, 1, &sets[1], 2, dyn);
+        vkCmdPushConstants(X->cmd, X->pl4, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        vkCmdDispatch(X->cmd, (uint32_t)((PI + 7) / 8), 1, 1);
+        VkMemoryBarrier hb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
+        vkCmdPipelineBarrier(X->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                             0, 1, &hb, 0, NULL, 0, NULL);
+        if (vkEndCommandBuffer(X->cmd) != VK_SUCCESS) goto out;
+        VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &X->cmd};
+        if (vkResetFences(X->dev, 1, &X->fence) != VK_SUCCESS ||
+            vk_submit(X->d, X->q, &si, X->fence) != VK_SUCCESS ||
+            vkWaitForFences(X->dev, 1, &X->fence, VK_TRUE, ~(uint64_t)0) != VK_SUCCESS) goto out;
+    }
+    ok = !memcmp(by[0].ptr, by[1].ptr, (size_t)PO * 4);
+    if (!ok)
+        for (int o = 0; o < PO; o++)
+            if (memcmp((const uint8_t *)by[0].ptr + (size_t)o * 4, (const uint8_t *)by[1].ptr + (size_t)o * 4, 4)) {
+                float ya, yb2; memcpy(&ya, (const uint8_t *)by[0].ptr + (size_t)o * 4, 4);
+                memcpy(&yb2, (const uint8_t *)by[1].ptr + (size_t)o * 4, 4);
+                fprintf(stderr, "[VK] tier s1gemv: parity row %d of %d: generic %.9g, dedicated %.9g\n",
+                        o, PO, ya, yb2);
+                break;
+            }
+out:
+    if (dp) vkDestroyDescriptorPool(X->dev, dp, NULL);
+    for (int s = 0; s < 2; s++)
+        if (by[s].buf) { vkDestroyBuffer(X->dev, by[s].buf, NULL); vkFreeMemory(X->dev, by[s].mem, NULL); }
+    if (bs.buf) { vkDestroyBuffer(X->dev, bs.buf, NULL); vkFreeMemory(X->dev, bs.mem, NULL); }
+    if (bw.buf) { vkDestroyBuffer(X->dev, bw.buf, NULL); vkFreeMemory(X->dev, bw.mem, NULL); }
+    if (bx.buf) { vkDestroyBuffer(X->dev, bx.buf, NULL); vkFreeMemory(X->dev, bx.mem, NULL); }
+    return ok;
+}
 static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a, float b) {
     if (X->ready) {   /* the activation rides the push constants; the geometry changes
                        * only while no expert is allocated (scratch grows by bytes) */
@@ -5655,6 +5766,29 @@ static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a,
     /* a first scratch for 64 rows of 16 experts; grows with the first prefill */
     if (!xb_reserve(X, 64 * (size_t)D * 4 + 16 * X->align, 64 * (size_t)I * 4 + 16 * X->align,
                     64 * (size_t)D * 4 + 16 * X->align)) return 0;
+    {   /* COLI_VK_V4_S1GEMV: the fork's dedicated fmt-15 S=1 GEMV on the down of a decode
+         * row. Default off; armed only past the parity leg -- a mismatch destroys the
+         * pipeline so nothing can take it, and the generic form stays (one line each). */
+        const char *s1 = getenv("COLI_VK_V4_S1GEMV");
+        if (s1 && atoi(s1)) {
+            char s1_path[1100];
+            derive_dir_file(X->spv, "qmatmul_s1_mx.spv", s1_path, sizeof s1_path);
+            X->sh_s1 = load_spv(X->dev, s1_path);
+            if (X->sh_s1 && xb_pipeline(X, X->sh_s1, X->pl4, NULL, &X->p_s1) && xb_s1gemv_parity(X)) {
+                X->s1_ok = 1;
+                fprintf(stderr, "[VK] tier s1gemv: qmatmul_s1_mx armed%s (down of S=1 rows, parity vs qmatmul exact)\n",
+                        X->d ? " dev2" : "");
+            } else {
+                if (X->p_s1) {
+                    vkDestroyPipeline(X->dev, X->p_s1, NULL);
+                    fprintf(stderr, "[VK] tier s1gemv: parity vs qmatmul NOT exact -- the generic GEMV stays%s\n",
+                            X->d ? " (dev2)" : "");
+                } else fprintf(stderr, "[VK] tier s1gemv: qmatmul_s1_mx.spv absent or invalid -- the generic GEMV stays%s\n",
+                               X->d ? " (dev2)" : "");
+                X->p_s1 = VK_NULL_HANDLE;
+            }
+        }
+    }
     if (act == COLI_VK_ACT_SWIGLU_V4 && !xb_v4_init(X)) return 0;
     X->ready = 1;
     return 1;
@@ -6066,13 +6200,17 @@ static int xb_record_submit(XbCtx *X, VkCommandBuffer cmd, VkFence fence, VkQuer
             int k = route[c], gemm = k >= 0;
             int bm = 8, bn = 1;
             if (k == XB_ROUTE_CGV) continue;   /* down on the chain's kernel already */
-            VkPipeline pipe = gemm ? xb_mm_pipeline(X, e->d, rows[c], k, &bm, &bn, &cooperative) : bd_fmt(e->d->fmt) ? X->p_mv_bd : X->p_mv;
+            VkPipeline pipe = gemm ? xb_mm_pipeline(X, e->d, rows[c], k, &bm, &bn, &cooperative)
+                                   : bd_fmt(e->d->fmt) ? X->p_mv_bd : xb_s1gemv_pick(X, e->d, rows[c]);
             if (pipe != bound) { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe); bound = pipe; }
             uint32_t dyn[2] = {(uint32_t)off[3 * c + 1], (uint32_t)off[3 * c + 2]};
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->pl4, 0, 1, &e->s_dn, 2, dyn);
             struct PC pc = {e->d->fmt, rows[c], I, D, e->d->rowWords, e->d->gs};
             vkCmdPushConstants(cmd, X->pl4, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-            if (gemm) {
+            if (pipe == X->p_s1) {   /* the dedicated GEMV: S=1 by the pick, rows in x alone */
+                vkCmdDispatch(cmd, (uint32_t)((I + 7) / 8), 1, 1);
+                X->s1_gemvs++;
+            } else if (gemm) {
                 vkCmdDispatch(cmd, (uint32_t)((D + bm - 1) / bm), (uint32_t)((rows[c] + bn - 1) / bn), 1);
             } else vkCmdDispatch(cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
         }
@@ -6257,8 +6395,17 @@ static void xb_stats(const XbCtx *X, ColiVkXbStats *st) {
     st->sub_gemm = X->sub_gemm; st->sub_ms = X->sub_ms;
     st->cooperative_matmuls = X->cooperative_matmuls; st->grouped_batches = X->grp_batches; st->gemv_batches = X->gv_batches;
     st->chain_gemv_batches = X->cgv_batches + X->cbd_batches;
+    st->s1_gemvs = X->s1_gemvs;
 }
 void coli_vk_xb_stats(ColiVkXbStats *st) { xb_stats(&g_xb[0], st); }
+/* COLI_VK_V4_S1GEMV's state on a device (0 primary, 1 the second): 1 the dedicated
+ * fmt-15 S=1 GEMV armed past its parity leg, 0 the generic form (lever off, shader
+ * absent, or the leg refused). coli_vk_xb_s1gemv_force overrides the pick for tests
+ * in-process (0 off, 1 on where armed, -1 the lever's own state). */
+int coli_vk_xb_s1gemv_armed(int dev) {
+    return dev == 0 || dev == 1 ? g_xb[dev].s1_ok && g_xb[dev].p_s1 != VK_NULL_HANDLE : 0;
+}
+void coli_vk_xb_s1gemv_force(int v) { g_s1_forced = v; }
 void coli_vk_xb_stats_dev(int dev, ColiVkXbStats *st) {
     if (dev == 0 || dev == 1) xb_stats(&g_xb[dev], st); else memset(st, 0, sizeof(*st));
 }
@@ -6671,8 +6818,10 @@ static void xb_shutdown(XbCtx *X) {
     if (X->sh_mm) vkDestroyShaderModule(X->dev, X->sh_mm, NULL);
     if (X->p_gu_bd) vkDestroyPipeline(X->dev, X->p_gu_bd, NULL);
     if (X->p_mv_bd) vkDestroyPipeline(X->dev, X->p_mv_bd, NULL);
+    if (X->p_s1) vkDestroyPipeline(X->dev, X->p_s1, NULL);
     if (X->sh_gu_bd) vkDestroyShaderModule(X->dev, X->sh_gu_bd, NULL);
     if (X->sh_mv_bd) vkDestroyShaderModule(X->dev, X->sh_mv_bd, NULL);
+    if (X->sh_s1) vkDestroyShaderModule(X->dev, X->sh_s1, NULL);
     for (int t = 0; t < 64; t++) if (X->p_mm_bd[t]) vkDestroyPipeline(X->dev, X->p_mm_bd[t], NULL);
     if (X->sh_mm_bd) vkDestroyShaderModule(X->dev, X->sh_mm_bd, NULL);
     for (int k = 0; k < VK_COOP_SLOTS; k++) if (X->p_coop[k]) vkDestroyPipeline(X->dev, X->p_coop[k], NULL);

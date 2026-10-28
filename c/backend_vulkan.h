@@ -427,8 +427,17 @@ typedef struct {
     unsigned long long sub_batches, sub_experts, sub_rows, sub_gemm;   /* coli_vk_xb_sub_* */
     double sub_ms;
     unsigned long long cooperative_matmuls; /* all projections, including sub-batches */
+    unsigned long long s1_gemvs;            /* down GEMVs the dedicated S=1 kernel took (COLI_VK_V4_S1GEMV) */
 } ColiVkXbStats;
 void coli_vk_xb_stats(ColiVkXbStats *st);
+/* COLI_VK_V4_S1GEMV's state on a device (0 primary, 1 the second): 1 the fork's
+ * dedicated fmt-15 S=1 GEMV (qmatmul_s1_mx.spv, the fork's qmatmul_s1_fp4.comp)
+ * armed past its bitwise parity leg against the generic qmatmul dispatch, 0 the
+ * generic form (lever off, shader absent or the leg refused). The force hook
+ * overrides the pick for tests in-process (0 off, 1 on where armed, -1 the
+ * lever's own state); the arm itself is fixed at the batch's init. */
+int  coli_vk_xb_s1gemv_armed(int dev);
+void coli_vk_xb_s1gemv_force(int v);
 /* COLI_VK_CHAIN_DPROF (diagnostics only): the compute-site (COLI_VK_TIER_EXPERTS)
  * group's backend split, accumulated by backend_vulkan.c and read once per report by
  * vk_tier.c. Every field is zero and no timer is taken unless the env gate is on;

@@ -4460,6 +4460,103 @@ static void packed_scales(int bytes) {
     unsetenv("COLI_VK_TIER_FMT15");
 }
 
+/* ---- the dedicated S=1 GEMV (COLI_VK_V4_S1GEMV) ----------------------------------- */
+/* The fork's qmatmul_s1_mx.comp (its qmatmul_s1_fp4.comp) on the down of a decode row,
+ * A/B'd bit for bit against the generic qmatmul dispatch through the tier's own decode
+ * groups: one model, every expert pre-loaded so both arms take the same rows, the PRNG
+ * rewound so route and x match, coli_vk_xb_s1gemv_force the only difference. The arm's
+ * own parity leg (backend_vulkan.c xb_s1gemv_parity, run when the lever arms) already
+ * asserts the two kernels on the device; this adds the batch's plumbing -- the sets, the
+ * dynamic offsets and the pick itself -- and, without the lever, that nothing armed. */
+static void s1gemv_case(int leg) {
+    if (!leg) {
+        ColiVkXbStats st; coli_vk_xb_stats(&st);
+        CHECK(!coli_vk_xb_s1gemv_armed(0), "s1gemv: armed without the lever");
+        CHECK(st.s1_gemvs == 0, "s1gemv: %llu dispatches without the lever", st.s1_gemvs);
+        return;
+    }
+    int h0 = H, f0 = F;
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    model_make(f, f);
+    const float limit = 10.0f;
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    set_budget(L * E, f, f);
+    /* v4_act's own step mix: the wide steps warm the tier (its residents are what a
+     * decode group takes), the S=1 steps are the pick's; the S>1 steps' experts carry
+     * more than one row, so the pick correctly stays off them */
+    static const int Ss[] = {1, 3, 20, 1, 2, 24};
+    enum { ST = 6, MR = 51 * K * L };   /* sum(Ss) = 51 rows a layer */
+    float *cap[2] = {malloc((size_t)MR * HF_MAX * sizeof(float)), malloc((size_t)MR * HF_MAX * sizeof(float))};
+    uint8_t *tk[2] = {malloc(MR), malloc(MR)};
+    unsigned save = rng;
+    int ran = cap[0] && cap[1] && tk[0] && tk[1], nrows = 0;
+    unsigned long long base = 0, fired = 0;
+    for (int arm = 0; arm < 2 && ran; arm++) {
+        VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU_V4, limit);
+        int on = vkt_init(&vc, NULL);   /* a fresh tier an arm: the same residents, the same takes */
+        CHECK(on, "s1gemv: the tier did not start (arm %d)", arm);
+        if (arm) CHECK(coli_vk_xb_s1gemv_armed(0),
+                      "s1gemv: the lever armed nothing (shader absent or the parity leg refused)");
+        if (!on) break;
+        coli_vk_xb_s1gemv_force(arm ? 1 : 0);   /* arm 0: the generic form */
+        rng = save;
+        int ri = 0;
+        for (int t = 0; t < ST; t++)
+            for (int l = 0; l < L; l++) {
+                int S = Ss[t], idx[24 * K]; float w[24 * K];
+                route(S, 0, E, idx, w);
+                float *xq = malloc(sizeof(float) * S * H);
+                uint8_t taken[24 * K]; const float *rows[24 * K];
+                for (int i = 0; i < S * H; i++) xq[i] = frnd() * 4.0f;
+                for (int s = 0; s < S; s++) qdq128(xq + (size_t)s * H, H);
+                int nq = vkt_issue_w(l, xq, S, K, idx, w, taken);
+                for (int i = 0; i < S * K; i++) {   /* the engine's share: the tier learns these bytes (v4_act's flow) */
+                    if (taken[i]) continue;
+                    VktExpertSrc src = src_of(&ex[l][idx[i]]); vkt_note(l, idx[i], &src);
+                }
+                int joined = nq ? vkt_join(rows) : 1;
+                CHECK(joined, "s1gemv: join failed (arm %d)", arm);
+                for (int i = 0; i < S * K; i++) {
+                    if (!arm) {
+                        tk[0][ri] = (uint8_t)(taken[i] && joined);
+                        if (tk[0][ri]) memcpy(cap[0] + (size_t)ri * H, rows[i], (size_t)H * sizeof(float));
+                    } else {
+                        tk[1][ri] = (uint8_t)(taken[i] && joined);
+                        if (tk[1][ri]) memcpy(cap[1] + (size_t)ri * H, rows[i], (size_t)H * sizeof(float));
+                    }
+                    ri++;
+                }
+                free(xq);
+            }
+        if (!arm) nrows = ri;
+        else CHECK(ri == nrows, "s1gemv: %d rows against the first arm's %d", ri, nrows);
+        vkt_shutdown();
+        ColiVkXbStats stp; coli_vk_xb_stats(&stp);
+        if (!arm) base = stp.s1_gemvs;
+        else fired = stp.s1_gemvs - base;   /* the tier's shutdowns keep the batch's counters: the delta is this case's */
+    }
+    coli_vk_xb_s1gemv_force(-1);
+    int same = 0;
+    if (ran)
+        for (int ri = 0; ri < nrows; ri++) {
+            CHECK(tk[0][ri] == tk[1][ri], "s1gemv: the arms disagree on row %d (%d vs %d)", ri, tk[0][ri], tk[1][ri]);
+            if (tk[0][ri] && tk[1][ri]) {
+                CHECK(!memcmp(cap[0] + (size_t)ri * H, cap[1] + (size_t)ri * H, (size_t)H * sizeof(float)),
+                      "s1gemv: row %d not bit-identical between the generic and the dedicated arm", ri);
+                same++;
+            }
+        }
+    printf("  %-44s %d of %d rows bit-identical between the arms, %llu dedicated down GEMVs\n",
+           "MXFP4 ue8m0 S=1 down: qmatmul vs qmatmul_s1_mx", same, nrows, fired);
+    CHECK(fired > 0, "s1gemv: the dedicated GEMV never fired (%llu)", fired);
+    CHECK(same > 0, "s1gemv: no row ran on the device in both arms");
+    free(cap[0]); free(cap[1]); free(tk[0]); free(tk[1]);
+    unsetenv("COLI_VK_TIER_SYNC"); unsetenv("COLI_VK_TIER_RATE");
+    H = h0; F = f0;
+    model_free();
+}
+
 int main(int argc, char **argv) {
     char buf[1024];
     const char *spv = argc > 1 ? argv[1] : coli_vk_shader_path(buf, sizeof buf);
@@ -4479,6 +4576,11 @@ int main(int argc, char **argv) {
     /* the decode-growth headroom legs' own invocation (see decode_grow's comment): their
      * run-to-run nondeterminism must stay out of the plain one the strict gate compares */
     int dg_leg = argc > 2 && !strcmp(argv[2], "dgrow");
+    /* the dedicated S=1 GEMV's own invocation: the whole suite with the fork's kernel
+     * armed on every decode down (each case's own reference CHECKs then cover it),
+     * plus the A/B case below -- the arm's parity leg has already run at the arm */
+    int s1_leg = argc > 2 && !strcmp(argv[2], "s1gemv");
+    if (s1_leg) setenv("COLI_VK_V4_S1GEMV", "1", 1);
     if (argc > 2 && !strcmp(argv[2], "host-pairs")) {   /* the CPU's integer form: no device, GQ_EXACT unread */
         unsetenv("GQ_EXACT");
         printf("host pairs, the integer form:\n"); host_pairs_case(5e-2);
@@ -4522,6 +4624,7 @@ int main(int argc, char **argv) {
     printf("compute site alias cache:\n"); cs_alias_cache();
     printf("compute site VA reuse:\n"); cs_alias_va_reuse();
     printf("compute site scan skip:\n"); cs_alias_scan_skip(dprof_leg);
+    printf("s1 GEMV:\n"); s1gemv_case(s1_leg);
     printf("stream:\n"); stream();
     printf("stream batch:\n"); stream_batch();
     printf("stream rows adaptive:\n"); stream_rows_adaptive();

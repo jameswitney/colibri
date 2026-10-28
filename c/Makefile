@@ -769,6 +769,9 @@ VK_SPV   += shaders/chain_gemv_bd_i8.spv
 # the expert batch's grouped GEMM for a GGUF's experts, down and gate+up (backend_vulkan.c)
 VK_SPV   += shaders/qmatmul_grp_bd.spv shaders/qmatmul_grp_gate_up_bd.spv
 VK_SPV   += shaders/qmatmul_grp_mx.spv shaders/qmatmul_grp_gate_up_mx.spv
+# the fork's dedicated fmt-15 S=1 GEMV (COLI_VK_V4_S1GEMV; the fork's qmatmul_s1_fp4.comp
+# on its decode group's down matmul), optional at run time -- the lever off never loads it
+VK_SPV   += shaders/qmatmul_s1_mx.spv
 # and both on the matrix units (cooperative matrices at subgroups of 64 or 32)
 VK_SPV   += shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_grp_bdc.spv shaders/qmatmul_grp_gate_up_bdc.spv
 # and for our own formats' experts on the chain's prompt chunks (vk_chain.c: vkc_moe_rows)
@@ -1024,6 +1027,27 @@ deepseek-v4-oracle: deepseek-v4
 		--teacher-forcing $(or $(ORACLE_TEACHER_FORCING),32) \
 		--greedy $(or $(ORACLE_GREEDY),20)
 
+# COLI_VK_V4_S1GEMV's own gate (gap-wave3, the forked decode's first kernel adopter):
+# the -cs legs with the fork's dedicated fmt-15 S=1 GEMV (qmatmul_s1_mx.comp, the fork's
+# qmatmul_s1_fp4.comp) armed on the compute site's decode down. The kernel may not arm
+# anywhere until its parity leg passes bit-exact (backend_vulkan.c xb_s1gemv_parity, run
+# at the arm: the generic dispatch and the dedicated one on the same random weights, bit
+# for bit -- the fork's own test-vk-dsv4-experts discipline), so these token-exact legs
+# run past that gate; the A/B plumbing leg lives in vk-tier-check's s1gemv invocation.
+.PHONY: deepseek-v4-tiny-check-s1gemv
+deepseek-v4-tiny-check-s1gemv: deepseek-v4-tiny-generate
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) VK=1 deepseek-v4
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_V4_S1GEMV=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_V4_S1GEMV=1 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_V4_S1GEMV=1 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+
 # COLI_VK_TIER_PILOT's own gate (the decode read-ahead, gap-wave2): the same three
 # harnesses and the same token-exact oracle with the pilot armed beside the compute
 # site. The tiny fixture keeps one hash layer (its layer 0), so no chain host-step has
@@ -1161,6 +1185,13 @@ shaders/qmatmul_grp_gate_up_mx.spv: shaders/qmatmul_grp_mx.comp
 shaders/qmatmul_grp_gemv_gate_up.spv: shaders/qmatmul_grp_gemv.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
+# the dedicated S=1 fmt-15 GEMV (COLI_VK_V4_S1GEMV, the fork's qmatmul_s1_fp4.comp):
+# same glslc requirement and fallback as the grouped pair; at run time the batch keeps
+# the generic down GEMV without it -- the lever off never loads it
+shaders/qmatmul_s1_mx.spv: shaders/qmatmul_s1_mx.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
 vk_chain.o: vk_chain.c .build-config
 	$(CC) $(CFLAGS) -c vk_chain.c -o $@
 # the block formats' decoders (fmt >= 100), included by the GEMV shaders and the chain's
@@ -2732,6 +2763,12 @@ tests/test_vk_degrade$(EXE): tests/test_vk_degrade.c $(VK_OBJ)
 # through the same slab, the registry alias's geometry and f16 wide verdict read off
 # the slab's own scale bytes, and free(t)'s own-nothing lifetime -- the same unit's
 # forkdec case with a device, or the malloc ladder without one.
+# The eighth (`s1gemv`) carries COLI_VK_V4_S1GEMV, the fork's dedicated fmt-15 S=1
+# GEMV (qmatmul_s1_mx.comp, the fork's qmatmul_s1_fp4.comp) on the decode down: the
+# whole suite runs with it armed, so every case's own reference CHECKs cover it, and
+# the s1gemv case A/Bs the same rows through the generic and the dedicated kernel bit
+# for bit -- on top of the arm's own in-init parity leg (xb_s1gemv_parity), which
+# refuses the arm on any bit difference.
 # The routed-expert tier on a CUDA device (cu_tier.h) against a CPU reference.
 tests/test_cu_tier$(EXE): tests/test_cu_tier.c $(CUDA_OBJ)
 	@case "$(CUDA_OBJ)" in *cu_tier.o*) ;; *) echo "tests/test_cu_tier needs CUDA=1 (or HIP=1)" >&2; exit 1 ;; esac
@@ -2748,6 +2785,7 @@ vk-tier-check: tests/test_vk_tier$(EXE) tests/test_deepseek_v4$(EXE)
 	COLI_VK_CHAIN_DPROF=1 ./tests/test_vk_tier$(EXE) shaders/qmatmul.spv dprof
 	COLI_VK_TIER_PILOT=1 COLI_VK_TIER_PILOT_DEPTH=1 ./tests/test_deepseek_v4$(EXE) pilot
 	COLI_VK_TIER_EXPERTS=1 COLI_VK_V4_DECODE_PATH=fork ./tests/test_deepseek_v4$(EXE) forkdec shaders/qmatmul.spv
+	COLI_VK_V4_S1GEMV=1 ./tests/test_vk_tier$(EXE) shaders/qmatmul.spv s1gemv
 
 # The dense chain's ops (vk_chain.c, shaders/chain_*.comp) against CPU references, on
 # a Vulkan device (CI: Lavapipe); like test_vk_tier it needs VK=1 and stays out of
