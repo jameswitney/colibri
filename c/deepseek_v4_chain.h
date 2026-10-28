@@ -38,6 +38,22 @@
  *     expert tier's batch and the CPU's share, summed in the CPU block's order).
  *   device, frame A2 (not waited for): the shared expert (the input to E4M3, w1 and w3,
  *     V4's SwiGLU between bf16 roundings, the input to E4M3, w2, bf16).
+ * The decode attention cell (COLI_VK_CHAIN_ATTN_CELL, default off) is the fork's cell
+ * discipline on that standing structure, a decode forward of one row only: the layer's
+ * A2 record+submit moves to UNDER the cell's run -- right after A1's submit, while the
+ * device still computes the attention -- and the settle narrows from vkc_finish (every
+ * frame in flight) to the cell's own fence (vkc_wait_serial): one fence settle a
+ * layer-token, the shared leg's record and submit leaving the critical path between the
+ * attention and the routed step it overlaps. Nothing else moves: the mHC head and post
+ * tails ride the same frame either way (with COLI_VK_CHAIN_MHC_S1 they are one dispatch
+ * each), A2 still lands unwaited so the device keeps running it through the host's
+ * routed step (measured at the W-CS operating point: A2's device time is hidden under
+ * the host-MoE span, which is why folding it into A1's waited frame would move it onto
+ * the critical path -- the lever does not do that), and every frame's barrier discipline
+ * is the ring's own. Multi-row forwards (a prompt chunk, a verify), the layer-outer
+ * order and COLI_VK_DMOE's in-frame layers keep today's A1/A2 exactly; the KV split's
+ * staged readback still settles its own submit inside the attention where it must (the
+ * cell's fence is then the frame the h2d copy rode).
  * The final streams come back to the host, which runs final_hidden and the head as
  * before; DSpark's taps of the last three layers' streams too (v4_mainh_tap).
  *
@@ -129,6 +145,7 @@ typedef struct {
     unsigned long long layer_fwd, layer_units;   /* the layer-ordered prompt forwards, their layer-chunk units (the report's line) */
     float *host_routed;
     unsigned long long forwards;
+    unsigned long long cell_steps;               /* COLI_VK_CHAIN_ATTN_CELL: decode layer-tokens through the cell (the report's line) */
     double host_ms;
     VkcKvSplit ks;                              /* the compressed rows split past the device's budget (ks.on) */
     int *sli, nsl, rmin, planned;               /* per layer its table (-1 none), tables, the least ratio */
@@ -205,6 +222,16 @@ static int v4c_rows(void) {
 static int v4c_order_layer(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_ORDER"); on = e && !strcmp(e, "layer"); }
+    return on;
+}
+/* COLI_VK_CHAIN_ATTN_CELL: the decode attention cell (this file's header comment, the
+ * A1 site in the chunk loop). A one-row forward's layer settles ONE fence a
+ * layer-token -- the cell frame's own -- with A2's record+submit riding the cell's
+ * device run; unset keeps the standing A1/A2 structure byte-identical (the branch is
+ * not even taken). */
+static int v4c_cell_wanted(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_CHAIN_ATTN_CELL"); on = e && *e && *e != '0'; }
     return on;
 }
 /* v4c_res counts instead of reserving while g_v4c_count >= 0 (the chunk's sizing) */
@@ -942,6 +969,10 @@ params:
     else fprintf(stderr, "[VK] deepseek_v4 chain: %d layers on the device (%d compressing, %d indexing), %d streams, "
                          "%.1f MiB of parameters, %zu matrices (%.1f MiB) on the device\n",
                  ch->L, ncomp, nidx, ch->H, n * 4 / 1048576.0, tensors, bytes / 1048576.0);
+    if (!d && v4c_cell_wanted())
+        fprintf(stderr, "[VK] deepseek_v4 chain: the decode attention cell is on -- a one-row forward's layer settles one fence "
+                        "(its attention cell's) with the shared expert's record+submit riding the cell's device run "
+                        "(COLI_VK_CHAIN_ATTN_CELL)\n");
     vkc_fit_placed(nmc, fit);
     return 1;
 }
@@ -1847,18 +1878,32 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
                 }
                 vkc_role(VKC_R_A1);
             }   /* DPROF: the staging beside A1's wait */
-            ok = ok && vkc_finish();
-            if (!ok) break;
+            int cell = ok && v4c_cell_wanted() && nr == 1 && n == 1 && !prompt;
+            if (cell) {   /* COLI_VK_CHAIN_ATTN_CELL: the decode attention cell -- A2's record+submit
+                          * rides the cell's device run, and the settle is the cell's own fence */
+                unsigned long long cell_ser = vkc_serial();
+                vkc_role(VKC_R_A2);   /* DPROF: A2's span and frame stamp stay A2's, wherever it records */
+                ok = vkc_begin() && v4c_shared(ch, ly, nr) && vkc_submit(0);
+                vkc_role(VKC_R_A1);
+                ok = ok && vkc_wait_serial(cell_ser);   /* one fence a layer-token: the cell's */
+                if (ok) ch->cell_steps++;
+                if (!ok) break;
+            } else {
+                ok = ok && vkc_finish();
+                if (!ok) break;
+            }
             if (ch->ks.on && ly->ratio > 0) {               /* this chunk's new compressed rows into the host's */
                 int r = ly->ratio, g0 = pb / r, np = (pb + nr) / r - g0;
                 ColiV4AttentionView v;
                 if (np > 0 && !coli_v4_attention_view(attention[i], &v))
                     memcpy(v.compressed + (size_t)g0 * hd, vkc_ptr(ch->cdn), (size_t)np * hd * sizeof(float));
             }
-            /* A2: the shared expert, while the host computes the routed experts */
-            vkc_role(VKC_R_A2);
-            ok = vkc_begin() && v4c_shared(ch, ly, nr) && vkc_submit(0);
-            if (!ok) break;
+            if (!cell) {   /* A2: the shared expert, while the host computes the routed experts
+                            * (the cell armed above already has A2 in flight under the attention's run) */
+                vkc_role(VKC_R_A2);
+                ok = vkc_begin() && v4c_shared(ch, ly, nr) && vkc_submit(0);
+                if (!ok) break;
+            }
             double t1 = spec_now();
             vkc_role(VKC_R_MOEH);   /* DPROF: the host's routed-expert step (ch->host_ms above; the tier's own line splits it) */
             if (pool) coli_v4_expert_store_prefill_pool(experts, i);
@@ -2102,6 +2147,10 @@ static void v4c_report(void) {
                 fprintf(stderr, "[VK] %s chain: COLI_VK_CHAIN_ORDER=layer: %llu layer-ordered prompt forwards, %llu "
                                 "layer-chunk units (%d layers, chunks of %d rows)\n",
                         v4c_name(ch), ch->layer_fwd, ch->layer_units, ch->L - ch->lo, ch->rows);
+            if (ch->cell_steps)   /* COLI_VK_CHAIN_ATTN_CELL: the cell's own line, whatever armed it */
+                fprintf(stderr, "[VK] %s chain: COLI_VK_CHAIN_ATTN_CELL: %llu decode layer-tokens through the attention cell "
+                                "(one settled fence each, A2 recorded under the cell's run)\n",
+                        v4c_name(ch), ch->cell_steps);
         }
         vkc_dmoe_hyb_report(v4c_name(ch), &ch->dm);
         vkc_prof_print();

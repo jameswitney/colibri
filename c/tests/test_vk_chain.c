@@ -2516,6 +2516,56 @@ static void test_frames(void) {
     vkc_free(x); vkc_free(y); free(a); free(acc); free(got);
 }
 
+/* The decode attention cell's frame discipline (COLI_VK_CHAIN_ATTN_CELL, the chain's A1
+ * site): the cell frame (the one holding the attention and the h2d copy) is submitted,
+ * the next frame (the shared expert's A2) is recorded and submitted while the device
+ * still runs the cell, and the settle is the cell's own fence (vkc_wait_serial) -- the
+ * host then reads the cell's DOWN buffer with A2 still in flight, and the frame after
+ * it (the next layer's join) reads both sides. This is that structure on chain_ew, a
+ * CPU mirror of the three frames, and a frame-count check: a round is exactly three
+ * submissions whatever settles them. */
+static void test_cell_frames(void) {
+    int n = 700;
+    VkcBuf *x = vkc_buf((size_t)n * 4, VKC_DEV), *y = vkc_buf((size_t)n * 4, VKC_DEV);
+    VkcBuf *dx = vkc_buf((size_t)n * 4, VKC_DOWN), *j = vkc_buf((size_t)n * 4, VKC_DEV);
+    VkcEw add = {VKC_EW_ADD, n, n, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+    float *a = fvec(n, 1.f), *cx = malloc((size_t)n * 4), *cy = malloc((size_t)n * 4);
+    int ok = a && cx && cy && x && y && dx && j;
+    for (int i = 0; ok && i < n; i++) { cx[i] = a[i]; cy[i] = a[i] * 0.5f; }
+    if (ok) ok = vkc_begin() && vkc_write(x, 0, cx, (size_t)n * 4) && vkc_write(y, 0, cy, (size_t)n * 4) && vkc_submit(1);
+    for (int r = 0; ok && r < 4; r++) {
+        VkcStats f0; vkc_stats(&f0);
+        /* F1, the cell: the attention's sum, then the h2d copy riding the same frame */
+        ok = vkc_begin() && vkc_ew(x, x, y, NULL, NULL, &add) && vkc_copy(dx, 0, x, 0, n) && vkc_submit(0);
+        for (int i = 0; i < n; i++) cx[i] += cy[i];
+        unsigned long long cell = ok ? vkc_serial() : 0;
+        /* F2, A2: recorded and submitted under the cell's run, reading what F1 wrote */
+        ok = ok && vkc_begin() && vkc_ew(y, y, x, NULL, NULL, &add) && vkc_submit(0);
+        for (int i = 0; i < n; i++) cy[i] += cx[i];
+        /* the cell's own fence: the h2d read with A2 still in flight */
+        ok = ok && vkc_wait_serial(cell);
+        const float *h2d = (const float *)vkc_ptr(dx);
+        double eh = 0;
+        for (int i = 0; i < n; i++) { double d = fabs((double)h2d[i] - cx[i]); if (d > eh) eh = d; }
+        CHECK(ok && eh == 0, "cell frames: the cell's h2d copy settles at its own fence (err %.2e)", eh);
+        /* F3, the join: reads both frames' outputs; the round's frames are three */
+        ok = vkc_begin() && vkc_ew(j, x, y, NULL, NULL, &add) && vkc_copy(x, 0, j, 0, n) && vkc_submit(1);
+        for (int i = 0; i < n; i++) cx[i] += cy[i];
+        VkcStats f1; vkc_stats(&f1);
+        CHECK(ok && f1.frames - f0.frames == 3, "cell frames: a round is three submissions (%llu)", f1.frames - f0.frames);
+        if (r == 3) {
+            float *join = down(x, 0, n);
+            CHECK(join && !bad(join, n), "cell frames: the join reads both sides finite");
+            free(join);
+        }
+    }
+    ok = ok && vkc_finish();
+    printf("  cell frames: 4 rounds x 3 frames, the cell's own fence settled with A2 in flight\n");
+    vkc_free(x); vkc_free(y); vkc_free(dx); vkc_free(j);
+    free(a); free(cx); free(cy);
+    CHECK(ok, "cell frames: every frame took");
+}
+
 /* COLI_VK_CHAIN_DPROF: the decode window (vkc_dwin) and the roles (vkc_role) as the
  * engine stamps them -- frames submitted inside the window count once each by role,
  * their fence waits with them, and the frames outside it count nowhere. The device
@@ -4696,6 +4746,7 @@ int main(int argc, char **argv) {
     test_qsa();
     test_ple();
     test_frames();
+    test_cell_frames();   /* the decode attention cell's discipline (COLI_VK_CHAIN_ATTN_CELL) */
     test_dprof();
     if (!vkc_mla_ready()) { fails++; printf("FAIL: the MLA shaders did not load\n"); }
     else {
