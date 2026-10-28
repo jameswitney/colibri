@@ -983,6 +983,36 @@ deepseek-v4-tiny-check-cs: deepseek-v4-tiny-generate
 		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
 		--fixture $(CURDIR)/deepseek_v4_tiny
 
+# COLI_VK_V4_DECODE_PATH=fork's own gate (gap-wave3, the forked decode path): the
+# compute site's harnesses with the forked arm beside them -- the store's slot slabs
+# come out of the registry's mapped arena and the CS alias is a calloc against it (no
+# import, no slab_buf handles), so the same token-exact oracle now covers the
+# registry's tensor lifetime. The tiny fixture keeps every expert resident, so the
+# alias path itself is exercised by the forced-alias legs (COLI_VK_TIER_GB=0: no
+# resident budget, every selection aliases off its registry slab) and the engagement
+# line (decode-path=fork ... slabs=) is asserted by the harness (--expect-stderr).
+# The growth-composition leg mirrors -cs's (EXPERTS=2 + headroom + target + promo
+# cap). Model-scale oracle recipe (not run this wave): deepseek-v4-oracle with the
+# same env, teacher-forcing 32 + greedy 20, the -cs leg's class.
+.PHONY: deepseek-v4-tiny-check-forkdec
+deepseek-v4-tiny-check-forkdec: deepseek-v4-tiny-generate
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) VK=1 deepseek_v4
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_V4_DECODE_PATH=fork $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny \
+		--expect-stderr 'decode-path=fork arena=.*GiB slabs='
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_V4_DECODE_PATH=fork COLI_VK_TIER_GB=0 COLI_VK_TIER_WARM=0 COLI_VK_TIER_PROMOTE=0 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_V4_DECODE_PATH=fork COLI_VK_TIER_GB=0 COLI_VK_TIER_WARM=0 COLI_VK_TIER_PROMOTE=0 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_V4_DECODE_PATH=fork COLI_VK_TIER_DECODE_GROW=1 COLI_VK_TIER_DECODE_GROW_HEADROOM=1 \
+	COLI_VK_TIER_DECODE_GROW_TARGET=800 COLI_VK_TIER_PROMO_CAP=-1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+
 deepseek-v4-oracle: deepseek-v4
 	@test -n "$(MODEL)" || { echo "usage: make deepseek-v4-oracle MODEL=/path/to/checkpoint" >&2; exit 2; }
 	$(PYTHON) tools/make_deepseek_v4_oracle.py --model "$(MODEL)" \
@@ -1053,6 +1083,8 @@ deepseek-v4-tiny-check-dmoe:
 	@echo "SKIP deepseek-v4-tiny-check-dmoe: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
 deepseek-v4-tiny-check-cs:
 	@echo "SKIP deepseek-v4-tiny-check-cs: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
+deepseek-v4-tiny-check-forkdec:
+	@echo "SKIP deepseek-v4-tiny-check-forkdec: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
 deepseek-v4-tiny-generate:
 	@echo "SKIP deepseek-v4-tiny-generate: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
 endif
@@ -2695,6 +2727,11 @@ tests/test_vk_degrade$(EXE): tests/test_vk_degrade.c $(VK_OBJ)
 # -- hash and non-hash fires (the tid2eid table and its NULL), warm reads that move
 # no demand book, a misprediction that costs a slot and nothing else, the
 # single-flight late read, and the unset no-op.
+# The seventh (`forkdec`) carries COLI_VK_V4_DECODE_PATH=fork's store seam: registry-
+# backed slots, an LRU victim's in-place rewrite serving its new expert's exact bytes
+# through the same slab, the registry alias's geometry and f16 wide verdict read off
+# the slab's own scale bytes, and free(t)'s own-nothing lifetime -- the same unit's
+# forkdec case with a device, or the malloc ladder without one.
 # The routed-expert tier on a CUDA device (cu_tier.h) against a CPU reference.
 tests/test_cu_tier$(EXE): tests/test_cu_tier.c $(CUDA_OBJ)
 	@case "$(CUDA_OBJ)" in *cu_tier.o*) ;; *) echo "tests/test_cu_tier needs CUDA=1 (or HIP=1)" >&2; exit 1 ;; esac
@@ -2710,6 +2747,7 @@ vk-tier-check: tests/test_vk_tier$(EXE) tests/test_deepseek_v4$(EXE)
 	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv dgrow
 	COLI_VK_CHAIN_DPROF=1 ./tests/test_vk_tier$(EXE) shaders/qmatmul.spv dprof
 	COLI_VK_TIER_PILOT=1 COLI_VK_TIER_PILOT_DEPTH=1 ./tests/test_deepseek_v4$(EXE) pilot
+	COLI_VK_TIER_EXPERTS=1 COLI_VK_V4_DECODE_PATH=fork ./tests/test_deepseek_v4$(EXE) forkdec shaders/qmatmul.spv
 
 # The dense chain's ops (vk_chain.c, shaders/chain_*.comp) against CPU references, on
 # a Vulkan device (CI: Lavapipe); like test_vk_tier it needs VK=1 and stays out of

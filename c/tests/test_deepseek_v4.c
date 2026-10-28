@@ -2541,6 +2541,229 @@ static int test_fp8_decode_batch_order(void) {
     return 0;
 }
 
+#ifdef COLI_VULKAN
+#include "../backend_vulkan.h"
+#endif
+
+/* `forkdec`: the forked decode path's store-side seam (COLI_VK_V4_DECODE_PATH=fork,
+ * vk-tier-check's seventh leg names this case; the alias seam end-to-end is
+ * deepseek-v4-tiny-check-forkdec's token-exact oracle). The fixture keeps every
+ * record 16-byte aligned (48 B of scales then 48 B of weights an expert) so the
+ * registry alias's descriptor offsets align, and ONE slot a layer so a second
+ * expert rewrites the first's slot in place -- the fork's LRU rewrite, the exact
+ * hazard the per-token alias model must survive (no content-keyed alias persists,
+ * every alias reads the slot's CURRENT bytes). Optional argv[2] is the shader path:
+ * given and a device comes up, the registry path itself is asserted (slot in the
+ * arena, alias geometry + the wide verdict off the slab's own bytes, free(t)
+ * lifetime); without it the case asserts the ladder -- slots fall back to malloc,
+ * the store serves byte-identical records either way. */
+static int forkdec_write_fixture(const char *path) {
+    static const char *matrix_names[3] = {"w1", "w2", "w3"};
+    const int experts = 8, per_cell = 3264;   /* 3x64B scales + 3x1KB weights; 6 slots of the 8 */
+    size_t header_capacity = 8192;
+    char *header = malloc(header_capacity);
+    size_t payload_size = 16 + (size_t)experts * per_cell;
+    unsigned char *payload = malloc(payload_size);
+    if (!header || !payload) { free(payload); free(header); return -1; }
+    size_t used = (size_t)snprintf(
+        header, header_capacity,
+        "{\"resident\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}");
+    for (int expert = 0; expert < experts; expert++) {
+        size_t cell = 16 + (size_t)expert * per_cell;
+        for (int matrix = 0; matrix < 3; matrix++) {
+            int count = snprintf(
+                header + used, header_capacity - used,
+                ",\"layers.0.ffn.experts.%d.%s.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,64],"
+                "\"data_offsets\":[%zu,%zu]}",
+                expert, matrix_names[matrix], cell + (size_t)matrix * 64,
+                cell + (size_t)matrix * 64 + 64);
+            if (count < 0 || (size_t)count >= header_capacity - used) {
+                free(payload); free(header); return -1; }
+            used += (size_t)count;
+        }
+        for (int matrix = 0; matrix < 3; matrix++) {
+            int count = snprintf(
+                header + used, header_capacity - used,
+                ",\"layers.0.ffn.experts.%d.%s.weight\":{\"dtype\":\"I8\",\"shape\":[1,1024],"
+                "\"data_offsets\":[%zu,%zu]}",
+                expert, matrix_names[matrix], cell + 192 + (size_t)matrix * 1024,
+                cell + 192 + (size_t)matrix * 1024 + 1024);
+            if (count < 0 || (size_t)count >= header_capacity - used) {
+                free(payload); free(header); return -1; }
+            used += (size_t)count;
+        }
+    }
+    if (used + 1 >= header_capacity) { free(payload); free(header); return -1; }
+    header[used++] = '}';
+    header[used] = '\0';
+    for (size_t i = 0; i < payload_size; i++) payload[i] = 0;
+    for (int expert = 0; expert < experts; expert++) {
+        size_t cell = 16 + (size_t)expert * per_cell;
+        for (int m = 0; m < 3; m++)
+            for (int b = 0; b < 64; b++) {
+                /* ue8m0 exponents: 128..135 (narrow) everywhere but expert 1's gate
+                 * scale[0] = 145, past the f16 verdict's 140 line (a wide tensor) */
+                payload[cell + (size_t)m * 64 + b] =
+                    (expert == 1 && m == 0 && b == 0) ? 145
+                    : (unsigned char)(128 + ((expert + m) & 7));
+            }
+        for (int m = 0; m < 3; m++)
+            for (int b = 0; b < 1024; b++)
+                payload[cell + 192 + (size_t)m * 1024 + b] =
+                    (unsigned char)(expert * 3 + m);   /* every weight byte names its (expert, matrix) */
+    }
+    uint64_t header_length = used;
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY | COMPAT_O_BINARY, 0600);
+    if (fd < 0) { free(payload); free(header); return -1; }
+    int result = write_all(fd, &header_length, sizeof(header_length)) ||
+                 write_all(fd, header, (size_t)header_length) ||
+                 write_all(fd, payload, payload_size);
+    close(fd);
+    free(payload);
+    free(header);
+    return result ? -1 : 0;
+}
+
+static int forkdec_expect_view(const ColiExpertView *view, int expert) {
+    const unsigned char *gs = view->gate.scales, *gd = view->gate.data,
+                        *dd = view->down.data, *ud = view->up.data;
+    /* the record's packed layout: scales [0,192), weights [192, 3264) as w1 w2 w3;
+     * every weight byte names its (expert, matrix) -- a stale slot's bytes cannot pass */
+    return view->gate.format == COLI_TENSOR_FP4_NATIVE_BLOCK &&
+           view->gate.rows == 1 && view->gate.columns == 2048 &&
+           view->gate.data_bytes == 1024 && view->gate.scale_bytes == 64 &&
+           (size_t)(gd - gs) == 192 && (size_t)(dd - gs) == 192 + 1024 &&
+           (size_t)(ud - gs) == 192 + 2048 &&
+           gs[0] == (unsigned char)(expert == 1 ? 145 : 128 + (expert & 7)) &&
+           gd[0] == (unsigned char)(expert * 3) &&
+           dd[0] == (unsigned char)(expert * 3 + 1) &&
+           ud[0] == (unsigned char)(expert * 3 + 2);
+}
+
+static int test_forkdec(const char *spv) {
+    char directory[] = "colibri-v4-forkdec-XXXXXX";
+    char path[256], error[256];
+    int failed = 0, device = 0;
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_VK_TIER_EXPERTS", "1", 1);
+    setenv("COLI_VK_V4_DECODE_PATH", "fork", 1);
+#ifdef COLI_VULKAN
+    if (spv && *spv) device = coli_vk_init(spv);   /* 0: no device -- the ladder path */
+#endif
+    if (!mkdtemp(directory)) { perror("mkdtemp"); return 1; }
+    snprintf(path, sizeof path, "%s/model.safetensors", directory);
+    if (forkdec_write_fixture(path) != 0) { perror("forkdec_write_fixture"); return 1; }
+    ColiDeepSeekV4ExpertStoreOptions options = { directory, 1, 8, 6 * 3264, -1, 0, 0, 0 };   /* 6 of the 8 experts: victims exist */
+    ColiExpertStore *store = NULL;
+    if (coli_deepseek_v4_expert_store_open(&options, &store, error, sizeof error)) {
+        fprintf(stderr, "%s\n", error);
+        return 1;
+    }
+    ColiExpertView view;
+    const unsigned char *slab = NULL;
+    /* the round table: 0..5 fill every slot, 6 takes the LRU victim (expert 0's slot,
+     * rewritten in place -- the fork's rewrite model), then 1 (a hit, the wide-tensor
+     * alias case) and 0 again (another rewrite, back to the first expert's bytes) */
+    static const int rounds[] = {0, 1, 2, 3, 4, 5, 6, 1, 0};
+    for (unsigned round = 0; round < sizeof rounds / sizeof rounds[0]; round++) {
+        int expert = rounds[round];
+        if (coli_expert_lookup(store, (ColiExpertKey){0, expert}, &view)) {
+            fprintf(stderr, "forkdec: lookup round %d failed\n", round);
+            failed = 1;
+            break;
+        }
+        if (!forkdec_expect_view(&view, expert)) {
+            fprintf(stderr, "forkdec: round %d served expert %d's bytes wrong (stale slot rewrite?)\n",
+                    round, expert);
+            failed = 1;
+        }
+        size_t bytes = 0;
+        const unsigned char *s = coli_v4_expert_store_view_slab(store, &view, &bytes);
+        if (!s || bytes != 3264) {
+            fprintf(stderr, "forkdec: round %u (expert %d) view_slab refused (bytes=%zu)\n",
+                    round, expert, bytes);
+            failed = 1;
+        } else if (round == 0)
+            slab = s;   /* expert 0's slot: round 6 (expert 6) must REWRITE this very one */
+        else if (round == 6 && s != slab) {
+            fprintf(stderr, "forkdec: expert 6 did not rewrite expert 0's slot in place (%p -> %p)\n",
+                    (const void *)slab, (const void *)s);
+            failed = 1;
+        }
+#ifdef COLI_VULKAN
+        if (device) {
+            ColiVkSlabReg *reg = NULL;
+            size_t base = (size_t)-1;
+            if (!coli_vk_slabreg_lookup(s, &reg, &base) || base != 0) {
+                fprintf(stderr, "forkdec: round %d's slab is not the registry's (base=%zd)\n",
+                        round, (ssize_t)base);
+                failed = 1;
+            } else {
+                /* the alias seam's geometry, exactly as v4_vk_alias_src fills it: the
+                 * three matrices' woff/soff off the slot's own slab */
+                static const int woff[3] = {192, 2240, 1216}, soff[3] = {0, 128, 64};   /* w1 w3 w2 */
+                for (int m = 0; m < 3; m++) {
+                    ColiVkTensor *t = NULL;
+                    if (!coli_vk_slabreg_alias(reg, s, (size_t)woff[m], (size_t)soff[m],
+                                               15, 2048, 1, 32, -1, &t)) {
+                        fprintf(stderr, "forkdec: round %u (expert %d) matrix %d alias refused\n",
+                                round, expert, m);
+                        failed = 1;
+                        continue;
+                    }
+                    ColiVkTensorInfo info;
+                    if (!coli_vk_tensor_info(t, &info) || info.fmt != 15 || info.I != 2048 ||
+                        info.O != 1 || info.rowWords != 256) {
+                        fprintf(stderr, "forkdec: round %u (expert %d) matrix %d geometry wrong\n",
+                                round, expert, m);
+                        failed = 1;
+                    }
+                    /* the wide verdict: the scan of the slab's own scale bytes -- expert 1's
+                     * gate (m=0) is the one past 140, every other tensor narrow */
+                    int want_wide = (expert == 1 && m == 0);
+                    if (info.wide != want_wide) {
+                        fprintf(stderr, "forkdec: round %u (expert %d) matrix %d wide=%d, want %d\n",
+                                round, expert, m, (int)info.wide, want_wide);
+                        failed = 1;
+                    }
+                    coli_vk_tensor_free(t);   /* free(t): owns nothing, the slab stays */
+                }
+                /* a registry tensor's free must leave the slot serving (no handle went away) */
+                ColiExpertView again;
+                if (coli_expert_lookup(store, (ColiExpertKey){0, expert}, &again) ||
+                    !forkdec_expect_view(&again, expert)) {
+                    fprintf(stderr, "forkdec: round %u (expert %d) re-lookup after alias frees failed\n",
+                            round, expert);
+                    failed = 1;
+                } else
+                    coli_expert_release(store, &again);
+            }
+        }
+#endif
+        coli_expert_release(store, &view);
+    }
+#ifdef COLI_VULKAN
+    if (!device)
+        fprintf(stderr, "forkdec: no Vulkan device -- the malloc ladder served every round\n");
+#endif
+    store->ops->destroy(store);   /* zero leases: the registry slabs go back here */
+#ifdef COLI_VULKAN
+    if (device && slab) {   /* the store's destroy returned the slab's buffer: gone */
+        ColiVkSlabReg *reg = NULL;
+        if (coli_vk_slabreg_lookup(slab, &reg, NULL)) {
+            fprintf(stderr, "forkdec: the destroyed store's slab is still registered\n");
+            failed = 1;
+        }
+    }
+#endif
+    unlink(path);
+    rmdir(directory);
+    if (failed) return 1;
+    puts("DeepSeek-V4 forkdec: registry slots, in-place rewrites, alias lifetime ok");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     /* `pilot` runs only the read-ahead case: vk-tier-check's fifth leg names it
      * (the pilot lives in this store unit, deepseek_v4.c -- not in VK_OBJ), so
@@ -2548,6 +2771,15 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "pilot")) {
         if (test_pilot() != 0) {
             fprintf(stderr, "FAIL: test_pilot\n");
+            return 1;
+        }
+        return 0;
+    }
+    /* `forkdec` (argv[2] = the shader path, optional): the forked decode path's
+     * store seam, vk-tier-check's seventh leg. */
+    if (argc > 1 && !strcmp(argv[1], "forkdec")) {
+        if (test_forkdec(argc > 2 ? argv[2] : NULL) != 0) {
+            fprintf(stderr, "FAIL: test_forkdec\n");
             return 1;
         }
         return 0;
