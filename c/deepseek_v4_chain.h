@@ -1825,7 +1825,28 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
             ok = ok && vkc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)nr * D) && vkc_submit(0);    /* A1 */
             /* while it runs, the tier loads the experts this layer will likely stream (a
              * big prompt chunk only) */
-            if (ok) { vkc_role(VKC_R_STAGE); vkt_stream_prefetch(i, nr); vkc_role(VKC_R_A1); }   /* DPROF: the staging beside A1's wait */
+            if (ok) {
+                vkc_role(VKC_R_STAGE);
+                vkt_stream_prefetch(i, nr);
+                /* COLI_VK_TIER_PILOT: a rows-1 unit's next hash layer's selection is
+                 * tid2eid-known now, a full layer before its MoE entry -- fire its
+                 * store reads so they land under this layer's attention and host step
+                 * (non-hash or past-the-end layers keep today's behaviour; the reads
+                 * only warm, the fork's demand diamond stays the entry's) */
+                if (nr == 1 && v4_pilot_wanted()) {
+                    int pl = i + v4_pilot_depth();
+                    if (pl < L && engine->dense_resident.layers[pl].plan.uses_hash_router &&
+                        !(dmoe && vkc_dmoe_on(&ch->dm, pl))) {   /* a dmoe layer's experts never reach the store */
+                        const int64_t *tid2eid = v4c_val(&engine->dense_resident.layers[pl],
+                                                         "ffn.gate.tid2eid");
+                        if (tid2eid)
+                            v4_pilot_fire(experts, pl, tokens[c0],
+                                          c->num_experts_per_tok, tid2eid,
+                                          c->n_routed_experts, c->vocab_size);
+                    }
+                }
+                vkc_role(VKC_R_A1);
+            }   /* DPROF: the staging beside A1's wait */
             ok = ok && vkc_finish();
             if (!ok) break;
             if (ch->ks.on && ly->ratio > 0) {               /* this chunk's new compressed rows into the host's */

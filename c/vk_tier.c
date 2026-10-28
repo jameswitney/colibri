@@ -3328,6 +3328,12 @@ int vkt_resident(int layer, int eid) {
     return T.on && layer >= 0 && layer < T.c.layers && eid >= 0 && eid < T.c.experts &&
            slot(layer, eid)->state == VS_RESIDENT;
 }
+int vkt_cs_served(int layer, int eid) {
+    if (!T.on || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts)
+        return 0;
+    VSlot *v = slot(layer, eid);
+    return v->state == VS_RESIDENT && v->ex != NULL;   /* the CS defer's taken rule */
+}
 int vkt_ready(void) { return T.on; }
 int vkt_cs_armed(void) { return T.on && T.csx > 0; }
 

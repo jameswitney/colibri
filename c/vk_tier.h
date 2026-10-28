@@ -354,6 +354,10 @@ int  vkt_join(const float **rows);
  * summed on the device; else *sum = NULL. w as vkt_issue_w's (NULL = 1). */
 int vkt_join_sum(const float **rows, const float *w, const float **sum);
 int  vkt_resident(int layer, int eid);
+/* The CS defer's own taken rule, read-only: would a decode issue mark (layer, eid)
+ * taken with no read (a resident's cached ColiVkExpert handle)? The pilot
+ * (COLI_VK_TIER_PILOT) skips those -- a warm read of one is pure disk traffic. */
+int  vkt_cs_served(int layer, int eid);
 /* The next vkt_issue starts a forward (promotion rate, decay, eviction candidates).
  * Optional: the tier tells forwards apart by the layer index going back, which a model
  * with a single MoE layer never does; such an engine calls this at its first MoE layer. */
@@ -498,6 +502,7 @@ static inline int  vkt_wants(int l,int e){(void)l;(void)e;return 0;}
 static inline int  vkt_join(const float **r){(void)r;return 0;}
 static inline int  vkt_join_sum(const float **r, const float *w, const float **s){(void)r;(void)w;*s=0;return 0;}
 static inline int  vkt_resident(int l,int e){(void)l;(void)e;return 0;}
+static inline int  vkt_cs_served(int l,int e){(void)l;(void)e;return 0;}
 static inline void vkt_begin_forward(void){}
 static inline void vkt_report(const char *s,unsigned long long r,unsigned long long d){(void)s;(void)r;(void)d;}
 static inline size_t vkt_expert_bytes(int h,int i,VktFmt a,VktFmt b){(void)h;(void)i;(void)a;(void)b;return 0;}

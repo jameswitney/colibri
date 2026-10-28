@@ -1758,6 +1758,237 @@ out:
     puts("DeepSeek-V4 ExpertStore mfu: ok");
     return 0;
 }
+
+/* ==== begin test_deepseek_v4_pilot.c ==== */
+/* COLI_VK_TIER_PILOT's lifecycle (the store unit's decode read-ahead): the
+ * non-hash fallback fires nothing, a fired prediction lands and the entry's
+ * own lookup hits the warm slot byte-identically, the pilot's reads move no
+ * demand book (requests/hits/misses stay zero while the slot turns resident),
+ * a misprediction costs a slot and nothing else, an entry that comes while
+ * the pilot's read is still on disk coalesces onto it (one disk read, exact
+ * bytes -- lookup_hot's single flight), and the depth knob clamps. The reads
+ * ride a gate hook so the in-flight leg is deterministic. */
+static pthread_mutex_t pilot_gate_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pilot_gate_cond = PTHREAD_COND_INITIALIZER;
+static int pilot_gate_entered, pilot_gate_release, pilot_gate_reads;
+
+static void pilot_read_hook(ColiExpertKey key) {
+    (void)key;
+    pthread_mutex_lock(&pilot_gate_mutex);
+    pilot_gate_entered = 1;
+    pilot_gate_reads++;
+    pthread_cond_broadcast(&pilot_gate_cond);
+    while (!pilot_gate_release)
+        pthread_cond_wait(&pilot_gate_cond, &pilot_gate_mutex);
+    pthread_mutex_unlock(&pilot_gate_mutex);
+}
+
+static int pilot_wait_gate(int milliseconds) {
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_nsec += (long)milliseconds * 1000000L;
+    if (until.tv_nsec >= 1000000000L) {
+        until.tv_sec += until.tv_nsec / 1000000000L;
+        until.tv_nsec %= 1000000000L;
+    }
+    pthread_mutex_lock(&pilot_gate_mutex);
+    int entered = pilot_gate_entered;
+    while (!entered && pthread_cond_timedwait(&pilot_gate_cond,
+                                              &pilot_gate_mutex, &until) == 0)
+        entered = pilot_gate_entered;
+    pthread_mutex_unlock(&pilot_gate_mutex);
+    return entered;
+}
+
+static int pilot_expect_stats(ColiExpertStore *store, unsigned requests,
+                              unsigned hits, unsigned misses,
+                              unsigned long long resident) {
+    ColiExpertStoreStats stats;
+    store->ops->stats(store, &stats);
+    if (stats.requests != requests || stats.hits != hits ||
+        stats.misses != misses || stats.resident_bytes != resident) {
+        fprintf(stderr, "pilot stats mismatch: requests=%llu (want %u), hits=%llu "
+                        "(want %u), misses=%llu (want %u), resident=%llu (want %llu)\n",
+                (unsigned long long)stats.requests, requests,
+                (unsigned long long)stats.hits, hits,
+                (unsigned long long)stats.misses, misses,
+                (unsigned long long)stats.resident_bytes, resident);
+        return 1;
+    }
+    return 0;
+}
+
+typedef struct {
+    ColiExpertStore *store;
+    ColiExpertKey key;
+    ColiExpertView view;
+    int result;
+} PilotEntryJob;
+
+static void *pilot_entry_lookup(void *opaque) {
+    PilotEntryJob *job = opaque;
+    job->result = coli_expert_lookup(job->store, job->key, &job->view);
+    return NULL;
+}
+
+static int test_pilot(void) {
+    char directory[] = "colibri-v4-pilot-XXXXXX";
+    char path[256], error[256];
+    int failed = 0;
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
+    setenv("COLI_VK_TIER_PILOT", "1", 1);
+    setenv("COLI_VK_CHAIN_DPROF", "1", 1);
+    setenv("COLI_VK_TIER_PILOT_DEPTH", "99", 1);
+    coli_v4_test_pilot_env_reset();
+    if (v4_pilot_depth() != 8) {   /* clamped to the useful span */
+        fprintf(stderr, "pilot depth 99 clamped to %d, want 8\n", v4_pilot_depth());
+        return 1;
+    }
+    setenv("COLI_VK_TIER_PILOT_DEPTH", "0", 1);
+    coli_v4_test_pilot_env_reset();
+    if (v4_pilot_depth() != 1) {
+        fprintf(stderr, "pilot depth 0 clamped to %d, want 1\n", v4_pilot_depth());
+        return 1;
+    }
+    setenv("COLI_VK_TIER_PILOT_DEPTH", "1", 1);
+    coli_v4_test_pilot_env_reset();
+    if (!mkdtemp(directory)) { perror("mkdtemp"); return 1; }
+    snprintf(path, sizeof path, "%s/model.safetensors", directory);
+    if (write_fixture(path) != 0) { perror("write_fixture"); return 1; }
+    ColiDeepSeekV4ExpertStoreOptions options = { directory, 1, 7, 306, -1, 0, 0, 0 };
+    ColiExpertStore *store = NULL;
+    if (coli_deepseek_v4_expert_store_open(&options, &store, error,
+                                           sizeof error) != 0) {
+        fprintf(stderr, "%s\n", error);
+        return 1;
+    }
+    /* token 3 of a 7-expert hash layer selects {2, 5}; the other cells keep
+     * out-of-range ids, which the fire must skip without reading */
+    int64_t table[8 * 2];
+    for (int i = 0; i < 16; i++) table[i] = i / 2 == 3 ? (i % 2 ? 5 : 2) : 9;
+
+    /* a non-hash layer (no tid2eid) fires nothing: the fallback, exact */
+    coli_v4_test_pilot_fire(store, 0, 3, 2, NULL, 7, 8);
+    coli_v4_test_pilot_quiesce();
+    if (pilot_expect_stats(store, 0, 0, 0, 0)) failed = 1;
+
+    /* the prediction lands: two warm reads, zero demand books moved, the
+     * slots resident -- then the entry's own lookup hits one, byte-identical */
+    coli_v4_test_pilot_fire(store, 0, 3, 2, table, 7, 8);
+    coli_v4_test_pilot_quiesce();
+    if (pilot_expect_stats(store, 0, 0, 0, 102)) failed = 1;
+    if (coli_v4_test_pilot_stat(0) != 2 || coli_v4_test_pilot_stat(3) != 2 ||
+        coli_v4_test_pilot_stat(4) != 0) {
+        fprintf(stderr, "pilot issued/landed/failed = %llu/%llu/%llu, want 2/2/0\n",
+                coli_v4_test_pilot_stat(0), coli_v4_test_pilot_stat(3),
+                coli_v4_test_pilot_stat(4));
+        failed = 1;
+    }
+    v4_pilot_classify(0, 2);   /* the preload marker's question, at the entry */
+    v4_pilot_classify(0, 5);
+    v4_pilot_classify(0, 4);   /* never predicted: a cold read as today */
+    if (coli_v4_test_pilot_stat(5) != 2 || coli_v4_test_pilot_stat(7) != 1 ||
+        coli_v4_test_pilot_stat(6) != 0) {
+        fprintf(stderr, "pilot entry split hit/late/miss = %llu/%llu/%llu, want 2/0/1\n",
+                coli_v4_test_pilot_stat(5), coli_v4_test_pilot_stat(6),
+                coli_v4_test_pilot_stat(7));
+        failed = 1;
+    }
+    ColiExpertView warm;
+    if (coli_expert_lookup(store, (ColiExpertKey){0, 2}, &warm) != 0 ||
+        !expect_fixture_expert(&warm, 2)) {
+        fprintf(stderr, "the entry's read of a landed prediction is not exact\n");
+        failed = 1;
+    }
+    coli_expert_release(store, &warm);
+    if (pilot_expect_stats(store, 1, 1, 0, 102)) failed = 1;   /* the demand read counted, as a hit */
+
+    /* a misprediction: token 5's selections warm, nothing ever demands them
+     * -- two slots, no book, no byte of output anywhere */
+    int64_t mispredict[16];
+    for (int i = 0; i < 16; i++) mispredict[i] = i / 2 == 5 ? (i % 2 ? 6 : 1) : 9;
+    coli_v4_test_pilot_fire(store, 0, 5, 2, mispredict, 7, 8);
+    coli_v4_test_pilot_quiesce();
+    if (pilot_expect_stats(store, 1, 1, 0, 204)) failed = 1;
+
+    /* a re-fire of the resident prediction: no read, no books */
+    coli_v4_test_pilot_fire(store, 0, 3, 2, table, 7, 8);
+    coli_v4_test_pilot_quiesce();
+    if (pilot_expect_stats(store, 1, 1, 0, 204)) failed = 1;
+
+    /* an entry that comes while the pilot's read is on disk: one read, exact
+     * bytes -- the single flight, never two slabs */
+    int64_t late[2] = {4, 4};
+    pthread_mutex_lock(&pilot_gate_mutex);
+    pilot_gate_entered = pilot_gate_release = pilot_gate_reads = 0;
+    pthread_mutex_unlock(&pilot_gate_mutex);
+    coli_v4_test_expert_read_hook = pilot_read_hook;
+    coli_v4_test_pilot_fire(store, 0, 1, 1, late, 7, 8);
+    if (!pilot_wait_gate(5000)) {
+        fprintf(stderr, "the pilot's read never reached the disk hook\n");
+        failed = 1;
+    }
+    if (!failed) {
+        v4_pilot_classify(0, 4);   /* still READING: the late class */
+        PilotEntryJob job = { store, {0, 4}, {{0}}, 0 };
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, pilot_entry_lookup, &job)) {
+            fprintf(stderr, "could not start the entry's lookup\n");
+            failed = 1;
+        } else {
+            struct timespec pause = {0, 100 * 1000000L};
+            nanosleep(&pause, NULL);   /* the entry parks on the load, or serves it */
+            pthread_mutex_lock(&pilot_gate_mutex);
+            pilot_gate_release = 1;
+            pthread_cond_broadcast(&pilot_gate_cond);
+            pthread_mutex_unlock(&pilot_gate_mutex);
+            pthread_join(thread, NULL);
+            if (job.result != 0 || !expect_fixture_expert(&job.view, 4)) {
+                fprintf(stderr, "the entry's read over an in-flight pilot is not exact\n");
+                failed = 1;
+            } else
+                coli_expert_release(store, &job.view);
+            if (pilot_gate_reads != 1) {
+                fprintf(stderr, "the coalesced read did not stay single: %d reads\n",
+                        pilot_gate_reads);
+                failed = 1;
+            }
+            if (coli_v4_test_pilot_stat(6) != 1) {
+                fprintf(stderr, "the in-flight prediction did not classify late\n");
+                failed = 1;
+            }
+        }
+    }
+    coli_v4_test_expert_read_hook = NULL;
+    pthread_mutex_lock(&pilot_gate_mutex);
+    pilot_gate_release = 1;
+    pthread_cond_broadcast(&pilot_gate_cond);
+    pthread_mutex_unlock(&pilot_gate_mutex);
+    coli_v4_test_pilot_quiesce();
+
+    /* unset: fire is a no-op, the lever off costs nothing */
+    unsetenv("COLI_VK_TIER_PILOT");
+    coli_v4_test_pilot_env_reset();
+    coli_v4_test_pilot_fire(store, 0, 3, 2, table, 7, 8);
+    coli_v4_test_pilot_quiesce();
+    if (pilot_expect_stats(store, 2, 2, 0, 255)) failed = 1;   /* only the late leg's demand read since */
+    setenv("COLI_VK_TIER_PILOT", "1", 1);
+
+    coli_v4_test_pilot_quiesce();
+    store->ops->destroy(store);   /* zero leases left: the drain held */
+    unsetenv("COLI_VK_TIER_PILOT");
+    unsetenv("COLI_VK_CHAIN_DPROF");
+    unsetenv("COLI_VK_TIER_PILOT_DEPTH");
+    coli_v4_test_pilot_env_reset();
+    unlink(path);
+    if (scratch_remove(directory, path)) return 1;
+    if (failed) return 1;
+    puts("DeepSeek-V4 pilot read-ahead: ok");
+    return 0;
+}
+/* ==== end test_deepseek_v4_pilot.c ==== */
 /* ==== end test_deepseek_v4_expert_store.c ==== */
 
 /* ==== begin test_deepseek_v4_kv_cache.c ==== */
@@ -2311,6 +2542,16 @@ static int test_fp8_decode_batch_order(void) {
 }
 
 int main(int argc, char **argv) {
+    /* `pilot` runs only the read-ahead case: vk-tier-check's fifth leg names it
+     * (the pilot lives in this store unit, deepseek_v4.c -- not in VK_OBJ), so
+     * the leg needs this binary's one case without the rest of the suite. */
+    if (argc > 1 && !strcmp(argv[1], "pilot")) {
+        if (test_pilot() != 0) {
+            fprintf(stderr, "FAIL: test_pilot\n");
+            return 1;
+        }
+        return 0;
+    }
     if (test_fp8_decode_batch_order() || test_sparse_attention_parallel_order() ||
         test_route_bf16_parallel_order() || test_fp8_grouped_projection()) return 1;
     if (test_attention_cache() != 0) {
@@ -2355,6 +2596,10 @@ int main(int argc, char **argv) {
     }
     if (test_expert_store_mfu() != 0) {
         fprintf(stderr, "FAIL: test_expert_store_mfu\n");
+        return 1;
+    }
+    if (test_pilot() != 0) {
+        fprintf(stderr, "FAIL: test_pilot\n");
         return 1;
     }
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)

@@ -844,7 +844,8 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 		--fixture ./kimi_k3_tiny
 
 .PHONY: deepseek-v4 deepseek_v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
-	deepseek-v4-tiny-check deepseek-v4-tiny-check-dmoe deepseek-v4-tiny-check-cs deepseek-v4-tiny-check-ring deepseek-v4-clean
+	deepseek-v4-tiny-check deepseek-v4-tiny-check-dmoe deepseek-v4-tiny-check-cs deepseek-v4-tiny-check-ring \
+	deepseek-v4-tiny-check-pilot deepseek-v4-clean
 ifeq ($(COLI_V4_SUPPORTED),1)
 # Every shader the other engines build (VK_SPV, empty without VK=1): backend_vulkan.c
 # looks for them at run time and goes without one that is not there, and
@@ -984,6 +985,27 @@ deepseek-v4-tiny-check-cs: deepseek-v4-tiny-generate
 
 deepseek-v4-oracle: deepseek-v4
 	@test -n "$(MODEL)" || { echo "usage: make deepseek-v4-oracle MODEL=/path/to/checkpoint" >&2; exit 2; }
+
+# COLI_VK_TIER_PILOT's own gate (the decode read-ahead, gap-wave2): the same three
+# harnesses and the same token-exact oracle with the pilot armed beside the compute
+# site. The tiny fixture keeps one hash layer (its layer 0), so no chain host-step has
+# a hash layer at i+depth and the pilot stays shape-inert here -- the PW-C2/ring
+# precedent; the mechanics live in tests/test_deepseek_v4's pilot case (fire/quiesce,
+# warm-hit byte-identity, misprediction harmlessness, the single-flight late read).
+# VK=1 because the fire site is the chain's.
+.PHONY: deepseek-v4-tiny-check-pilot
+deepseek-v4-tiny-check-pilot: deepseek-v4-tiny-generate
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) VK=1 deepseek-v4
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_TIER_PILOT=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_TIER_PILOT=1 COLI_VK_TIER_PILOT_DEPTH=3 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_TIER_EXPERTS=1 COLI_VK_TIER_PILOT=1 COLI_VK_CHAIN_DPROF=1 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
 
 # COLI_VK_TIER_STREAM_RING's own gate (PW-B, the fork's ring class): the tiny oracle with
 # the stream's fills moved onto the ring's worker -- the same token-exact expectations,
@@ -2659,6 +2681,12 @@ tests/test_vk_degrade$(EXE): tests/test_vk_degrade.c $(VK_OBJ)
 # headroom/promo-cap legs: their guard-made places allocate as installs proceed, so
 # block counts, frag and the probe-derived arm counts differ between any two runs,
 # and the strict gate byte-compares the plain invocation's unset-vs-0 pair.
+# The fifth invocation (`pilot`) carries COLI_VK_TIER_PILOT's lifecycle: the pilot
+# lives in the store unit (deepseek_v4.c), which VK_OBJ does not link, so the leg
+# runs that unit's own pilot case (tests/test_deepseek_v4 pilot) armed with depth 1
+# -- hash and non-hash fires (the tid2eid table and its NULL), warm reads that move
+# no demand book, a misprediction that costs a slot and nothing else, the
+# single-flight late read, and the unset no-op.
 # The routed-expert tier on a CUDA device (cu_tier.h) against a CPU reference.
 tests/test_cu_tier$(EXE): tests/test_cu_tier.c $(CUDA_OBJ)
 	@case "$(CUDA_OBJ)" in *cu_tier.o*) ;; *) echo "tests/test_cu_tier needs CUDA=1 (or HIP=1)" >&2; exit 1 ;; esac
@@ -2667,11 +2695,12 @@ tests/test_vk_tier$(EXE): tests/test_vk_tier.c $(VK_OBJ) $(VK_SPV)
 	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_tier needs VK=1" >&2; exit 1; }
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 .PHONY: vk-tier-check
-vk-tier-check: tests/test_vk_tier$(EXE)
+vk-tier-check: tests/test_vk_tier$(EXE) tests/test_deepseek_v4$(EXE)
 	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv
 	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv host-pairs
 	COLI_VK_TIER_FMT15=1 ./tests/test_vk_tier$(EXE) shaders/qmatmul.spv fmt15
 	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv dgrow
+	COLI_VK_TIER_PILOT=1 COLI_VK_TIER_PILOT_DEPTH=1 ./tests/test_deepseek_v4$(EXE) pilot
 
 # The dense chain's ops (vk_chain.c, shaders/chain_*.comp) against CPU references, on
 # a Vulkan device (CI: Lavapipe); like test_vk_tier it needs VK=1 and stays out of
