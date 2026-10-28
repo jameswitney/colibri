@@ -985,6 +985,14 @@ deepseek-v4-tiny-check-cs: deepseek-v4-tiny-generate
 
 deepseek-v4-oracle: deepseek-v4
 	@test -n "$(MODEL)" || { echo "usage: make deepseek-v4-oracle MODEL=/path/to/checkpoint" >&2; exit 2; }
+	$(PYTHON) tools/make_deepseek_v4_oracle.py --model "$(MODEL)" \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--output tests/deepseek_v4_oracle.json \
+		--memory-gb $(or $(MEMORY_GB),32) \
+		--prompt "$(or $(ORACLE_PROMPT),The capital of France is)" \
+		--validate \
+		--teacher-forcing $(or $(ORACLE_TEACHER_FORCING),32) \
+		--greedy $(or $(ORACLE_GREEDY),20)
 
 # COLI_VK_TIER_PILOT's own gate (the decode read-ahead, gap-wave2): the same three
 # harnesses and the same token-exact oracle with the pilot armed beside the compute
@@ -1034,14 +1042,6 @@ deepseek-v4-tiny-check-ring: deepseek-v4-tiny-generate
 	COLI_VULKAN=1 COLI_VK_TIER_STREAM_BYPASS=1 COLI_VK_TIER_STREAM_RING=1 COLI_VK_TIER_STREAM_DEPTH=16 $(PYTHON) tests/test_deepseek_v4_tiny.py \
 		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
 		--fixture ./deepseek_v4_tiny
-	$(PYTHON) tools/make_deepseek_v4_oracle.py --model "$(MODEL)" \
-		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
-		--output tests/deepseek_v4_oracle.json \
-		--memory-gb $(or $(MEMORY_GB),32) \
-		--prompt "$(or $(ORACLE_PROMPT),The capital of France is)" \
-		--validate \
-		--teacher-forcing $(or $(ORACLE_TEACHER_FORCING),32) \
-		--greedy $(or $(ORACLE_GREEDY),20)
 else
 deepseek-v4 deepseek-v4-oracle:
 	@echo "$@ is supported only on x86-64/aarch64 Linux and Windows/MSYS2" >&2; exit 1
@@ -3046,6 +3046,16 @@ V4_TEST_LINK_OBJS = \
 ifneq ($(IS_WIN),)
 V4_TEST_LINK_OBJS += COLI_V4_UNIT_GPU.o backend_loader_dsv4.o
 V4_TEST_EXTRA_TARGETS = COLI_V4_UNIT_GPU.o backend_loader_dsv4.o
+endif
+# Under VK=1 the test's units compile with -DCOLI_VULKAN, and CS-1c's forget hook
+# (vkt_slab_forget at both store destroys, deepseek_v4.c's EXPERT_STORE unit)
+# references the tier's symbol: the link needs the same VK objects the engine
+# binary links (Makefile.deepseek-v4's V4_VK_OBJ), built by the sub-make under
+# their own -flto names. vk_chain_v4.o is not among them: nothing the test's
+# units compile reaches vk_chain.c.
+ifeq ($(VK),1)
+V4_TEST_LINK_OBJS += backend_vulkan_v4.o vk_tier_v4.o
+V4_TEST_EXTRA_TARGETS += backend_vulkan_v4.o vk_tier_v4.o
 endif
 
 tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c sse41_kernels.h deepseek_v4.c deepseek_v4.h compat.h \
