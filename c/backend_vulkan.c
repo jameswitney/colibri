@@ -278,6 +278,10 @@ struct ColiVkTensor {
     VkDeviceMemory imp;    /* coli_vk_tensor_import: the host memory its rows are read from, in place */
     struct ColiVkTensor *imp_next;   /* the live imports, freed at shutdown */
     struct ColiVkSlab *slab;         /* coli_vk_tensor_alias: the imported slab its two records sit in */
+    struct ColiVkSlabReg *reg;       /* coli_vk_slabreg_alias (decode-path=fork): the registry slab its whole-buffer
+                                      * binding reads; the alias owns NOTHING (free(t) only, the fork's lifetime) */
+    size_t woff, soff;               /* the record's byte offsets in wbuf/sbuf: 0 for every own-buffer tensor,
+                                      * the registry alias's slab-relative window (the descriptor offset) */
     size_t wcap, scap;     /* the bytes its two ranges hold (tensor_alloc_pad: room for a bigger format) */
     size_t acct;           /* what tensor_alloc added to the pool's counters, taken back at the release */
     uint8_t wide;          /* a scale times the format's largest code passes f16 (scales_wide): off the cooperative-matrix GEMMs, which hold the weights in f16 */
@@ -2586,6 +2590,252 @@ void coli_vk_slab_forget(const void *slab) {
         if (r->ptr == slab) { r->ptr = NULL; r->base = NULL; }
     pthread_mutex_unlock(&g_slabs.mx);
 }
+
+/* ---- the persistent slab registry (COLI_VK_V4_DECODE_PATH=fork) ---------------------
+ * The forked decode path's tensor lifetime: the expert store's slot slabs live in a
+ * small arena of large host-coherent system-RAM blocks, each slot ONE mapped STORAGE
+ * VkBuffer bound at its aligned offset, so an expert record's alias is three callocs
+ * and zero driver objects a token (coli_vk_slabreg_alias binds the slab's buffer whole
+ * and carries woff/soff on the tensor) -- where the import path re-imports the slot's
+ * malloc pages every token and mints 2 VkBuffers a matrix (slab_buf). Slab count is
+ * bounded by buffer objects, block count by the arena cap: the gap3 arena probe on the
+ * bench GPU (RX 6900 XT / RADV) verified 2000 x 12.8 MiB STORAGE(+SDA) slabs across
+ * 9 x 2 GiB mapped blocks, one dispatch over 6 of them byte-exact, and 1000
+ * dispatch+submit+fence cycles at 0.67-1.02x a small import's per-cycle -- and that
+ * past the reported heap (10+ x 2 GiB) vkAllocateMemory SUCCEEDS while every submit
+ * fails ("not enough memory"), so the arena is clamped to the room, never trusted to
+ * refuse. */
+struct ColiVkSlabReg {
+    void *host;              /* the slab's mapping: the store's slot pointer */
+    size_t bytes;            /* the caller's bytes at host (the slab's own, not the block's) */
+    VkBuffer buf;            /* the whole slab as one storage buffer (the alias binds it whole) */
+    void *blk;               /* the SlabRegBlock carrying it (void: block type is private) */
+    size_t off;              /* the slab's bind offset in that block's memory */
+    struct ColiVkSlabReg *next;
+};
+typedef struct SlabRegBlock {
+    VkDeviceMemory mem;
+    void *map;               /* mapped once, whole (HOST_COHERENT: no flushes) */
+    size_t used, cap;
+    struct SlabRegBlock *next;
+} SlabRegBlock;
+static struct {
+    pthread_mutex_t mx;
+    ColiVkSlabReg *live;
+    SlabRegBlock *blocks;
+    size_t bytes, cap;       /* live slab bytes, the arena's byte ceiling */
+    long block_mb;           /* the block size asked for (env), what the driver allows */
+    uint32_t memtype;
+    int state;               /* 0 unset, 1 armed, -1 refused (ladder: malloc path) */
+    unsigned long long nslabs, nblocks, nrefused;
+} g_slabreg = {.mx = PTHREAD_MUTEX_INITIALIZER};
+static size_t slabreg_heap_room(void) {
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
+    uint32_t hi = mp.memoryTypes[g_slabreg.memtype].heapIndex;
+    size_t room = coli_vk_tier_host_heap_room();   /* the budget's heapUsage already counts these blocks */
+    size_t size = (size_t)mp.memoryHeaps[hi].size;
+    if (!room || room > size) room = size;
+    return room - g_slabreg.bytes > room ? 0 : room - g_slabreg.bytes;
+}
+static int slabreg_arm(void) {
+    if (g_slabreg.state) return g_slabreg.state > 0;
+    g_slabreg.state = -1;
+    if (!G.ready || G.memtype_sys < 0) return 0;   /* no coherent system-RAM type: ladder step 2 */
+    g_slabreg.memtype = (uint32_t)G.memtype_sys;
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
+    VkMemoryPropertyFlags fl = mp.memoryTypes[g_slabreg.memtype].propertyFlags;
+    if ((fl & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) !=
+        (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) return 0;
+    const char *bm = getenv("COLI_VK_V4_SLAB_BLOCK_MB");
+    long mb = bm && *bm ? atol(bm) : 2048;
+    if (mb < 16) mb = 16;
+    uint64_t max_alloc = 0;
+    {   /* maintenance4's maxMemoryAllocationSize where the device has it, else 4 GiB (the
+         * spec minimum every driver here reports; the clamp only ever tightens) */
+        VkPhysicalDeviceMaintenance4Properties m4 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &m4};
+        vkGetPhysicalDeviceProperties2(G.phys, &p2);
+        max_alloc = m4.maxBufferSize ? m4.maxBufferSize : (4ull << 30);
+    }
+    if ((uint64_t)mb << 20 > max_alloc) mb = (long)(max_alloc >> 20);
+    g_slabreg.block_mb = mb;
+    uint32_t hi = mp.memoryTypes[g_slabreg.memtype].heapIndex;
+    size_t room = slabreg_heap_room();
+    size_t heap_frac = (size_t)mp.memoryHeaps[hi].size / 8 * 7;   /* never past 7/8 of the heap: the probe's overcommit */
+    if (room > heap_frac) room = heap_frac;
+    const char *ag = getenv("COLI_VK_V4_SLAB_ARENA_GB");
+    double gb = ag && *ag ? atof(ag) : 0;
+    if (gb > 0) { size_t want = (size_t)(gb * 1073741824.0); if (room > want) room = want; }
+    g_slabreg.cap = room;
+    g_slabreg.state = 1;
+    fprintf(stderr, "[VK] slab registry armed: block=%ldMiB cap=%.2fGiB memtype=%u%s\n",
+            g_slabreg.block_mb, g_slabreg.cap / 1073741824.0, g_slabreg.memtype,
+            G.has_bda ? " storage+device-address" : "");
+    return 1;
+}
+int coli_vk_slabreg_alloc(size_t bytes, void **host_out, ColiVkSlabReg **reg_out) {
+    if (!G.ready || !coli_vk_slabreg_wanted() || !bytes || !host_out || !reg_out) return 0;
+    *host_out = NULL; *reg_out = NULL;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = bytes,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 (G.has_bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0),
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VkBuffer buf;
+    if (vkCreateBuffer(G.dev, &bi, NULL, &buf) != VK_SUCCESS) return 0;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(G.dev, buf, &req);
+    size_t align = req.alignment > 4096 ? (size_t)req.alignment : 4096;   /* 4096: the store's direct-I/O reads */
+    size_t need = ((size_t)req.size + align - 1) / align * align;
+    pthread_mutex_lock(&g_slabreg.mx);
+    if (!slabreg_arm()) goto refuse;
+    if (g_slabreg.bytes + need > g_slabreg.cap) goto refuse;   /* the arena cap (ladder: fewer registry slots) */
+    SlabRegBlock *b = g_slabreg.blocks;
+    while (b && b->cap - b->used < need) b = b->next;
+    if (!b) {
+        size_t cap = (size_t)g_slabreg.block_mb << 20;
+        if (need > cap) cap = need;
+        if (g_slabreg.bytes + cap > g_slabreg.cap)   /* a last short block serves the room that is left */
+            cap = g_slabreg.cap - g_slabreg.bytes;
+        if (cap < need) goto refuse;
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = cap, .memoryTypeIndex = g_slabreg.memtype};
+        VkMemoryAllocateFlagsInfo afl = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+        if (G.has_bda) { afl.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT; ai.pNext = &afl; }
+        VkDeviceMemory mem;
+        if (vkAllocateMemory(G.dev, &ai, NULL, &mem) != VK_SUCCESS) goto refuse;
+        void *map = NULL;
+        if (vkMapMemory(G.dev, mem, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) {
+            vkFreeMemory(G.dev, mem, NULL);
+            goto refuse;
+        }
+        b = calloc(1, sizeof *b);
+        if (!b) { vkUnmapMemory(G.dev, mem); vkFreeMemory(G.dev, mem, NULL); goto refuse; }
+        b->mem = mem; b->map = map; b->cap = cap;
+        b->next = g_slabreg.blocks; g_slabreg.blocks = b;
+        g_slabreg.nblocks++;
+    }
+    {
+        ColiVkSlabReg *r = calloc(1, sizeof *r);
+        if (!r) goto refuse;
+        r->off = (b->used + align - 1) / align * align;
+        if (vkBindBufferMemory(G.dev, buf, b->mem, r->off) != VK_SUCCESS) { free(r); goto refuse; }
+        r->host = (uint8_t *)b->map + r->off;
+        r->bytes = bytes;
+        r->buf = buf;
+        r->blk = b;
+        r->next = g_slabreg.live; g_slabreg.live = r;
+        b->used = r->off + need;
+        g_slabreg.bytes += need;
+        g_slabreg.nslabs++;
+        pthread_mutex_unlock(&g_slabreg.mx);
+        *host_out = r->host;
+        *reg_out = r;
+        return 1;
+    }
+refuse:
+    pthread_mutex_unlock(&g_slabreg.mx);
+    vkDestroyBuffer(G.dev, buf, NULL);
+    g_slabreg.nrefused++;
+    return 0;
+}
+void coli_vk_slabreg_free(ColiVkSlabReg *r) {
+    if (!r) return;
+    pthread_mutex_lock(&g_slabreg.mx);
+    for (ColiVkSlabReg **pp = &g_slabreg.live; *pp; pp = &(*pp)->next)
+        if (*pp == r) { *pp = r->next; break; }
+    pthread_mutex_unlock(&g_slabreg.mx);
+    if (G.ready) vkDestroyBuffer(G.dev, r->buf, NULL);
+    free(r);   /* the block's space is not rewound: slabs free only at store destroy */
+}
+int coli_vk_slabreg_lookup(const void *user, ColiVkSlabReg **reg_out, size_t *base_off) {
+    if (!user || !reg_out) return 0;
+    pthread_mutex_lock(&g_slabreg.mx);
+    for (ColiVkSlabReg *r = g_slabreg.live; r; r = r->next)
+        if ((const uint8_t *)user >= (const uint8_t *)r->host &&
+            (size_t)((const uint8_t *)user - (const uint8_t *)r->host) < r->bytes) {
+            if (base_off) *base_off = (size_t)((const uint8_t *)user - (const uint8_t *)r->host);
+            pthread_mutex_unlock(&g_slabreg.mx);
+            *reg_out = r;
+            return 1;
+        }
+    pthread_mutex_unlock(&g_slabreg.mx);
+    return 0;
+}
+size_t coli_vk_slabreg_bytes(void) {
+    pthread_mutex_lock(&g_slabreg.mx);
+    size_t b = g_slabreg.bytes;
+    pthread_mutex_unlock(&g_slabreg.mx);
+    return b;
+}
+int coli_vk_slabreg_wanted(void) {
+    static int w;
+    if (!w) {
+        const char *p = getenv("COLI_VK_V4_DECODE_PATH");
+        w = p && *p && !strcmp(p, "fork") ? 1 : -1;
+    }
+    return w > 0;
+}
+void coli_vk_slabreg_reset(void) {
+    pthread_mutex_lock(&g_slabreg.mx);
+    ColiVkSlabReg *r = g_slabreg.live;
+    while (r) { ColiVkSlabReg *n = r->next; if (G.ready) vkDestroyBuffer(G.dev, r->buf, NULL); free(r); r = n; }
+    g_slabreg.live = NULL;
+    SlabRegBlock *b = g_slabreg.blocks;
+    while (b) {
+        SlabRegBlock *n = b->next;
+        if (G.ready) { vkUnmapMemory(G.dev, b->mem); vkFreeMemory(G.dev, b->mem, NULL); }
+        free(b);
+        b = n;
+    }
+    g_slabreg.blocks = NULL;
+    g_slabreg.bytes = 0;
+    g_slabreg.state = 0;
+    pthread_mutex_unlock(&g_slabreg.mx);
+}
+/* The registry alias: the fork's coli_vk_tensor_alias over an arena slab -- the tensor
+ * binds its slab's ONE buffer whole (wbuf == sbuf), the record's woff/soff carried on
+ * the tensor as the descriptor offsets, pool NULL, slab NULL, reg the slab (free(t)
+ * owns nothing). Geometry/bounds/wide-verdict are coli_vk_tensor_alias_wide's rules
+ * verbatim, the import's slab_buf handles minus everything: 3 callocs, 0 driver
+ * objects. `user` is the caller's record base inside the slab (the store slot pointer
+ * the view served); wide < 0 scans the scale bytes through the slab's own mapping. */
+int coli_vk_slabreg_alias(const ColiVkSlabReg *reg, const void *user, size_t woff, size_t soff,
+                          int fmt, int I, int O, int gs, int wide, ColiVkTensor **tensor) {
+    if (*tensor) return (*tensor)->fmt == fmt && (*tensor)->I == I && (*tensor)->O == O;
+    if (!reg || !reg->host || !user || !(fmt == 7 || fmt == 15) || !fmt_uploadable(fmt, gs) || I < 1 || O < 1) return 0;
+    size_t rb = cpu_row_bytes(fmt, I);
+    if (rb != (size_t)rowwords(fmt, I) * 4) return 0;
+    size_t wbytes = rb * (size_t)O, sbytes = scale_floats(fmt, I, O, gs) * sizeof(float);
+    size_t base = (size_t)((const uint8_t *)user - (const uint8_t *)reg->host);
+    if (base > reg->bytes) return 0;
+    size_t wo = base + woff, so = base + soff;
+    if (wbytes > G.ssbo_range || wo > reg->bytes || wbytes > reg->bytes - wo ||
+        so > reg->bytes || sbytes > reg->bytes - so) return 0;
+    if (!G.ssbo_align || wo % G.ssbo_align || so % G.ssbo_align) return 0;   /* the descriptor offset's alignment */
+    ColiVkTensor *t = calloc(1, sizeof(*t));
+    if (!t) return 0;
+    t->wbuf = t->sbuf = reg->buf;   /* whole-buffer binding: the offsets ride the tensor */
+    t->woff = wo; t->soff = so;
+    t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I);
+    t->gs = (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13 || fmt == 15) ? gs : 0;
+    t->dev = 0; t->wbytes = wbytes;
+    t->pool = NULL; t->slab = NULL;
+    t->reg = (struct ColiVkSlabReg *)reg;
+    if (wide >= 0) t->wide = (uint8_t)(wide != 0);
+    else {
+        const uint8_t *sc = (const uint8_t *)reg->host + so;
+        if (fmt == 15) {
+            size_t nb = (size_t)O * (((size_t)I + gs - 1) / gs);
+            for (size_t i = 0; i < nb; i++)
+                if (sc[i] > 140) { t->wide = 1; break; }
+        } else t->wide = scales_wide(fmt, (const float *)sc, sbytes / 4);
+    }
+    __atomic_add_fetch(&g_import_bytes, wbytes, __ATOMIC_RELAXED);
+    *tensor = t;
+    return 1;
+}
 /* one record of the slab as a buffer bound into the imported memory at `off` bytes
  * into the caller's slab: the descriptor paths bind their buffers whole (offset 0),
  * so a record needs its own handle into the same pages, as a pool range has its own */
@@ -4251,6 +4501,12 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
  * reclaim the host struct and counters only. */
 static void tensor_release(ColiVkTensor *t) {
     VkWPool *P = t->pool;
+    if (t->reg) {   /* a registry slab's view (decode-path=fork): the fork's lifetime -- the alias
+                     * owns nothing, the registry holds the buffer and mapping for the store's own */
+        __atomic_sub_fetch(&g_import_bytes, t->wbytes, __ATOMIC_RELAXED);
+        free(t);
+        return;
+    }
     if (t->slab) {   /* an aliased record of an imported slab: its two buffer handles and the slab's reference, no pool's */
         ColiVkSlab *r = t->slab;
         if (G.ready) {
@@ -4627,17 +4883,19 @@ static int xb_buf(XbCtx *X, XbBuf *b, size_t region, uint32_t memtype, int map) 
  * buffers' regions; the offsets come at bind time. */
 static void xb_write_sets(ColiVkExpert *e) {
     XbCtx *X = e->X;
+    /* the weight/scale offsets are the tensor's own: 0 for every own-buffer tensor, the
+     * registry alias's whole-buffer window (decode-path=fork) -- wbuf/sbuf bind whole */
     VkDescriptorBufferInfo gu[6] = {
-        {X->x.buf, 0, X->x.region}, {e->g->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->g), 0, VK_WHOLE_SIZE},
-        {e->u->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->u), 0, VK_WHOLE_SIZE}, {X->h.buf, 0, X->h.region}};
+        {X->x.buf, 0, X->x.region}, {e->g->wbuf, e->g->woff, VK_WHOLE_SIZE}, {sbuf_of(e->g), e->g->soff, VK_WHOLE_SIZE},
+        {e->u->wbuf, e->u->woff, VK_WHOLE_SIZE}, {sbuf_of(e->u), e->u->soff, VK_WHOLE_SIZE}, {X->h.buf, 0, X->h.region}};
     VkDescriptorBufferInfo dn[4] = {
-        {X->h.buf, 0, X->h.region}, {e->d->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->d), 0, VK_WHOLE_SIZE},
+        {X->h.buf, 0, X->h.region}, {e->d->wbuf, e->d->woff, VK_WHOLE_SIZE}, {sbuf_of(e->d), e->d->soff, VK_WHOLE_SIZE},
         {X->y.buf, 0, X->y.region}};
     VkDescriptorBufferInfo mg[4] = {
-        {X->x.buf, 0, X->x.region}, {e->g->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->g), 0, VK_WHOLE_SIZE},
+        {X->x.buf, 0, X->x.region}, {e->g->wbuf, e->g->woff, VK_WHOLE_SIZE}, {sbuf_of(e->g), e->g->soff, VK_WHOLE_SIZE},
         {X->g.buf, 0, X->g.region}};
     VkDescriptorBufferInfo mu[4] = {
-        {X->x.buf, 0, X->x.region}, {e->u->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->u), 0, VK_WHOLE_SIZE},
+        {X->x.buf, 0, X->x.region}, {e->u->wbuf, e->u->woff, VK_WHOLE_SIZE}, {sbuf_of(e->u), e->u->soff, VK_WHOLE_SIZE},
         {X->u.buf, 0, X->u.region}};
     VkWriteDescriptorSet w[18]; int n = 0;
     struct { VkDescriptorSet set; VkDescriptorBufferInfo *bi; int nb, d0, d1; } sets[4] = {
@@ -6790,6 +7048,7 @@ void coli_vk_shutdown(void) {
     g_async_inflight[0] = 0;   /* idle after vkDeviceWaitIdle: the deferred frees run now */
     tensor_reap(0);
     bdtab_free(0);
+    coli_vk_slabreg_reset();   /* the registry's slabs and arena blocks (the store freed its slots first) */
     pthread_mutex_lock(&g_imports_mx);   /* imported rows: their memory objects go before the device */
     for (ColiVkTensor *t = g_imports; t; t = t->imp_next) {
         vkDestroyBuffer(G.dev, t->wbuf, NULL); vkFreeMemory(G.dev, t->imp, NULL);

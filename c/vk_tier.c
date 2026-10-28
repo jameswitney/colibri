@@ -287,7 +287,7 @@ static struct {
      * that fell back to the CPU, and of those how many the alias itself refused) */
     int csx, cs_pending, cs_layer;
     ColiVkExpert **cs_ex; int cs_nex, cs_cex;
-    unsigned long long cs_groups, cs_res, cs_alias, cs_fallback, cs_refuse;
+    unsigned long long cs_groups, cs_res, cs_alias, cs_fallback, cs_refuse, cs_fork;   /* cs_fork: decode-path=fork's registry aliases (the import branch's complement) */
     /* the CS alias keepalive cache (COLI_VK_TIER_CS_ALIAS_CACHE, CS-1c): a tier-owned
      * hold on each aliased store slab across the group's join, so a decode expert's
      * slab is imported once and reused at its exact geometry, not re-imported every
@@ -3135,6 +3135,40 @@ void vkt_slab_forget(const void *slab) {
     coli_vk_slab_forget(slab);
 }
 
+/* ---- the forked decode path's store routing (COLI_VK_V4_DECODE_PATH=fork) -------------
+ * The engine's expert store asks these at its slot alloc/free sites; the registry
+ * itself is the backend's (coli_vk_slabreg_*, backend_vulkan.c). Every refusal is the
+ * ladder: the slot keeps its malloc/import path and the CS alias takes the import
+ * branch exactly as today -- never an error, never fatal. */
+int vkt_forkdec_wanted(void) {
+    static int w;
+    if (!w) {
+        w = -1;
+        if (coli_vk_slabreg_wanted()) {
+            const char *xe = getenv("COLI_VK_TIER_EXPERTS");
+            int csx = xe && *xe ? atoi(xe) : 0;
+            if (csx == 1 || csx == 2) w = 1;
+            else fprintf(stderr, VKT_TAG " tier: COLI_VK_V4_DECODE_PATH=fork needs COLI_VK_TIER_EXPERTS=1; the forked decode path stays off, slots keep the malloc/import path\n");
+        }
+    }
+    return w > 0;
+}
+int vkt_slabreg_slot(size_t bytes, void **host, void **reg) {
+    if (!vkt_forkdec_wanted() || !host || !reg) return 0;
+    *host = NULL; *reg = NULL;
+    return coli_vk_slabreg_alloc(bytes, host, (ColiVkSlabReg **)reg);
+}
+void vkt_slabreg_slot_free(void *reg, void *host) {
+    (void)host;   /* the slab's pages are the registry's own (vk_slab_forget walked it first) */
+    if (reg) coli_vk_slabreg_free((ColiVkSlabReg *)reg);
+}
+void vkt_forkdec_store_line(int slots, size_t slab_bytes) {
+    if (!vkt_forkdec_wanted()) return;
+    fprintf(stderr, VKT_TAG " tier %s: decode-path=fork arena=%.2fGiB slabs=%d slab=%.2fMiB\n",
+            T.engine, (double)slots * (double)slab_bytes / 1073741824.0, slots,
+            slab_bytes / 1048576.0);
+}
+
 /* One aliased expert over its imported slab: CS-1a's capability, VktAliasSrc's three
  * records as ColiVkTensors and an expert of them. The import is refcounted by the
  * slab's own pages (a slot reused keeps it); this call's own reference goes back once
@@ -3163,12 +3197,21 @@ static ColiVkExpert *cs_alias_expert(int layer, int eid, const VktAliasSrc *s, i
         }
     }
     if (hit) *hit = ci >= 0;
-    ColiVkSlab *r;
-    double tim = vkt_cs_dprof() ? vkt_now_ms() : 0;   /* the import's own span: the alias churn question (create vs hit is the backend's) */
-    if (!coli_vk_slab_import(s->slab, s->bytes, &r)) { T.cs_refuse++; return NULL; }
-    if (vkt_cs_dprof()) { T.cs_import_ms += vkt_now_ms() - tim; T.cs_import_n++; }
+    /* the forked decode path (COLI_VK_V4_DECODE_PATH=fork): a registry-backed slot
+     * (its slab came out of the arena) aliases straight off the slab's own buffer --
+     * no import, no slab_buf handles, 3 callocs; the alias cache's entry (when armed)
+     * keeps only its f16 verdicts, the keepalive is the registry's own residence */
+    ColiVkSlabReg *freg = NULL;
+    int forked = coli_vk_slabreg_lookup(s->slab, &freg, NULL) ? 1 : 0;
+    if (forked) T.cs_fork++;
+    ColiVkSlab *r = NULL;
+    if (!forked) {
+        double tim = vkt_cs_dprof() ? vkt_now_ms() : 0;   /* the import's own span: the alias churn question (create vs hit is the backend's) */
+        if (!coli_vk_slab_import(s->slab, s->bytes, &r)) { T.cs_refuse++; return NULL; }
+        if (vkt_cs_dprof()) { T.cs_import_ms += vkt_now_ms() - tim; T.cs_import_n++; }
+    }
     VCsAlias *ce = NULL;   /* this source's entry (a hit's, or the one the miss just inserted): the verdicts' home while the skip lever is armed */
-    if (T.cs_cache) ce = ci >= 0 ? &T.cs_cache_e[ci] : cs_cache_insert(s, r);
+    if (T.cs_cache) ce = ci >= 0 ? &T.cs_cache_e[ci] : cs_cache_insert(s, forked ? NULL : r);
     /* the skip applies only to provably the same content: the entry's recorded (layer,
      * eid) -- a same-geometry rewrite to another expert, or an address the store freed
      * and the allocator re-took (the entry is gone: vkt_slab_forget), keeps the scan */
@@ -3177,8 +3220,11 @@ static ColiVkExpert *cs_alias_expert(int layer, int eid, const VktAliasSrc *s, i
     ColiVkTensor *t[3] = {NULL, NULL, NULL};
     int ok = 1;
     for (int k = 0; ok && k < 3; k++)
-        ok = coli_vk_tensor_alias_wide(r, s->woff[k], s->soff[k], s->fmt, s->I[k], s->O[k], s->gs,
-                                       know ? (int)ce->wide[k] : -1, &t[k]) == 1;
+        ok = forked
+            ? coli_vk_slabreg_alias(freg, s->slab, s->woff[k], s->soff[k], s->fmt, s->I[k], s->O[k], s->gs,
+                                    know ? (int)ce->wide[k] : -1, &t[k]) == 1
+            : coli_vk_tensor_alias_wide(r, s->woff[k], s->soff[k], s->fmt, s->I[k], s->O[k], s->gs,
+                                        know ? (int)ce->wide[k] : -1, &t[k]) == 1;
     double t1 = vkt_cs_dprof() ? vkt_now_ms() : 0;
     ColiVkExpert *ex = ok ? coli_vk_xb_expert(t[0], t[1], t[2]) : NULL;
     if (vkt_cs_dprof()) T.cs_xbex_ms += vkt_now_ms() - t1;
@@ -3202,7 +3248,7 @@ static ColiVkExpert *cs_alias_expert(int layer, int eid, const VktAliasSrc *s, i
             }
         }
     }
-    coli_vk_slab_unref(r);   /* the built tensors hold their own; an empty hand returns the pages */
+    if (!forked) coli_vk_slab_unref(r);   /* the built tensors hold their own; an empty hand returns the pages */
     return ex;
 }
 
@@ -4236,6 +4282,10 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
                  * (layer, expert); any other hit rescans */
                 const char *se = getenv("COLI_VK_TIER_CS_ALIAS_SCAN_SKIP");
                 T.cs_scan_skip = se && *se && atoi(se) != 0 ? 1 : 0;
+                /* the forked decode path supersedes the keepalive (the registry IS the
+                 * residence); the verdict cache composes unchanged (content-keyed) */
+                if (coli_vk_slabreg_wanted())
+                    fprintf(stderr, VKT_TAG " tier %s: alias cache idle: registry resident (COLI_VK_V4_DECODE_PATH=fork; the verdict cache composes)\n", eng);
             }
         }
         /* CS device-sum (COLI_VK_TIER_CS_DEVSUM, off unless asked): the group's rows
@@ -4538,8 +4588,11 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
         fprintf(stderr, " | decode dprof: waited %.1f ms, device %.1f ms, CPU %.1f ms, promoted %.1f MiB",
                 T.d_wait_ms, T.d_dev_ms, T.d_cpu_ms, (double)T.d_up_bytes / 1048576.0);
     if (T.cs_groups) {   /* COLI_VK_TIER_EXPERTS: the finish-site group's own books (one group a layer-token) */
-        fprintf(stderr, " | cs: %llu groups, %llu resident + %llu aliased entries on the device, %llu cpu-fallback (%llu alias refusals)",
+        fprintf(stderr, " | cs: %llu groups, %llu resident + %llu aliased entries on the device, %llu cpu-fallback (%llu alias refusals",
                 T.cs_groups, T.cs_res, T.cs_alias, T.cs_fallback, T.cs_refuse);
+        if (T.cs_fork)   /* COLI_VK_V4_DECODE_PATH=fork: how many of the aliased came off the registry (no import) */
+            fprintf(stderr, ", %llu registry", T.cs_fork);
+        fprintf(stderr, ")");
         if (T.cs_sum_n)   /* CS_DEVSUM: the groups whose join read one merged row, and the rows they did not */
             fprintf(stderr, ", %llu device-merged (%llu rows)", T.cs_sum_n, T.cs_sum_rows);
     }

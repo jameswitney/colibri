@@ -425,6 +425,20 @@ void vkt_settle(void);
  * imports the new pages fresh (the VA-reuse hazard's guard). Cheap and a no-op when
  * the cache holds nothing for the address. */
 void vkt_slab_forget(const void *slab);
+/* The forked decode path (COLI_VK_V4_DECODE_PATH=fork, gap-wave3): the expert store's
+ * slot slabs route through the backend's persistent slab registry (arena blocks of
+ * mapped HOST_COHERENT system RAM, one STORAGE VkBuffer a slot) so the CS alias is a
+ * calloc against the registry, not a per-token host-page import. vkt_forkdec_wanted
+ * reads the arm (COLI_VK_V4_DECODE_PATH=fork AND COLI_VK_TIER_EXPERTS=1/2 -- the
+ * compute site is the alias's consumer; anything else: one stderr line, ignored).
+ * vkt_slabreg_slot is the alloc (0: this slot keeps the malloc/import path, the
+ * ladder), vkt_slabreg_slot_free the destroy-time return (after vkt_slab_forget),
+ * vkt_forkdec_store_line the store's one engagement line (planned slots and slab
+ * bytes, the registry's own cap line said the rest). */
+int  vkt_forkdec_wanted(void);
+int  vkt_slabreg_slot(size_t bytes, void **host, void **reg);
+void vkt_slabreg_slot_free(void *reg, void *host);
+void vkt_forkdec_store_line(int slots, size_t slab_bytes);
 int  vkt_dev_changes(unsigned since, int *slots, int max);
 /* The VRAM bank's refill (COLI_VK_TIER_BANK_LAYER, vk_tier.c "the VRAM bank"): at the
  * banked layer's routed step, post-router and pre-issue -- the engine's tier seam --
@@ -530,6 +544,10 @@ static inline int  vkt_dev_table(int l,uint32_t *e){(void)l;(void)e;return -1;}
 static inline void vkt_dev_count(int l,int S,int K,const int *i){(void)l;(void)S;(void)K;(void)i;}
 static inline void vkt_settle(void){}
 static inline void vkt_slab_forget(const void *s){(void)s;}
+static inline int  vkt_forkdec_wanted(void){return 0;}
+static inline int  vkt_slabreg_slot(size_t b, void **h, void **r){(void)b;(void)h;(void)r;return 0;}
+static inline void vkt_slabreg_slot_free(void *r, void *h){(void)r;(void)h;}
+static inline void vkt_forkdec_store_line(int s, size_t b){(void)s;(void)b;}
 static inline void vkt_bank_fill(int l,const int *i,int n){(void)l;(void)i;(void)n;}
 static inline void vkt_bank_switch(int l){(void)l;}
 #endif
