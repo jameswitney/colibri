@@ -80,6 +80,8 @@ static const CuTierOps *cut_ops(void) {
 #define coli_vk_xb_issue_w(...) (cut_ops()->xb_issue_w(__VA_ARGS__))
 #define coli_vk_xb_issue_dev(...) (cut_ops()->xb_issue_dev(__VA_ARGS__))
 #define coli_vk_xb_join(...) (cut_ops()->xb_join(__VA_ARGS__))
+#define coli_vk_xb_join_sum(...) (cut_ops()->xb_join_sum(__VA_ARGS__))
+#define coli_vk_xb_sum_arm(...) (cut_ops()->xb_sum_arm(__VA_ARGS__))
 #define coli_vk_xb_join_dev(...) (cut_ops()->xb_join_dev(__VA_ARGS__))
 #define coli_vk_xb_busy_dev(...) (cut_ops()->xb_busy_dev(__VA_ARGS__))
 #define coli_vk_xb_stats(...) (cut_ops()->xb_stats(__VA_ARGS__))
@@ -118,6 +120,7 @@ static const CuTierOps *cut_ops(void) {
 #define vkt_issue_w cut_issue_w
 #define vkt_issue_group cut_issue_group
 #define vkt_join cut_join
+#define vkt_join_merged cut_join_merged
 #define vkt_join_sum cut_join_sum
 #define vkt_layers cut_layers
 #define vkt_note cut_note

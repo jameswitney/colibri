@@ -729,7 +729,7 @@ endif
 VK_OBJ    = backend_vulkan.o vk_tier.o
 VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_bd.spv shaders/qmatmul_gate_up_bd.spv shaders/attention_absorb.spv shaders/rmsnorm.spv \
             shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv shaders/expert_act.spv \
-            shaders/expert_act_v4.spv shaders/qmatmul_grp.spv shaders/qmatmul_grp_gate_up.spv shaders/expert_sum.spv shaders/qmatmul_grp_gemv.spv shaders/qmatmul_grp_gemv_gate_up.spv
+            shaders/expert_act_v4.spv shaders/qmatmul_grp.spv shaders/qmatmul_grp_gate_up.spv shaders/expert_sum.spv shaders/expert_sum_dec.spv shaders/qmatmul_grp_gemv.spv shaders/qmatmul_grp_gemv_gate_up.spv
 # vk_chain.o: a layer's dense chain recorded into one submission (vk_chain.h), and
 # its shaders; an engine that does not call it links nothing from it.
 VK_OBJ   += vk_chain.o

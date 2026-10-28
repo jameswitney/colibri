@@ -785,6 +785,11 @@ typedef struct {
     int (*issue)(int layer, const float *x, int S, int K, const int *idx, const float *w,
                  uint8_t *taken);
     int (*join)(const float **rows);
+    /* COLI_VK_TIER_CS_DEVSUM (the Vulkan CS tier's own, NULL everywhere else): join's
+     * contract and, when the group carried the device-sum tail, *sum its ONE merged
+     * row (each row bf16 rounded, added in rank order -- the finish site's host merge,
+     * bit-for-bit) beside the rows, which stay valid; *sum = NULL on every other join. */
+    int (*join_merged)(const float **rows, const float **sum);
     void (*note)(const ColiExpertView *view);
     void (*routed)(ColiExpertKey key);
     void (*bank)(int layer, const int *idx, int n);
