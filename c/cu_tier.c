@@ -111,6 +111,8 @@ static const CuTierOps *cut_ops(void) {
 #define vkt_devices cut_devices
 #define vkt_epoch cut_epoch
 #define vkt_expert_bytes cut_expert_bytes
+#define vkt_forkdec_store_line cut_forkdec_store_line
+#define vkt_forkdec_wanted cut_forkdec_wanted
 #define vkt_host_pairs cut_host_pairs
 #define vkt_host_pairs_w cut_host_pairs_w
 #define vkt_host_pool_on cut_host_pool_on
@@ -136,6 +138,8 @@ static const CuTierOps *cut_ops(void) {
 #define vkt_score cut_score
 #define vkt_settle cut_settle
 #define vkt_slab_forget cut_slab_forget
+#define vkt_slabreg_slot cut_slabreg_slot
+#define vkt_slabreg_slot_free cut_slabreg_slot_free
 #define vkt_shutdown cut_shutdown
 #define vkt_stage_room cut_stage_room
 #define vkt_step_rows cut_step_rows
@@ -159,6 +163,15 @@ static const CuTierOps *cut_ops(void) {
 #define coli_vk_slab_bytes(...) (0)
 #define coli_vk_slab_cap() (0)
 #define coli_vk_slab_forget(...) ((void)0)
+/* the forked decode path's registry is the Vulkan backend's own (coli_vk_slabreg_*,
+ * backend_vulkan.c); a CUDA backend has no such registry, so every call declines and
+ * the store's slots keep the malloc path, the CS alias the import branch (itself
+ * shimmed above) -- the lever's refusal ladder, never a drop */
+#define coli_vk_slabreg_wanted() (0)
+#define coli_vk_slabreg_alloc(...) (0)
+#define coli_vk_slabreg_free(...) ((void)0)
+#define coli_vk_slabreg_lookup(...) (0)
+#define coli_vk_slabreg_alias(...) (0)
 /* the Vulkan backend's CS diagnostics (backend_vulkan.h); the CUDA tier has no slab
  * import, so vk_tier.c's report reads an all-zero snapshot */
 #define coli_vk_cs_diag(out) (memset((out), 0, sizeof *(out)))
