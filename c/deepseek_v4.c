@@ -9397,13 +9397,20 @@ static void destroy(ColiExpertStore *store) {
     V4ExpertStoreState *state = store->state;
     if (state) {
         assert(state->active_leases == 0 && "destroy with active expert leases");
-        for (int i = 0; i < state->layers * state->slots_per_layer; i++)
+        for (int i = 0; i < state->layers * state->slots_per_layer; i++) {
+            /* the tier's alias holds on these pages go before the pages do, so a
+             * later slab at this address cannot hit the stale import (vkt_slab_forget,
+             * the VA-reuse guard); no lease is live here, so nothing reads them. Not
+             * XT(): xtier.h sits below, and every slab import there is belongs to the
+             * Vulkan tier (a CUDA tier's imports refuse -- its cache walks empty) */
+            vkt_slab_forget(state->slots[i].slab);
             /* aligned_slab means posix_memalign, which on Windows is
              * _aligned_malloc and must not reach free(). */
             if (state->slots[i].aligned_slab)
                 compat_aligned_free(state->slots[i].slab);
             else
                 free(state->slots[i].slab);
+        }
         pthread_cond_destroy(&state->load_ready);
         pthread_mutex_destroy(&state->mutex);
         coli_st_index_close(state->index);
@@ -20437,11 +20444,16 @@ static void destroy(ColiExpertStore *store) {
     V4ExpertStoreState *state = store->state;
     if (state) {
         assert(state->active_leases == 0 && "destroy with active expert leases");
-        for (int i = 0; i < state->layers * state->slots_per_layer; i++)
+        for (int i = 0; i < state->layers * state->slots_per_layer; i++) {
+            /* the tier's alias holds go first even here (vkt_slab_forget): this
+             * store's slots never alias (view_slab serves the hot store only),
+             * but the guard costs one empty walk */
+            vkt_slab_forget(state->slots[i].slab);
             free(state->slots[i].slab);   /* this store allocates slabs with
                                            * malloc only; the aligned path and
                                            * its compat_aligned_free live in the
                                            * hot rows16 store above. */
+        }
         pthread_mutex_destroy(&state->mutex);
         coli_st_index_close(state->index);
         free(state->records);

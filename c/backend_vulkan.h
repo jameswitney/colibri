@@ -155,6 +155,7 @@ void coli_vk_slab_unref(ColiVkSlab *slab);
 void coli_vk_slab_ref(ColiVkSlab *slab);   /* one more keepalive reference (the tier's alias cache) */
 size_t coli_vk_slab_bytes(const ColiVkSlab *slab);   /* the imported bytes the reference pins */
 int  coli_vk_slab_cap(void);               /* the live-import cap (COLI_VK_TIER_EXPERTS_IMPORT_CAP) */
+void coli_vk_slab_forget(const void *slab);   /* the store's slot-free path: blind the dedup to these pages (VA reuse) */
 /* A tensor whose weights AND scales are records of an imported slab, read in
  * place: woff the first weight row's byte in the slab, soff the scales' (fmt 15:
  * the packed ue8m0 bytes, their word pad past the end never read -- exactly the
@@ -168,6 +169,16 @@ int  coli_vk_slab_cap(void);               /* the live-import cap (COLI_VK_TIER_
  * (or uploads a copy). */
 int  coli_vk_tensor_alias(ColiVkSlab *slab, size_t woff, size_t soff, int fmt, int I, int O, int gs,
                           ColiVkTensor **tensor);
+/* the same alias with the f16-range verdict (tensor.wide) supplied by the caller:
+ * wide < 0 scans the slab's scale bytes (every build pays O x ceil(I/gs) bytes a
+ * tensor); 0/1 is vouched for the exact bytes at [soff, soff+sbytes) -- the tier's
+ * alias cache records one per entry for the content it served last and skips the
+ * scan only when the SAME content is aliased again (same slab address generation
+ * and the same expert: the store's record bytes are fixed per (layer, expert)).
+ * A stale verdict is silent wrong math -- the bar for passing one is provable
+ * sameness of the bytes, never plausibility. */
+int  coli_vk_tensor_alias_wide(ColiVkSlab *slab, size_t woff, size_t soff, int fmt, int I, int O, int gs,
+                               int wide, ColiVkTensor **tensor);
 
 /* SECOND DEVICE (COLI_VK_DEV2): a self-contained context on another Vulkan GPU that
  * hosts ONLY tier experts and runs ONLY the async expert-group path. devidx: -1 =

@@ -77,13 +77,21 @@ typedef struct { int n, nslot, cap, *slot; float **yout; } VSub;
  * rewritten to another expert's geometry (or reallocated elsewhere) is a different entry -- and
  * the one slab reference the cache holds across joins (the tensors' own references ride the
  * in-flight group and go at its join). imp_bytes is the slab's imported bytes, the MB bound's
- * charge; seq is the LRU stamp. */
+ * charge; seq is the LRU stamp. The scan-skip lever (COLI_VK_TIER_CS_ALIAS_SCAN_SKIP) records
+ * beside them the CONTENT the entry's f16-range verdicts (wide, one a tensor role) were earned
+ * for -- layer and eid: the same (layer, expert) re-aliased from the same address is the same
+ * bytes (the store's record reads are fixed per expert), so its hits pass the verdicts to
+ * coli_vk_tensor_alias_wide and skip the scale scan; anything else (a slot rewritten to
+ * another expert at the same geometry, a forgotten-and-reallocated address) rebuilds with
+ * the scan. wide_ok 0 until a build recorded them. */
 typedef struct {
     const void *slab; size_t bytes;
     size_t woff[3], soff[3];
     int I[3], O[3], fmt, gs;
     ColiVkSlab *imp;
     size_t imp_bytes;
+    int layer, eid;
+    uint8_t wide[3], wide_ok;
     unsigned long long seq;
 } VCsAlias;
 
@@ -288,9 +296,10 @@ static struct {
      * (never while a group is in flight). */
     int cs_cache;
     size_t cs_cache_cap;
+    int cs_scan_skip;                  /* COLI_VK_TIER_CS_ALIAS_SCAN_SKIP: a hit of the same content passes the recorded f16 verdicts and skips the scale scan */
     VCsAlias *cs_cache_e; int cs_cache_n, cs_cache_capn;
     size_t cs_cache_bytes;
-    unsigned long long cs_cache_seq, cs_cache_hits, cs_cache_misses, cs_cache_evicts;
+    unsigned long long cs_cache_seq, cs_cache_hits, cs_cache_misses, cs_cache_evicts, cs_cache_forgets, cs_scan_skips;
     /* CS diagnostics (COLI_VK_CHAIN_DPROF=1 only): the deferred group's window split,
      * double-ms + counts; all zero and untimed unless the gate is on. They reconcile
      * against the decode dprof line's waited/device/CPU (see vkt_report's cs dprof):
@@ -303,6 +312,7 @@ static struct {
     unsigned long long cs_settle_n;
     double cs_lookup_ms;               /* B: the group's entry loop (resident lookup + alias builds) */
     double cs_alias_ms;                /* B: cs_alias_expert's span, a subset of cs_lookup_ms */
+    double cs_alias_hit_ms, cs_alias_miss_ms;   /* B: the same span by the cache's outcome (a hit rode the keepalive, a miss built the entry) -- the bench wave's effectiveness read, beside the backend's create/hit import split */
     double cs_xbex_ms;                 /* B: coli_vk_xb_expert's span, a subset of cs_alias_ms */
     double cs_import_ms;               /* B: coli_vk_slab_import's span, a subset of cs_alias_ms (the import
                                         * churn's own time, beside the backend's create/hit split) */
@@ -3035,14 +3045,14 @@ static void cs_cache_evict_bytes(void) {
     if (!T.cs_cache) return;
     while (T.cs_cache_n && T.cs_cache_bytes > T.cs_cache_cap) cs_cache_drop_lru();
 }
-static void cs_cache_insert(const VktAliasSrc *s, ColiVkSlab *r) {
+static VCsAlias *cs_cache_insert(const VktAliasSrc *s, ColiVkSlab *r) {
     long cap = coli_vk_slab_cap();   /* the live-import count cap: keep one slot free so the next fresh alias can import before the cache retires a hold */
-    if (cap <= 1) return;            /* 0/1: no room for a keepalive beside the one live import */
+    if (cap <= 1) return NULL;       /* 0/1: no room for a keepalive beside the one live import */
     while (T.cs_cache_n && (long)T.cs_cache_n >= cap - 1) cs_cache_drop_lru();
     if (T.cs_cache_n == T.cs_cache_capn) {
         int nc = T.cs_cache_capn ? T.cs_cache_capn * 2 : 16;
         VCsAlias *a = realloc(T.cs_cache_e, (size_t)nc * sizeof(*a));
-        if (!a) return;   /* no room for the hold: this group still uses the slab, its pages go at the join */
+        if (!a) return NULL;   /* no room for the hold: this group still uses the slab, its pages go at the join */
         T.cs_cache_e = a; T.cs_cache_capn = nc;
     }
     VCsAlias *e = &T.cs_cache_e[T.cs_cache_n++];
@@ -3054,6 +3064,7 @@ static void cs_cache_insert(const VktAliasSrc *s, ColiVkSlab *r) {
     e->seq = ++T.cs_cache_seq;
     T.cs_cache_bytes += e->imp_bytes;
     coli_vk_slab_ref(r);   /* the keepalive reference beside the caller's own */
+    return e;
 }
 static void cs_cache_clear(void) {
     if (!T.cs_cache_e) return;
@@ -3061,13 +3072,37 @@ static void cs_cache_clear(void) {
     T.cs_cache_n = 0;
     T.cs_cache_bytes = 0;
 }
+/* Drop every hold keyed on this slab address (its pages are going away, the store's
+ * slot-free path): the drop-index discipline is cs_cache_find_slab's -- a dropped
+ * entry is replaced by the last, so the walk only steps on a match's survivor. */
+static void cs_cache_forget(const void *slab) {
+    for (int i = 0; i < T.cs_cache_n; )
+        if (T.cs_cache_e[i].slab == slab) { cs_cache_drop(i); T.cs_cache_forgets++; }
+        else i++;
+}
+/* The VA-reuse guard (gap-wave1's mandatory hardening): the cache's key is the exact
+ * alias-source geometry, which cannot tell two generations of one address apart -- a
+ * slab freed and its address returned for the same size would hit the stale entry (and
+ * the import dedup under it), a pinned import of pages the allocator has since given
+ * out, and the device would read whatever sits there now, silently. The store's
+ * slot-free path hands the address here before the pages go: the holds drop (never in
+ * flight -- the store frees at destroy, past every lease) and the backend blinds its
+ * dedup, so a later alias at this address is a fresh miss that imports the new pages. */
+void vkt_slab_forget(const void *slab) {
+    if (!slab) return;
+    if (T.cs_cache) cs_cache_forget(slab);
+    coli_vk_slab_forget(slab);
+}
 
 /* One aliased expert over its imported slab: CS-1a's capability, VktAliasSrc's three
  * records as ColiVkTensors and an expert of them. The import is refcounted by the
  * slab's own pages (a slot reused keeps it); this call's own reference goes back once
  * the tensors hold theirs -- the expert's free at the join releases those. NULL: the
- * import, a tensor or the sets refused; the selection computes on the CPU. */
-static ColiVkExpert *cs_alias_expert(const VktAliasSrc *s) {
+ * import, a tensor or the sets refused; the selection computes on the CPU. layer/eid
+ * name the CONTENT the source's slab holds (the store's view serves only its own
+ * expert's lease, its record bytes fixed per pair) -- the scan-skip lever's guarantee.
+ * *hit, when given, tells the caller the keepalive cache served this one. */
+static ColiVkExpert *cs_alias_expert(int layer, int eid, const VktAliasSrc *s, int *hit) {
     if (!s->slab || !s->bytes || (s->fmt != 7 && s->fmt != 15) || !s->gs) { T.cs_refuse++; return NULL; }
     for (int t = 0; t < 3; t++)
         if (s->I[t] < 1 || s->O[t] < 1 || s->woff[t] >= s->bytes || s->soff[t] >= s->bytes) {
@@ -3086,25 +3121,44 @@ static ColiVkExpert *cs_alias_expert(const VktAliasSrc *s) {
             if (pi >= 0) cs_cache_drop(pi);   /* the slot was rewritten: invalidate the old geometry's hold before the new import */
         }
     }
+    if (hit) *hit = ci >= 0;
     ColiVkSlab *r;
     double tim = vkt_cs_dprof() ? vkt_now_ms() : 0;   /* the import's own span: the alias churn question (create vs hit is the backend's) */
     if (!coli_vk_slab_import(s->slab, s->bytes, &r)) { T.cs_refuse++; return NULL; }
     if (vkt_cs_dprof()) { T.cs_import_ms += vkt_now_ms() - tim; T.cs_import_n++; }
-    if (T.cs_cache && ci < 0) cs_cache_insert(s, r);
+    VCsAlias *ce = NULL;   /* this source's entry (a hit's, or the one the miss just inserted): the verdicts' home while the skip lever is armed */
+    if (T.cs_cache) ce = ci >= 0 ? &T.cs_cache_e[ci] : cs_cache_insert(s, r);
+    /* the skip applies only to provably the same content: the entry's recorded (layer,
+     * eid) -- a same-geometry rewrite to another expert, or an address the store freed
+     * and the allocator re-took (the entry is gone: vkt_slab_forget), keeps the scan */
+    int know = T.cs_scan_skip && ce && ce->wide_ok && ce->layer == layer && ce->eid == eid;
+    if (know) T.cs_scan_skips++;
     ColiVkTensor *t[3] = {NULL, NULL, NULL};
     int ok = 1;
     for (int k = 0; ok && k < 3; k++)
-        ok = coli_vk_tensor_alias(r, s->woff[k], s->soff[k], s->fmt, s->I[k], s->O[k], s->gs, &t[k]) == 1;
+        ok = coli_vk_tensor_alias_wide(r, s->woff[k], s->soff[k], s->fmt, s->I[k], s->O[k], s->gs,
+                                       know ? (int)ce->wide[k] : -1, &t[k]) == 1;
     double t1 = vkt_cs_dprof() ? vkt_now_ms() : 0;
     ColiVkExpert *ex = ok ? coli_vk_xb_expert(t[0], t[1], t[2]) : NULL;
     if (vkt_cs_dprof()) T.cs_xbex_ms += vkt_now_ms() - t1;
     if (!ex) {   /* the sets refused: the tensors (their import references with them) give way here */
         T.cs_refuse++;
         for (int k = 0; k < 3; k++) coli_vk_tensor_free(t[k]);
-    } else if (vkt_cs_dprof()) {   /* E: the actual bytes this alias built (weights + scales), from the geometry the tensors hold */
-        for (int k = 0; k < 3; k++) {
-            size_t sb = 0;
-            T.cs_alias_bytes += coli_vk_tensor_alloc_bytes(s->fmt, s->I[k], s->O[k], s->gs, &sb) + sb;
+    } else {
+        if (T.cs_scan_skip && ce) {   /* the verdicts this content earned, read back off the tensors the build made */
+            int all = 1;
+            for (int k = 0; k < 3; k++) {
+                ColiVkTensorInfo ti;
+                if (coli_vk_tensor_info(t[k], &ti)) ce->wide[k] = (uint8_t)(ti.wide != 0);
+                else all = 0;   /* cannot know: the next build rescans */
+            }
+            ce->layer = layer; ce->eid = eid; ce->wide_ok = (uint8_t)all;
+        }
+        if (vkt_cs_dprof()) {   /* E: the actual bytes this alias built (weights + scales), from the geometry the tensors hold */
+            for (int k = 0; k < 3; k++) {
+                size_t sb = 0;
+                T.cs_alias_bytes += coli_vk_tensor_alloc_bytes(s->fmt, s->I[k], s->O[k], s->gs, &sb) + sb;
+            }
         }
     }
     coli_vk_slab_unref(r);   /* the built tensors hold their own; an empty hand returns the pages */
@@ -3148,8 +3202,13 @@ int vkt_issue_group(int layer, const float *x, int S, int K, const int *idx, con
         if (v->state == VS_RESIDENT && v->ex) { ex[i] = v->ex; res[i] = 1; }
         else if (src && src[i].slab) {
             double ta = vkt_cs_dprof() ? vkt_now_ms() : 0;
-            ex[i] = cs_alias_expert(&src[i]);
-            if (vkt_cs_dprof()) T.cs_alias_ms += vkt_now_ms() - ta;
+            int ahit = 0;
+            ex[i] = cs_alias_expert(layer, e, &src[i], &ahit);
+            if (vkt_cs_dprof()) {   /* the span and its outcome split: the cache's own wall, hit vs fresh */
+                double da = vkt_now_ms() - ta;
+                T.cs_alias_ms += da;
+                if (ahit) T.cs_alias_hit_ms += da; else T.cs_alias_miss_ms += da;
+            }
             if (ex[i] && !cs_ex_keep(ex[i])) {
                 coli_vk_xb_expert_free(ex[i]);   /* the kept list could not grow: not worth the batch's failure */
                 ex[i] = NULL;
@@ -4105,6 +4164,12 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
                 long mb = me && *me ? atol(me) : 4096;
                 if (mb < 0) mb = 0;
                 T.cs_cache_cap = (size_t)mb * 1048576u;
+                /* the hit fast path (off unless asked): a hit of the entry's recorded
+                 * content passes its f16 verdicts to the tensor build and skips the
+                 * scale scan -- provably the same bytes, the store's records fixed per
+                 * (layer, expert); any other hit rescans */
+                const char *se = getenv("COLI_VK_TIER_CS_ALIAS_SCAN_SKIP");
+                T.cs_scan_skip = se && *se && atoi(se) != 0 ? 1 : 0;
             }
         }
         /* tier adaptive (COLI_VK_TIER_ADAPTIVE): the fork-parity live guard, off unless
@@ -4377,11 +4442,13 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     if (T.cs_groups)   /* COLI_VK_TIER_EXPERTS: the finish-site group's own books (one group a layer-token) */
         fprintf(stderr, " | cs: %llu groups, %llu resident + %llu aliased entries on the device, %llu cpu-fallback (%llu alias refusals)",
                 T.cs_groups, T.cs_res, T.cs_alias, T.cs_fallback, T.cs_refuse);
-    if (T.cs_cache) {   /* CS-1c: the alias keepalive cache's standing (entries, pinned bytes, reuse) */
+    if (T.cs_cache) {   /* CS-1c: the alias keepalive cache's standing (entries, pinned bytes, reuse; forgotten = vkt_slab_forget's invalidations, the VA-reuse guard) */
         char hc[32];
-        fprintf(stderr, " | cs alias cache: %d entries, %zu bytes (%s), %llu hits, %llu misses, %llu evictions",
+        fprintf(stderr, " | cs alias cache: %d entries, %zu bytes (%s), %llu hits, %llu misses, %llu evictions, %llu forgotten",
                 T.cs_cache_n, T.cs_cache_bytes, human((double)T.cs_cache_bytes, hc, sizeof hc),
-                T.cs_cache_hits, T.cs_cache_misses, T.cs_cache_evicts);
+                T.cs_cache_hits, T.cs_cache_misses, T.cs_cache_evicts, T.cs_cache_forgets);
+        if (T.cs_scan_skip)   /* the hit fast path's own arm: its saves on the same line */
+            fprintf(stderr, ", %llu scans skipped", T.cs_scan_skips);
     }
     if (dprof && T.cs_groups) {   /* COLI_VK_CHAIN_DPROF: the group's window split. Reconciliation against the
                                    * decode dprof line (all CS decode steps): CPU window = settle + build + issue
@@ -4390,11 +4457,11 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
                                    * xb_expert are subsets of build (the lookup loop); release is a subset of
                                    * waited. resident bytes = resident entries * the tier's per-expert bytes. */
         ColiVkCsDiag cd; coli_vk_cs_diag(&cd);
-        fprintf(stderr, " | cs dprof: settle %.1f ms (%llu), build %.1f ms (%llu; alias %.1f, import %.1f (%llu), xb_expert %.1f), "
+        fprintf(stderr, " | cs dprof: settle %.1f ms (%llu), build %.1f ms (%llu; alias %.1f (hit %.1f / miss %.1f), import %.1f (%llu), xb_expert %.1f), "
                 "issue %.1f ms (%llu), fence %.1f ms, qread %.1f ms, device %.1f ms, release %.1f ms (%llu) | "
                 "slab import %llu create + %llu hit (create %.1f ms, hit %.1f ms), unref-zero %llu (%.1f ms), alias buffers %llu destroyed (%.1f ms) | "
                 "aliased %.1f MiB, resident %.1f MiB",
-                T.cs_settle_ms, T.cs_settle_n, T.cs_lookup_ms, T.cs_build_n, T.cs_alias_ms, T.cs_import_ms, T.cs_import_n, T.cs_xbex_ms,
+                T.cs_settle_ms, T.cs_settle_n, T.cs_lookup_ms, T.cs_build_n, T.cs_alias_ms, T.cs_alias_hit_ms, T.cs_alias_miss_ms, T.cs_import_ms, T.cs_import_n, T.cs_xbex_ms,
                 T.cs_issue_ms, T.cs_issue_n, T.cs_fence_ms, T.cs_qread_ms, T.cs_dev_ms, T.cs_release_ms, T.cs_release_n,
                 cd.slab_creates, cd.slab_hits, cd.slab_create_ms, cd.slab_hit_ms, cd.slab_zeros, cd.slab_zero_ms,
                 cd.alias_buf_destroys, cd.alias_buf_destroy_ms,

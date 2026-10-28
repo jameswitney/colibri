@@ -2572,6 +2572,20 @@ void coli_vk_slab_ref(ColiVkSlab *r) {   /* one more keepalive reference (the ti
     pthread_mutex_unlock(&g_slabs.mx);
 }
 size_t coli_vk_slab_bytes(const ColiVkSlab *r) { return r ? r->bytes : 0; }   /* the imported bytes a reference pins */
+/* The store's slot-free path names the pages that are going away (the tier's alias
+ * cache drops its holds first, vkt_slab_forget): every import still wrapping them is
+ * blinded to the dedup (base cleared), so a future import of the same address -- an
+ * allocator can return it for the same size, the same geometry -- builds a fresh
+ * import of the NEW pages instead of riding the stale record of the old ones. The
+ * record itself lives on until its last unref, as tensors still holding it may be
+ * reading it; only its identity in the dedup dies here. */
+void coli_vk_slab_forget(const void *slab) {
+    if (!slab) return;
+    pthread_mutex_lock(&g_slabs.mx);
+    for (ColiVkSlab *r = g_slabs.live; r; r = r->next)
+        if (r->ptr == slab) { r->ptr = NULL; r->base = NULL; }
+    pthread_mutex_unlock(&g_slabs.mx);
+}
 /* one record of the slab as a buffer bound into the imported memory at `off` bytes
  * into the caller's slab: the descriptor paths bind their buffers whole (offset 0),
  * so a record needs its own handle into the same pages, as a pool range has its own */
@@ -2601,6 +2615,19 @@ static int slab_buf(ColiVkSlab *r, size_t off, size_t bytes, VkBuffer *out) {
 }
 int coli_vk_tensor_alias(ColiVkSlab *r, size_t woff, size_t soff, int fmt, int I, int O, int gs,
                          ColiVkTensor **tensor) {
+    return coli_vk_tensor_alias_wide(r, woff, soff, fmt, I, O, gs, -1, tensor);
+}
+/* coli_vk_tensor_alias with the f16-range verdict supplied: wide < 0 the builder
+ * scans the slab's scale bytes itself (scales_wide's rule -- fmt 15: one ue8m0 byte
+ * a 32-group, O x ceil(I/gs) of them, the 786 KB-class pass a DeepSeek V4 expert's
+ * three tensors cost every build); 0/1 is a verdict the CALLER vouches for the exact
+ * bytes at [soff, soff+sbytes) -- the tier's alias cache records one per entry for
+ * the content it names, and skips the scan only when that same content is served
+ * again (same slab generation, same expert: the store's record bytes are fixed per
+ * (layer, expert)). A wrong verdict is silent wrong math, so the caller's bar is
+ * provable sameness, never plausibility. */
+int coli_vk_tensor_alias_wide(ColiVkSlab *r, size_t woff, size_t soff, int fmt, int I, int O, int gs,
+                              int wide, ColiVkTensor **tensor) {
     if (*tensor) return (*tensor)->fmt == fmt && (*tensor)->I == I && (*tensor)->O == O;
     /* the store's records: MXFP4 codes with their ue8m0 bytes (15) or f32 scales (7);
      * the other formats' scale geometry is a pool's, not a slab's -- refused, the
@@ -2627,12 +2654,15 @@ int coli_vk_tensor_alias(ColiVkSlab *r, size_t woff, size_t soff, int fmt, int I
      * product with the format's largest code passes 65504 keeps the alias off them
      * (scales_wide's rule, read off the slab itself -- a ue8m0 byte IS an exponent,
      * and one past 140 is 2^13.4) */
-    const uint8_t *sc = (const uint8_t *)r->ptr + soff;
-    if (fmt == 15) {
-        size_t nb = (size_t)O * (((size_t)I + gs - 1) / gs);
-        for (size_t i = 0; i < nb; i++)
-            if (sc[i] > 140) { t->wide = 1; break; }
-    } else t->wide = scales_wide(fmt, (const float *)sc, sbytes / 4);
+    if (wide >= 0) t->wide = (uint8_t)(wide != 0);   /* the caller's verdict for these exact bytes */
+    else {
+        const uint8_t *sc = (const uint8_t *)r->ptr + soff;
+        if (fmt == 15) {
+            size_t nb = (size_t)O * (((size_t)I + gs - 1) / gs);
+            for (size_t i = 0; i < nb; i++)
+                if (sc[i] > 140) { t->wide = 1; break; }
+        } else t->wide = scales_wide(fmt, (const float *)sc, sbytes / 4);
+    }
     pthread_mutex_lock(&g_slabs.mx);
     r->refs++;
     pthread_mutex_unlock(&g_slabs.mx);
