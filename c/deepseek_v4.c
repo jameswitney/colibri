@@ -8757,6 +8757,7 @@ typedef struct {
     uint64_t used;
     unsigned char *slab;
     int aligned_slab;
+    void *vk_reg;            /* decode-path=fork: the registry slab behind `slab` (NULL: malloc/posix_memalign) */
     int lru_previous;
     int lru_next;
     unsigned char in_lru;
@@ -9190,7 +9191,11 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
             return -1;
         }
         if (!slot->slab) {
-            slot->slab = malloc((size_t)state->record_bytes);
+            /* decode-path=fork (COLI_VK_V4_DECODE_PATH=fork): the registry's arena slab
+             * when armed -- mapped GPU-visible pages, one STORAGE VkBuffer, the store's
+             * own lifetime; any refusal is the ladder, this slot keeps the malloc path */
+            if (!vkt_slabreg_slot((size_t)state->record_bytes, (void **)&slot->slab, &slot->vk_reg))
+                slot->slab = malloc((size_t)state->record_bytes);
             if (!slot->slab) {
                 pthread_mutex_unlock(&state->mutex);
                 memset(view, 0, sizeof(*view));
@@ -9418,9 +9423,13 @@ static void destroy(ColiExpertStore *store) {
              * XT(): xtier.h sits below, and every slab import there is belongs to the
              * Vulkan tier (a CUDA tier's imports refuse -- its cache walks empty) */
             vkt_slab_forget(state->slots[i].slab);
+            /* a registry slot's pages are the arena's own (decode-path=fork): the slab's
+             * buffer handle goes back to the registry, never free()/compat_aligned_free */
+            if (state->slots[i].vk_reg)
+                vkt_slabreg_slot_free(state->slots[i].vk_reg, state->slots[i].slab);
             /* aligned_slab means posix_memalign, which on Windows is
              * _aligned_malloc and must not reach free(). */
-            if (state->slots[i].aligned_slab)
+            else if (state->slots[i].aligned_slab)
                 compat_aligned_free(state->slots[i].slab);
             else
                 free(state->slots[i].slab);
@@ -9563,6 +9572,11 @@ int coli_deepseek_v4_expert_store_open(
         state->slot_by_expert[i] = -1;
     state->stats.capacity_bytes = (uint64_t)state->layers *
                                   state->slots_per_layer * state->record_bytes;
+    /* decode-path=fork: the arm's one engagement line over the plan just sized (the
+     * registry's own boot line names its block size and cap at the first slab); the
+     * slot count and cache_bytes derive exactly as before, the arena only re-homes them */
+    vkt_forkdec_store_line(state->layers * state->slots_per_layer,
+                           (size_t)state->record_bytes + 8192u);
     store->ops = &operations;
     store->state = state;
     *output = store;
@@ -10460,11 +10474,15 @@ retry_lookup:
     }
     if (!slot->slab) {
         size_t capacity = (size_t)state->record_bytes + 8192u;
-        if (posix_memalign((void **)&slot->slab, 4096, capacity)) {
-            slot->slab = NULL;
-            pthread_mutex_unlock(&state->mutex);
-            memset(view, 0, sizeof(*view));
-            return -1;
+        /* decode-path=fork: the registry slab is 4096-aligned by construction (the
+         * direct window's rule holds); a refusal keeps this slot on posix_memalign */
+        if (!vkt_slabreg_slot(capacity, (void **)&slot->slab, &slot->vk_reg)) {
+            if (posix_memalign((void **)&slot->slab, 4096, capacity)) {
+                slot->slab = NULL;
+                pthread_mutex_unlock(&state->mutex);
+                memset(view, 0, sizeof(*view));
+                return -1;
+            }
         }
         slot->aligned_slab = 1;
         mark_slot_allocated(state, slot_partition(state, slot), slot);
@@ -20421,6 +20439,7 @@ typedef struct {
     unsigned references;
     uint64_t used;
     unsigned char *slab;
+    void *vk_reg;            /* decode-path=fork: the registry slab behind `slab` (NULL: malloc) */
 } V4ExpertSlot;
 
 typedef struct {
@@ -20620,7 +20639,10 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
             return -1;
         }
         if (!slot->slab) {
-            slot->slab = malloc((size_t)state->record_bytes);
+            /* decode-path=fork: the registry's arena slab when armed (see the base
+             * store's lookup); a refusal keeps this slot's malloc path */
+            if (!vkt_slabreg_slot((size_t)state->record_bytes, (void **)&slot->slab, &slot->vk_reg))
+                slot->slab = malloc((size_t)state->record_bytes);
             if (!slot->slab) {
                 pthread_mutex_unlock(&state->mutex);
                 memset(view, 0, sizeof(*view));
@@ -20846,7 +20868,12 @@ static void destroy(ColiExpertStore *store) {
              * store's slots never alias (view_slab serves the hot store only),
              * but the guard costs one empty walk */
             vkt_slab_forget(state->slots[i].slab);
-            free(state->slots[i].slab);   /* this store allocates slabs with
+            /* a registry slot (decode-path=fork) returns its buffer handle; the rest
+             * is this store's own malloc, exactly as the comment below says */
+            if (state->slots[i].vk_reg)
+                vkt_slabreg_slot_free(state->slots[i].vk_reg, state->slots[i].slab);
+            else
+                free(state->slots[i].slab);   /* this store allocates slabs with
                                            * malloc only; the aligned path and
                                            * its compat_aligned_free live in the
                                            * hot rows16 store above. */
@@ -20936,6 +20963,9 @@ int coli_deepseek_v4_expert_store_open(
     }
     state->stats.capacity_bytes = (uint64_t)state->layers *
                                   state->slots_per_layer * state->record_bytes;
+    /* decode-path=fork: the engagement line (this store's slab is the bare record) */
+    vkt_forkdec_store_line(state->layers * state->slots_per_layer,
+                           (size_t)state->record_bytes);
     store->ops = &operations;
     store->state = state;
     *output = store;

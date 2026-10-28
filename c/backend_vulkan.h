@@ -180,6 +180,31 @@ int  coli_vk_tensor_alias(ColiVkSlab *slab, size_t woff, size_t soff, int fmt, i
 int  coli_vk_tensor_alias_wide(ColiVkSlab *slab, size_t woff, size_t soff, int fmt, int I, int O, int gs,
                                int wide, ColiVkTensor **tensor);
 
+/* The persistent slab registry (COLI_VK_V4_DECODE_PATH=fork, the forked decode path):
+ * store slots carved out of a small number of large HOST_VISIBLE|HOST_COHERENT
+ * NON-device-local arena blocks (COLI_VK_V4_SLAB_BLOCK_MB, default 2048 MiB, clamped
+ * to the driver's maxMemoryAllocationSize and the heap's room), each slab ONE mapped
+ * STORAGE VkBuffer bound at its offset in its block, HOST_COHERENT-only (no coherent
+ * host-visible type: alloc refuses, the caller keeps its malloc path). The arena's
+ * bytes are capped (COLI_VK_V4_SLAB_ARENA_GB; else the heap's room) -- a driver can
+ * OVERCOMMIT its host heap (allocs succeed, then every submit fails: the gap3 arena
+ * probe, 10x2GiB over a 19.46 GiB heap on RADV), so the registry never asks past the
+ * room it can see. coli_vk_slabreg_alias is the fork's tensor lifetime over it
+ * (fork backend_vulkan.c:1818-1841): the tensor binds its slab's buffer WHOLE with
+ * the record's woff/soff carried on the tensor, pool NULL, slab NULL -- 3 callocs,
+ * 0 driver objects, freed by free(t) (the registry owns every object). The engine
+ * routes its expert-store slot slabs here only under the arm; every refusal is the
+ * ladder: that slot keeps the malloc/import path, never an error. */
+typedef struct ColiVkSlabReg ColiVkSlabReg;
+int  coli_vk_slabreg_alloc(size_t bytes, void **host_out, ColiVkSlabReg **reg_out);
+void coli_vk_slabreg_free(ColiVkSlabReg *reg);
+int  coli_vk_slabreg_alias(const ColiVkSlabReg *reg, const void *user, size_t woff, size_t soff,
+                           int fmt, int I, int O, int gs, int wide, ColiVkTensor **tensor);
+int  coli_vk_slabreg_lookup(const void *user, ColiVkSlabReg **reg_out, size_t *base_off);
+size_t coli_vk_slabreg_bytes(void);       /* the registry's live bytes (books) */
+int  coli_vk_slabreg_wanted(void);         /* COLI_VK_V4_DECODE_PATH=fork (env, once) */
+void coli_vk_slabreg_reset(void);          /* shutdown: buffers, mappings, blocks */
+
 /* SECOND DEVICE (COLI_VK_DEV2): a self-contained context on another Vulkan GPU that
  * hosts ONLY tier experts and runs ONLY the async expert-group path. devidx: -1 =
  * auto (best real GPU that is not device 0), >=0 = enumeration index (the same
