@@ -1536,6 +1536,10 @@ static int g_lookup=0; static SpecGate g_lookup_gate;
  * left the head's KV row at kv-1 unwritten: the head's window restarts after it (mtp_draft,
  * mtp_absorb) rather than attend a row that holds nothing of this text. */
 static int g_mtp_gap;
+static float g_mtp_pd[64]; static unsigned long long g_mtp_pdeclined;
+static int g_mtp_pstep=0; /* MTP_PSTEP=1: the verify's depth from each step's drafts' probabilities
+                           * under the head too (spec_gate_pick_p), not the averages only; opt-in,
+                           * not measured on a real checkpoint */
 static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward via n-gram lookup
                           * (0=off). LOSSLESS: verifica = output identico al greedy. Default OFF:
                           * misurato sul run reale (2026-07-03) acceptance ~5% -> ogni draft
@@ -8598,7 +8602,7 @@ static int ngram_draft(const int *ids, int len, int G, int *draft){
 static int mtp_argmax(const float *lo, int V){
     int b=0; float bv=lo[0]; for(int i=1;i<V;i++) if(lo[i]>bv){bv=lo[i];b=i;} return b;
 }
-static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
+static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft, float *pdraft){
     Cfg *c=&m->c; int D=c->hidden, li=c->n_layers;
     int p=kv-1; if(p<0||G<1) return 0;
     if(g_mtp_gap){ m->kv_start[li]=p; g_mtp_gap=0; }   /* rows before p hold a gap */
@@ -8630,6 +8634,11 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
         int t2=mtp_argmax(logit, c->vocab);
         if(dbg) fprintf(stderr,"[mtp2] pos=%d in_tok=%d ||eh||=%.1f ||post||=%.1f pre_blk=%d post_blk=%d\n",
                         pos, tok, sqrt(n_eh), sqrt(n_post), t_pre, t2);
+        if(pdraft){   /* the draft's probability under the head: scores 20 below the best add under 2e-9 */
+            float mx=logit[t2]; double z=0;
+            for(int i=0;i<c->vocab;i++){ float d=logit[i]-mx; if(d>-20.f) z+=exp((double)d); }
+            pdraft[n]=z>0?(float)(1.0/z):0.f;
+        }
         draft[n++]=t2; tok=t2; memcpy(h, hx, D*sizeof(float));
     }
     m->ld_ctx=0;
@@ -8910,7 +8919,16 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
                  * measured times and acceptance (spec_draft.h): on a model read from the disk a
                  * verify's second row brings its own experts, and drafting can cost more than it returns */
                 int want=spec_gate_pick(&g_lookup_gate,SPEC_SRC_MTP,g_draft,NULL);
-                if(want>0){ double td0=now_s(); g=mtp_draft(m,next,kv,want,draft); tdraft=now_s()-td0;
+                if(want>0){ double td0=now_s(); float pd[64];
+                            g=mtp_draft(m,next,kv,want,draft,g_mtp_pstep?pd:NULL); tdraft=now_s()-td0;
+                            /* the depth these drafts are worth, from their probabilities (DeepSeek's
+                             * confidence-scheduled verification): a doubtful draft goes unverified and its
+                             * verify row's experts unread. Its head row at kv-1 holds the right pair. */
+                            if(g>0 && g_mtp_pstep){
+                                gsrc=2; g=spec_gate_pick_p(&g_lookup_gate,SPEC_SRC_MTP,g,pd,NULL);
+                                memcpy(g_mtp_pd,pd,sizeof pd);
+                                if(!g){ g_mtp_pdeclined++; tdraft=0; }   /* T(1) is a plain step's */
+                            }
                             m->mtp_prop+=g; if(g)gsrc=2; }
             }
             else if(g_lookup){
@@ -8948,7 +8966,8 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         if(gsrc==1) g_grd.acc+=(uint64_t)k;
         else if(gsrc==4) spec_gate_result(&g_lookup_gate,SPEC_SRC_LOOKUP,k<g&&emitted<n_new&&!done?k+1:k,k);
         else if(gsrc==2 && m->has_mtp){ m->mtp_acc+=k;
-            spec_gate_result(&g_lookup_gate,SPEC_SRC_MTP,k<g&&emitted<n_new&&!done?k+1:k,k); }
+            if(g_mtp_pstep) spec_gate_result_p(&g_lookup_gate,SPEC_SRC_MTP,k<g&&emitted<n_new&&!done?k+1:k,k,g_mtp_pd);
+            else spec_gate_result(&g_lookup_gate,SPEC_SRC_MTP,k<g&&emitted<n_new&&!done?k+1:k,k); }
         else if(gsrc==3) g_corp_acc+=(uint64_t)k;
         double tab0=mt&&k>=1?now_s():0;
         if(m->has_mtp && k>=1) mtp_absorb(m, all+kv+1, m->h_all, k, kv);   /* KV MTP in sync coi verificati */
@@ -8963,8 +8982,9 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
     g_spec_live = 0;                     /* prefill/decode successivi: gate normali / next prefill: normal gates */
     if(m->has_mtp && g_draft>0 && !g_lookup_gate.off && !logit_out){
         char gd[384]; spec_gate_describe(&g_lookup_gate,SPEC_SRC_MTP,gd,sizeof gd);
-        fprintf(stderr,"[MTP] gate: %llu verifies, %llu plain steps chosen, %llu probes, acceptance %.0f%% (%llu/%llu) | %s\n",
+        fprintf(stderr,"[MTP] gate: %llu verifies, %llu plain steps chosen (%llu after the drafts' probabilities), %llu probes, acceptance %.0f%% (%llu/%llu) | %s\n",
                 (unsigned long long)g_lookup_gate.verifies[SPEC_SRC_MTP],(unsigned long long)g_lookup_gate.declined[SPEC_SRC_MTP],
+                (unsigned long long)g_mtp_pdeclined,
                 (unsigned long long)g_lookup_gate.probes[SPEC_SRC_MTP],
                 m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0,(unsigned long long)m->mtp_acc,(unsigned long long)m->mtp_prop,gd);
     }
@@ -11491,7 +11511,28 @@ static void run_serve(Model *m, const char *snap){
         const char *tk = getenv("THINK")&&atoi(getenv("THINK"))? "<think>" : "<think></think>";
         if(raw_mode){
             int *tmp=malloc(maxctx*sizeof(int)); if(!tmp){fprintf(stderr,"OOM raw tokens\n");exit(1);}
-            prompt_tokens=tok_encode(&T,input,input_n,tmp,maxctx-8-g_draft);
+            /* #2097: encode with one token of headroom (maxctx-1, buffer is
+             * maxctx) purely to DETECT overflow -- tok_encode stops dead at its
+             * cap with no signal, so the old cap (maxctx-8-g_draft) silently
+             * truncated an over-long prompt and the engine answered from the
+             * cut text. A full buffer means the prompt does not fit: refuse
+             * like mux_submit instead of generating from a truncated prompt. */
+            prompt_tokens=tok_encode(&T,input,input_n,tmp,maxctx-1);
+            if(prompt_tokens>maxctx-2){
+                /* The legacy protocol has no ERROR frame: this is an empty
+                 * answer plus a STAT line carrying CONTEXT_EXCEEDED as a 7th
+                 * token and the cause (PROMPT_TOO_LONG here) as an 8th
+                 * ('coli' matches the first fields and ignores the rest),
+                 * plus a stderr line the operator can act on. */
+                free(tmp); free(raw); g_temp=base_temp; g_nuc=base_nuc;
+                fprintf(stderr,"[API] prompt does not fit: >=%d tokens, context is %d "
+                               "(CTX=%d). Raise CTX or shorten the prompt.\n",
+                        prompt_tokens,maxctx-2,maxctx);
+                printf("\x01\x01" "END" "\x01\x01\n");
+                printf("STAT 0 0.00 0.0 %.2f %d 0 CONTEXT_EXCEEDED PROMPT_TOO_LONG\n",
+                       rss_gb(),prompt_tokens);
+                fflush(stdout); continue;
+            }
             int old_len=len, prefix=0;
             while(prefix<old_len && prefix<prompt_tokens && hist[prefix]==tmp[prefix]) prefix++;
             if(prefix<old_len){
@@ -11505,16 +11546,54 @@ static void run_serve(Model *m, const char *snap){
                 active,len,prompt_tokens,k);
             free(tmp);
         } else {
-            if(templ){ if(first) bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop>");
-                       bl+=snprintf(buf+bl,(1<<16)-bl,"<|user|>%s<|assistant|>%s",input,tk); }
-            else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
-            k=tok_encode(&T,buf,bl,hist+len,maxctx-len); prompt_tokens=k;
-            if(len+k+8+g_draft>=maxctx){ len=0; first=1; kv_disk_reset(m);
-                bl=0; if(templ){ bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop><|user|>%s<|assistant|>%s",input,tk); }
-                else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
-                k=tok_encode(&T,buf,bl,hist,maxctx); if(k>maxctx-8-g_draft) k=maxctx-8-g_draft;
-                prompt_tokens=k;
+            /* Render the turn into the 64KB buf first, watching for a clipped
+             * render (snprintf returns what it *would* have written), then
+             * encode with one token of headroom to DETECT overflow. The old
+             * code reset the conversation (len=0) and clamped k to
+             * maxctx-8-g_draft, silently dropping history and the tail of the
+             * prompt; refuse loudly in every case instead. */
+            int clipped=0, w;
+            if(templ){
+                if(first){ w=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop>");
+                           if(w<0||w>=(1<<16)-bl) clipped=1; else bl+=w; }
+                w=snprintf(buf+bl,(1<<16)-bl,"<|user|>%s<|assistant|>%s",input,tk);
+                if(w<0||w>=(1<<16)-bl) clipped=1; else bl+=w;
+            } else {
+                w=snprintf(buf+bl,(1<<16)-bl,"%s",input);
+                if(w<0||w>=(1<<16)-bl) clipped=1; else bl+=w;
             }
+            int *tmp=malloc(maxctx*sizeof(int)); if(!tmp){fprintf(stderr,"OOM turn tokens\n");exit(1);}
+            k=tok_encode(&T,buf,bl,tmp,maxctx-1); prompt_tokens=k;
+            if(clipped || k>maxctx-2 || len+k+8+g_draft>=maxctx){
+                /* Same refusal contract as the API arm above, with the cause
+                 * as the 8th STAT token so 'coli chat' can print the right
+                 * hint: HISTORY_FULL wants :reset, PROMPT_TOO_LONG wants a
+                 * shorter prompt or a bigger CTX, RENDER_CLIPPED wants the
+                 * prompt pasted in smaller chunks. */
+                free(tmp); g_temp=base_temp; g_nuc=base_nuc;
+                const char *cause;
+                if(clipped){
+                    cause="RENDER_CLIPPED";
+                    fprintf(stderr,"[chat] prompt text exceeded the 64KB render buffer and was "
+                                   "clipped; refusing rather than answering from clipped text. "
+                                   "Paste shorter chunks.\n");
+                } else if(k>maxctx-2){
+                    cause="PROMPT_TOO_LONG";
+                    fprintf(stderr,"[chat] turn does not fit: >=%d tokens, context is %d "
+                                   "(CTX=%d). Raise CTX or shorten the prompt.\n",
+                            k,maxctx-2,maxctx);
+                } else {
+                    cause="HISTORY_FULL";
+                    fprintf(stderr,"[chat] conversation history no longer fits the context "
+                                   "(CTX=%d); clear it (\\x02RESET) to continue.\n",maxctx);
+                }
+                printf("\n\x01\x01" "END" "\x01\x01\n");
+                printf("STAT 0 0.00 0.0 %.2f %d 0 CONTEXT_EXCEEDED %s\n",
+                       rss_gb(),prompt_tokens,cause);
+                fflush(stdout); continue;
+            }
+            if(k>0) memcpy(hist+len,tmp,k*sizeof(int));
+            free(tmp);
         }
         if(prompt_tokens<1){ free(raw); g_temp=base_temp; g_nuc=base_nuc;
             printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f 0 0\n", rss_gb()); fflush(stdout); continue; }
@@ -13614,6 +13693,7 @@ int main(int argc, char **argv){
     g_mlock  = getenv("MLOCK")?atoi(getenv("MLOCK")):-1;   /* -1 auto (ON macOS), 0 off, 1 force / auto (ON macOS), 0 off, 1 force */
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;
+    g_mtp_pstep = getenv("MTP_PSTEP") && getenv("MTP_PSTEP")[0]=='1';
     g_lookup = !(getenv("COLI_LOOKUP") && getenv("COLI_LOOKUP")[0]=='0');   /* on by default, gated */
     spec_gate_init(&g_lookup_gate, getenv("COLI_SPEC_GATE") && getenv("COLI_SPEC_GATE")[0]=='0');
     g_no_fused_pair = getenv("COLI_NO_FUSED_PAIR")?atoi(getenv("COLI_NO_FUSED_PAIR")):0;   /* -1 = auto: 3 se MTP, 0 senza */

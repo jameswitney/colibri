@@ -499,6 +499,12 @@ int  vkt_score(int layer, uint64_t *score);
  * (never above the budget itself); without one, what is available less the engine's
  * cache growth (hold) and 4 GiB. Pure arithmetic, for tests; never above avail. */
 size_t vkt_host_room(size_t avail, size_t budget, size_t spare, int planned, size_t hold);
+/* Device memory back to the engine (a dense chain's KV mirror growing with the context): at
+ * least `bytes` of the tier's pool on the primary device emptied and released, the coldest
+ * blocks first, their residents back to their host pool copies (the CPU computes them) or
+ * out of the tier; the tier then holds that much less. Between steps, on the engine's
+ * thread. The bytes released, 0 when none could be. */
+size_t vkt_give_back(size_t bytes);
 #else
 static inline int vkt_host_pool_on(void){return 0;}
 static inline size_t vkt_stage_room(void){return 0;}
@@ -506,9 +512,9 @@ static inline int vkt_dev_host(int l,uint8_t *h){(void)l;(void)h;return -1;}
 static inline int vkt_score(int l,uint64_t *s){(void)l;(void)s;return -1;}
 static inline size_t vkt_host_room(size_t avail, size_t budget, size_t spare, int planned, size_t hold){
     (void)avail;(void)budget;(void)spare;(void)planned;(void)hold;return 0;}
+static inline size_t vkt_give_back(size_t b){(void)b;return 0;}
 
 typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; const float *sg, *su, *sd; int gsgu, gsd; } VktHostExpert;   /* rgu, rd: bytes a row; sg/su/sd: f32 scales, fmt 15's ue8m0 bytes */
-
 static inline int vkt_dev_table_hybrid(int l,uint32_t *e,VktHostExpert *h){(void)l;(void)e;(void)h;return -1;}
 static inline int vkt_dev_entry(int l,int e,uint32_t *t,uint32_t *th,VktHostExpert *h,uint8_t *o){(void)l;(void)e;(void)t;(void)th;(void)h;(void)o;return -1;}
 static inline int vkt_host_pairs(const VktHostExpert *const *h,const float *const *x,int n,int D,int I,float l,int t,float *g,float *u,float *o){(void)h;(void)x;(void)n;(void)D;(void)I;(void)l;(void)t;(void)g;(void)u;(void)o;return 0;}

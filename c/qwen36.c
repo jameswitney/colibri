@@ -83,6 +83,7 @@ static int qwen36_max_ctx(void) {
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
 #include "vk_tier.h"       /* optional Vulkan routed-expert tier (COLI_VULKAN=1; stubs without VK=1) */
 #include "route_trace.h"   /* the tier's expert history (.coli_usage), kept only while the tier is on */
+#include "draft_vocab.h"   /* the tokens the MTP head scores for a draft (Q36_MTP_VOCAB) */
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
 #include "idot.h"          /* integer dot kernels for the dense trunk (COLI_DENSE_IDOT, COLI_DENSE_BITS) */
 #include "qwen38_vision.h" /* the ViT: the same tower in Qwen3.5/3.6/3.8 (#1757) */
@@ -2795,6 +2796,8 @@ static const gguf_tensor *gg_tensor(const char *hf) {
     char nm[256]; const char *g = gg_name(hf, nm, sizeof nm);
     /* tied embeddings (the small dense models): no output.weight, the head reads token_embd */
     if (g && !strcmp(g, "output.weight") && !gguf_find(&g_gg, g)) g = "token_embd.weight";
+    /* Ollama's converter names the DeltaNet's dt bias blk.N.ssm_dt (the same values) */
+    if (g && !gguf_find(&g_gg, g)) { size_t L = strlen(g); if (L > 12 && !strcmp(g + L - 12, ".ssm_dt.bias")) { nm[L - 5] = 0; g = nm; } }
     return g ? gguf_mark(&g_gg, g) : NULL;
 }
 static int64_t gg_numel(const gguf_tensor *t) { return t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3]; }
@@ -3350,6 +3353,11 @@ static void gguf_load_cfg(Cfg *c) {
     c->hidden   = (int)gguf_get_int(g, GK("embedding_length"), 0);
     c->q_heads  = (int)gguf_get_int(g, GK("attention.head_count"), 0);
     c->kv_heads = (int)gguf_get_int(g, GK("attention.head_count_kv"), 0);
+    {   /* Ollama's converter writes it per layer (0 on the DeltaNet layers): the attention layers' value */
+        const gguf_kv *kvh = gguf_get(g, GK("attention.head_count_kv"));
+        if (kvh && kvh->type == GGUF_T_ARRAY && kvh->arr && (kvh->atype == GGUF_T_U32 || kvh->atype == GGUF_T_I32))
+            for (uint64_t j = 0; j < kvh->n; j++) { int v = (int)((const int32_t *)kvh->arr)[j]; if (v > c->kv_heads) c->kv_heads = v; }
+    }
     c->head_dim = (int)gguf_get_int(g, GK("attention.key_length"), c->q_heads > 0 ? c->hidden / c->q_heads : 0);
     c->k_head_dim = c->head_dim;
     c->v_head_dim = (int)gguf_get_int(g, GK("attention.value_length"), c->head_dim);
@@ -3526,6 +3534,18 @@ static void gguf_expert_held(Model *m, GqExp *x) {
     if (tot > m->gqe_max) m->gqe_max = tot;
 }
 static int gguf_expert_ilv(const GqExp *x) { return x->hg != x->tg || x->hu != x->tu || x->hd != x->td; }
+/* The CUDA expert tier takes a GGUF's experts as the file has them: the RAM slots then hold the
+ * file's rows too, not the rows interleaved by 16. The tier reads them in place (an interleaved
+ * slot unpacked each into a second buffer of its own: Flint UD-Q3_K_XL, an 18.5 GB file, took
+ * 30.6 GB of RSS), the host pool copies a prompt chunk's experts from them to the device, and
+ * the CPU computes its experts eight rows at a time (gq_rows_f8). Before any slot is filled. */
+static void gguf_hold_file_rows(Model *m) {
+    for (int i = 0; i < m->c.n_layers; i++) {
+        GqExp *x = &m->gqx[i];
+        x->hg = x->tg; x->hu = x->tu; x->hd = x->td;
+        x->hb_g = x->eb_g; x->hb_u = x->eb_u; x->hb_d = x->eb_d;
+    }
+}
 
 /* GGUF mode: locate every layer's fused expert tensors and size the slot. */
 static void gguf_map_experts(Model *m) {
@@ -3614,6 +3634,8 @@ static int gguf_report_unused(const Cfg *c) {
         if (L > 12 && !strcmp(t->name + L - 12, ".input_scale")) continue;
         int layer = -1;
         if (sscanf(t->name, "blk.%d.", &layer) == 1 && layer >= c->n_layers) continue;   /* MTP / nextn */
+        /* Ollama's files carry the MTP head (mtp.*) and the vision tower and projector (v.*, mm.*) in the model's file */
+        if (!strncmp(t->name, "mtp.", 4) || !strncmp(t->name, "v.", 2) || !strncmp(t->name, "mm.", 3)) continue;
         n++;
         char pat[96]; const char *d = t->name; int o = 0;   /* blk.N. -> blk.*. for a short summary */
         while (*d && o < 90) { if (d[0] == '.' && d[1] >= '0' && d[1] <= '9') { pat[o++] = '.'; pat[o++] = '*'; d++; while (*d >= '0' && *d <= '9') d++; } else pat[o++] = *d++; }
@@ -4258,8 +4280,8 @@ static void tier_rebuild_evicted(Model *m) {
     if (!qt_ready()) return;
     int ls[512], es[512];
     int n = qt_evicted_take(ls, es, 512);
-    if (n <= 0) return;
-    #pragma omp parallel for schedule(dynamic, 4)
+    if (n <= 0 || xf_mode(m)) return;   /* planar int4 keeps its RAM copy in every slot */
+    #pragma omp parallel for schedule(dynamic, 1)   /* a promotion's few victims a token: every thread one */
     for (int i = 0; i < n; i++) {
         Slot *e; expert_get(m, ls[i], es[i], &e);
         slot_ensure_int8(m, e);
@@ -5158,21 +5180,23 @@ static void moe_vk_run(Model *m, Layer *l, int layer, const float *x, int S, flo
 /* Decode (one token, cache can hold all K at once): every routed expert's
  * gate and up rows in ONE parallel region, then every down row in another,
  * instead of two regions per expert. Returns 0, or -1 to take the general path. */
-/* u rows of W from its first (a group of 16 when t is a GQ_*_R16 form) against the
- * one-row activation a */
+/* u rows of W from its first (a group of 16 when t is a GQ_*_R16 form, eight file rows
+ * through gq_rows_f8) against the one-row activation a */
 static inline void gq_rows_u(float *y, int u, const gq_act *a, const uint8_t *W, int t, int I) {
 #ifdef GQ_R16_ON
     if (gq_r16_base(t) >= 0) { gq_r16_rows(t, y, 16, W, a, I); return; }
 #endif
     const int64_t rb = gq_row_bytes(t, I);
+    if (u == 8 && gq_f8_ok(t, I)) { gq_rows_f8(y, 8, a, W, rb, t, I, 8); return; }
     for (int j = 0; j < u; j++) gq_row_all(y + j, 1, a, W + (int64_t)j * rb, t, I);
 }
 static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const int *idx, const float *val) {
     Cfg *c = &m->c; const int D = q36_eh(c), K = c->topk, I = c->inter;
     const GqExp *gx = &m->gqx[layer];
     if (m->cache[layer].cap < K || K > 64 || !gq_int_ok(gx->hg, D) || !gq_int_ok(gx->hu, D) || !gq_int_ok(gx->hd, I)) return -1;
-    /* rows interleaved by 16 (q36_gq_held) go a group at a time, and then every matrix's rows by 16 */
-    const int u = gguf_expert_ilv(gx) ? 16 : 1;
+    /* rows interleaved by 16 (q36_gq_held) go a group at a time, and then every matrix's rows by 16;
+     * the file's rows by eight where all three types have gq_rows_f8 */
+    const int u = gguf_expert_ilv(gx) ? 16 : I % 8 == 0 && D % 8 == 0 && gq_f8_ok(gx->hg, D) && gq_f8_ok(gx->hu, D) && gq_f8_ok(gx->hd, I) ? 8 : 1;
     if (u == 16 && (I % 16 || D % 16)) return -1;
     Slot *sl[64]; int ids[64]; float w[64]; int n = 0;
     for (int k = 0; k < K; k++) if (idx[k] >= 0) { ids[n] = idx[k]; w[n] = val[k]; n++; }
@@ -5949,18 +5973,25 @@ static int trunk_place_dense(Model *m, double *vram_bytes, int kinds[3]){
  * one DeltaNet input projection (the most numerous placed matrix) is timed
  * both ways on the device that would host it, ten GEMVs each, best of three
  * rounds after a warm-up, and the trunk goes to VRAM only if the GPU wins.
+ * The CPU's ten GEMVs read ten layers' projections, not one ten times: one
+ * 16 MiB projection (the 35B's) stays in a big L3 after the first GEMV, while
+ * decode reads each projection once a step, from RAM. Beside an RTX PRO 6000
+ * an EPYC 9B45 (three 32 MiB L3s) timed the one matrix at 0.050-0.051 ms
+ * against the card's 0.045-0.046; under nsys the two tied and the trunk and
+ * the experts went to the CPU: decode 21.5 tok/s, 113 on the card.
  * Only the automatic placement is questioned: a hand-written COLI_PLACE
  * stands. COLI_TRUNK_PROBE=0 skips the probe and trusts the placer. The
- * probe's copy stays resident (one projection, ~25 MB on the 35B). */
+ * probe's copy stays resident (one projection, 16 MiB on the 35B). */
 static int trunk_probe_gpu_wins(Model *m){
     const char *e = getenv("COLI_TRUNK_PROBE");
     if (e && *e == '0') return 1;
     if (!qt_place_is_auto()) return 1;
     Cfg *c = &m->c;
-    QW *w = NULL; int dev = QT_PLACE_CPU;
-    for (int i = 0; i < c->n_layers && !w; i++) {
-        if (c->is_attn[i]) continue;
-        if (m->L[i].dn_qkv.q) { w = &m->L[i].dn_qkv; dev = qt_place_of("dnproj", i); }
+    QW *w = NULL, *cw[10]; int dev = QT_PLACE_CPU, nc = 0;
+    for (int i = 0; i < c->n_layers && nc < 10; i++) {
+        if (c->is_attn[i] || !m->L[i].dn_qkv.q) continue;
+        if (!w) { w = &m->L[i].dn_qkv; dev = qt_place_of("dnproj", i); }
+        if (m->L[i].dn_qkv.I == w->I && m->L[i].dn_qkv.O == w->O) cw[nc++] = &m->L[i].dn_qkv;
     }
     if (!w) return 1;                                /* dense-i8 off: nothing will be placed */
     if (dev == QT_PLACE_CPU) dev = qt_place_of("lmhead", 0);
@@ -5977,9 +6008,10 @@ static int trunk_probe_gpu_wins(Model *m){
         double t0 = now_s();
         for (int k = 0; k < 10; k++) if (!qt_dense_matmul(h, y, x, I, O)) { free(x); free(y); return 1; }
         double tg = (now_s() - t0) / 10;
-        for (int k = 0; k < 3; k++) matmul_q(y, x, w->q, w->sc, I, O);
+        /* with ten, the warm-up takes the last three, so the timed ten do not start in the cache it filled */
+        for (int k = 0; k < 3; k++) matmul_q(y, x, cw[(7 + k) % nc]->q, cw[(7 + k) % nc]->sc, I, O);
         t0 = now_s();
-        for (int k = 0; k < 10; k++) matmul_q(y, x, w->q, w->sc, I, O);
+        for (int k = 0; k < 10; k++) matmul_q(y, x, cw[k % nc]->q, cw[k % nc]->sc, I, O);
         double tc = (now_s() - t0) / 10;
         if (tg < gpu) gpu = tg;
         if (tc < cpu) cpu = tc;
@@ -6123,6 +6155,33 @@ static void q36_mtp_lm_head(Model *m, const float *row, float *logits) {
 #endif
     if (!qt_lmhead_matmul(logits, row, c->hidden, c->vocab)) matmul_d(logits, row, &m->lm_head, 1, c->hidden, c->vocab);
 }
+/* The scores of the lm_head rows ids[0..n) on one normed row, on the host: the MTP head's draft
+ * list (Q36_MTP_VOCAB). Without host rows, the whole vocabulary and then the listed ids. */
+static void q36_mtp_lm_rows(Model *m, const float *row, const int *ids, int n, float *scores) {
+    Cfg *c = &m->c; const QW *w = &m->lm_head; int D = c->hidden;
+    if (w->q && w->sc && dense_idot_on()) {
+        int8_t *xq = malloc((size_t)D);
+        if (!xq) { fprintf(stderr, "OOM MTP activation\n"); exit(1); }
+        float sx = dense_act_i8(row, D, xq, NULL);
+#ifdef IDOT_R16
+        if (w->q8r16) matmul_q_idot_rows_r16(scores, xq, sx, w->q, w->sc, ids, n, D);
+        else
+#endif
+        matmul_q_idot_rows(scores, xq, sx, w->q, w->sc, ids, n, D);
+        free(xq);
+    } else if (w->q && w->sc) {
+        for (int j = 0; j < n; j++)
+            matmul_q(scores + j, row, w->q + (int64_t)ids[j] * D, w->sc + ids[j], D, 1);
+    } else if (w->w) {
+        for (int j = 0; j < n; j++)
+            scores[j] = dot_f32_lanes(row, w->w + (int64_t)ids[j] * D, D);
+    } else {
+        float *full = falloc(c->vocab);
+        q36_mtp_lm_head(m, row, full);
+        for (int j = 0; j < n; j++) scores[j] = full[ids[j]];
+        free(full);
+    }
+}
 
 static void q36_embed_row(Model *m, int id, int pos, float *row) {
     int D = m->c.hidden;
@@ -6144,6 +6203,16 @@ static void q36_embed_row(Model *m, int id, int pos, float *row) {
 
 #ifdef COLI_CUDA
 #include "qwen36_cuda_chain.h"  /* COLI_CUDA_CHAIN: every layer's dense chain on the CUDA device */
+/* The CUDA chain's prompt staging (q36cc_gguf_stage_bytes), out of the tier's expert budget when
+ * the card holds fewer than every routed expert of a GGUF (qt_reserve_short): taken from the
+ * mirrors' room instead, a 16K prompt on Flint (RTX PRO 4000) found no memory for the routed
+ * experts' buffers and took the host's step from then on. COLI_CUDA_HOST_POOL=0: none. */
+static void q36_gguf_stage_reserve(Model *m) {
+    const char *e = getenv("COLI_CUDA_HOST_POOL");
+    size_t st = g_gguf && !(e && *e == '0') ? q36cc_gguf_stage_bytes(m) : 0, routed = 0;
+    for (int i = 0; i < m->c.n_layers; i++) routed += !q36_dense_l(&m->c, i);
+    if (st) qt_reserve_short(st, routed * (size_t)m->c.n_experts);
+}
 #endif
 
 /* The CUDA tier with every routed expert on the device, run by the CUDA chain: what a step
@@ -6878,6 +6947,8 @@ typedef struct {
     int mtp_force, mtp_force_row;
     int mtp, ahead_src;          /* Q36_MTP: the head drafts too; the source of the verify ahead */
     int mtp_depth;               /* Q36_MTP_DRAFTS: drafts per verify, 1..7 (1 unset); 0 ("auto") = the gate's pick up to 7 */
+    int mtp_pstep;               /* Q36_MTP_PSTEP: the verify's depth from the drafts' own probabilities */
+    float ahead_p[Q36_SPEC_ROWS];/* those probabilities, for the gate once the verify is judged */
     uint64_t mtp_drafts, mtp_accepted;
     int force, force_row;        /* COLI_LOOKUP_FORCE (tests): the oracle's tokens as the proposal */
     int *hist, hist_n, hist_cap; /* the tokens fed so far and the one about to be: what lookup searches */
@@ -6935,12 +7006,17 @@ static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
     e = getenv("Q36_MTP_DRAFTS");
     sp->mtp_depth = !e || !*e ? 1 : !strcmp(e, "auto") ? 0 : atoi(e);
     if (sp->mtp_depth < 0 || sp->mtp_depth > Q36_SPEC_ROWS - 1) { fprintf(stderr, "Q36_MTP_DRAFTS must be 0 (auto) or 1..%d\n", Q36_SPEC_ROWS - 1); exit(1); }
+    /* the depth a verify carries, from each step's drafts' probabilities (spec_gate_pick_p),
+     * within a fixed depth above; Q36_MTP_PSTEP=0 keeps it whatever the drafts look like */
+    e = getenv("Q36_MTP_PSTEP");
+    sp->mtp_pstep = !(e && *e == '0');
     if (sp->lookup && prompt && np > 0) {
         sp->hist_cap = np + 256;
         sp->hist = (int *)malloc((size_t)sp->hist_cap * sizeof(int));
         if (sp->hist) { memcpy(sp->hist, prompt, (size_t)np * sizeof(int)); sp->hist_n = np; }
         else { sp->lookup = 0; sp->hist_cap = 0; }
     }
+    if (sp->mtp) q36_mtp_vocab_begin(prompt, np);
 }
 
 static void q36_spec_free(Q36Spec *sp) { free(sp->hist); sp->hist = NULL; sp->hist_n = sp->hist_cap = 0; }
@@ -6984,7 +7060,9 @@ static void q36_spec_rollback(Model *m, int len, int keep) {
 
 static void q36_spec_settle(Model *m, Q36Spec *sp, int keep, int rejected) {
     if (keep < sp->ahead_n) q36_spec_rollback(m, sp->ahead_pos + keep, keep);
-    spec_gate_result(&sp->gate, sp->ahead_src, keep - 1 + (rejected ? 1 : 0), keep - 1);
+    if (sp->ahead_src == SPEC_SRC_MTP && sp->mtp_pstep)
+        spec_gate_result_p(&sp->gate, sp->ahead_src, keep - 1 + (rejected ? 1 : 0), keep - 1, sp->ahead_p);
+    else spec_gate_result(&sp->gate, sp->ahead_src, keep - 1 + (rejected ? 1 : 0), keep - 1);
     free(sp->ahead_logit); sp->ahead_logit = NULL; sp->ahead_n = sp->ahead_i = 0;
 }
 
@@ -7011,11 +7089,19 @@ static void q36_spec_hist_push(Q36Spec *sp, int tok, int pos) {
 }
 
 /* How many head drafts the next verify carries: Q36_MTP_DRAFTS, or the gate's pick up to
- * 7, within the room the caller leaves. */
+ * 7, within the room the caller leaves. A fixed depth of 2 or more that the drafts'
+ * probabilities trim takes a plain step every SPEC_REFRESH forwards: the trim prices
+ * rows with T(1) and rho, and nothing else measures T(1) there. */
 static int q36_mtp_depth(Q36Spec *sp, int room, double *value) {
     int maxm = room < Q36_SPEC_ROWS - 1 ? room : Q36_SPEC_ROWS - 1;
     if (maxm <= 0) return 0;
     if (sp->mtp_depth) {
+        if (sp->mtp_depth > 1 && sp->mtp_pstep && !sp->gate.off && !sp->mtp_force &&
+            sp->gate.since_plain >= SPEC_REFRESH) {
+            sp->gate.declined[SPEC_SRC_MTP]++;
+            if (value) *value = 1.0;
+            return 0;
+        }
         int km = sp->mtp_depth < maxm ? sp->mtp_depth : maxm;
         if (value) *value = spec_gate_value(&sp->gate, SPEC_SRC_MTP, km, NULL);
         return km;
@@ -7030,6 +7116,7 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
     Cfg *c = &m->c; int V = c->vocab;
     sp->tokens++;
     q36_spec_hist_push(sp, tok, pos);
+    if (sp->mtp) q36_mtp_vocab_step(tok);
     if (sp->ahead_n) {
         int i = sp->ahead_i;
         if (tok == sp->ids[i] && pos == sp->ahead_pos + i &&
@@ -7068,14 +7155,29 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
             float *hd = falloc(c->hidden);
             t_verify = now_s();
             d[0] = q36_mtp_draft(m, tok, pos, hd);
+            sp->ahead_p[0] = g_q36_mtp.last_p;
             double t_first = now_s();
             static float pmin = -1.f;
             if (pmin < 0) { const char *pe = getenv("Q36_MTP_PMIN"); pmin = pe && *pe ? (float)atof(pe) : 0.f; }
             for (int j = 1; j < k; j++) {
-                if (g_q36_mtp.last_p < pmin) { k = j; break; }   /* the head is unsure: no deeper draft */
+                /* no deeper draft when the head is below Q36_MTP_PMIN, or when the drafts
+                 * so far leave no next draft that could pass */
+                if (g_q36_mtp.last_p < pmin ||
+                    (sp->mtp_pstep && sp->mtp_depth && !sp->mtp_force &&
+                     !spec_gate_deeper_p(&sp->gate, SPEC_SRC_MTP, j, sp->ahead_p))) { k = j; break; }
                 double t1 = now_s();
                 d[j] = q36_mtp_draft_more(m, hd, d[j - 1], pos + j);
+                sp->ahead_p[j] = g_q36_mtp.last_p;
                 spec_gate_draft_cost(&sp->gate, SPEC_SRC_MTP, now_s() - t1);
+            }
+            /* the depth this step's drafts are worth, from their probabilities (DeepSeek's
+             * confidence-scheduled verification): the drafts past it go unverified. The first
+             * stays (the head pass that made it is a plain step's too). Within a fixed depth
+             * only: under auto the averages would learn from the drafts it kept, the sure
+             * ones, and pick deeper (measured: 392 head rows against 303, a prompt 8% slower). */
+            if (sp->mtp_pstep && sp->mtp_depth && !sp->mtp_force && k > 1) {
+                int kp = spec_gate_pick_p(&sp->gate, SPEC_SRC_MTP, k, sp->ahead_p, NULL);
+                k = kp < 1 ? 1 : kp;
             }
             t_verify += now_s() - t_first;   /* the deeper drafts are the gate's draft cost, not the verify's */
             free(hd);
@@ -7644,6 +7746,7 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     clk->hits=m->hits; clk->miss=m->miss;
     clk->t0=now_s();
     g_echo_k = 0; g_echo_id = NULL;   /* la lettura riguarda il prefill, non la decodifica */
+    g_q36_mtp.voc_reuse = reuse;
     *ids_out=ids; *np_out=np; *lo_out=lo;
     return 1;
 }
@@ -8253,7 +8356,7 @@ static void serve_loop(Model *m){
     for(;;){
         ServeReq q={0}; int r;
         do r=serve_read_req(&q); while(r==0||r==4||r==5);
-        if(r<0) return;
+        if(r<0){ q36_mtp_vocab_save(); return; }
         /* Resend the grid after EVERY turn, not only after READY: at boot the
          * expert cache is empty by definition, and that cold snapshot stayed
          * the only one the dashboard ever saw -- all grey, RAM 0, everything
@@ -8567,7 +8670,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
                     .ram_floor = slot * (size_t)c->topk * (size_t)c->n_layers, .ram_given = vk_ram_given,
                     .ram_later = q36_kv_later(m),
                     .dense_bytes = vk_dense_bytes(m), .stage = g_vk_chain,
-                    .chain_bytes = g_vk_chain ? q36c_late_bytes(m, qwen36_max_ctx()) : 0,
+                    .chain_bytes = g_vk_chain ? q36c_late_bytes(m, qwen36_max_ctx() < Q36C_KV_START ? qwen36_max_ctx() : Q36C_KV_START) : 0,
                     .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = vk_load, .release = vk_release, .load_ctx = m,
                     .layer_gate_up = lgu, .layer_down = ldn};
@@ -8979,8 +9082,10 @@ int main(int argc, char **argv) {
     /* the CUDA chain uploads its own router, DeltaNet b|a and gate rows after the tier sized
      * its budget: out of the tier's allowance, or the tier fills the card and the chain's
      * prompt scratch and KV mirror find no room (Muse Spark's f32 router: 496 MiB) */
-    if (q36cc_env_on() && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1')
+    if (q36cc_env_on() && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1') {
         qt_reserve(q36cc_own_bytes(&m) + q36cc_mirror_bytes(&m, qwen36_max_ctx()));   /* and the KV mirrors of a model whose chain needs them whole */
+        q36_gguf_stage_reserve(&m);   /* and a GGUF's prompt staging, where the card holds fewer than all its experts */
+    }
 #endif
 #ifdef COLI_CUDA
     if (g_gguf && !qq_active() && m.c.n_experts > 0 && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1') {
@@ -8995,7 +9100,12 @@ int main(int argc, char **argv) {
                  q36_eh(&m.c) % coli_cuda_block_elems(100 + x->tg) == 0 && m.c.inter % coli_cuda_block_elems(100 + x->td) == 0;
             if (ok) { tg[l] = x->tg; td[l] = x->td; bg[l] = (size_t)x->eb_g; bdn[l] = (size_t)x->eb_d; }
         }
-        if (ok && qt_init_gguf(L, m.c.n_experts, q36_eh(&m.c), m.c.inter, cap, m.c.topk, tg, td, bg, bdn, 0)) gguf_tier = 1;   /* the slots' rows stay */
+        /* each expert in a slot of its own layer's size (COLI_CUDA_EXACT_SLOTS=0: the largest layer's) */
+        { const char *xs = getenv("COLI_CUDA_EXACT_SLOTS"); qt_gguf_exact_slots(!(xs && *xs == '0')); }
+        if (ok && qt_init_gguf(L, m.c.n_experts, q36_eh(&m.c), m.c.inter, cap, m.c.topk, tg, td, bg, bdn, 0)) {
+            gguf_tier = 1;   /* the slots' rows stay */
+            gguf_hold_file_rows(&m);
+        }
         else fprintf(stderr, "[qwen36] COLI_CUDA=1: %s; the routed experts stay on the CPU\n",
                      ok ? "the CUDA expert tier did not start" : "the GGUF's expert types are not all ones the CUDA chain's experts take");
         free(tg); free(td); free(bg); free(bdn);
@@ -9114,8 +9224,8 @@ int main(int argc, char **argv) {
             else fprintf(stderr, "[dn] Q36_DN_GPU=1 but no layer has both projections on one card; the CPU path stands\n");
         }
         /* Warmstart: fill the VRAM budget BEFORE the first token (heat order
-         * when HEAT_FILE exists, natural order otherwise), loading all RAM
-         * slots along the way. */
+         * when HEAT_FILE exists, otherwise every layer's expert 0, then 1, ...),
+         * loading all RAM slots along the way. */
         const char *nws = getenv("QT_NO_WARMSTART");
         if (!(nws && *nws=='1') && qt_experts_on()) tier_warmstart(&m, expert_is_int4);
     }
@@ -9273,6 +9383,7 @@ int main(int argc, char **argv) {
     q36c_report(&m);
     vk_tier_turn(&m, "run");
 #endif
+    q36_mtp_vocab_save();
     free(buf); free(arena);
     /* Oracle mode is a gate, not a report: a mismatch must fail the caller.
      * inkling.c does the same (`return (match == ngen) ? 0 : 1;`) and its CI

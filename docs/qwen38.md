@@ -440,18 +440,28 @@ native FP8 routed experts (`Q38_NATIVE_FP8=1`, the default) with every layer's
 block-scale bank resident; a checkpoint that falls back to the per-matrix
 scale loader stays on the CPU and says so.
 
+**The card's allowance.** `CUDA_EXPERT_GB` is what each card gives the tier,
+the dense trunk and, with the CUDA chain, the chain's own buffers, in GB. Unset,
+`0` or `auto`, it is the card's free memory less 1 GB; the start prints both,
+`[qtier] dev 0: <free> GB free, allowance <GB> GB`. `coli chat --vram <GB>`
+passes its number as `CUDA_EXPERT_GB`; `--gpu` alone leaves it to the engine.
+`COLI_VK_TIER_GB` is the Vulkan tier's and does not size this one.
+
 **What a VRAM budget buys.** The routing of Qwen3.8-Flash-Next has no hot set
 that carries over between prompts: the 1,400 experts (5.8 % of the model) that
 were hottest in one 100-token run covered a different prompt's routes at
 chance level (4.7 %; two cards, 2,800 experts: 9.3 % against 11.5 % chance;
 rank correlation of expert frequency per layer between the two runs -0.2). A
 heat file from an earlier run therefore does not help, and the engine does no
-warmstart. Inside a run the locality is strong -- on the route trace of a
-315-token prompt plus 100 generated tokens, an LRU of 32 slots per layer
-serves 55 % of decode routes, 64 serve 79 %, 128 serve 90 % -- so the tier
-earns its VRAM by promotion at touch time: with the RAM LRU at cap 128, one
-8 GB card served 45 % of decode routes from VRAM on the real checkpoint, two
-cards 59 %.
+warmstart of the fp8 tier. (A GGUF is another case: the tier holds its experts
+as the file has them and fills the card at the start, the history's most used
+first, `.coli_usage`; `COLI_CUDA_TIER_WARM=0` turns that off. See
+[gguf.md](gguf.md#what-the-engines-do-with-the-blocks).) Inside a run the
+locality is strong -- on the route trace of a 315-token prompt plus 100
+generated tokens, an LRU of 32 slots per layer serves 55 % of decode routes,
+64 serve 79 %, 128 serve 90 % -- so the tier earns its VRAM by promotion at
+touch time: with the RAM LRU at cap 128, one 8 GB card served 45 % of decode
+routes from VRAM on the real checkpoint, two cards 59 %.
 
 **VRAM per expert.** The tier charges what `cudaMalloc` takes, not the payload:
 an allocation above 1 MiB rounds up to a multiple of 2 MiB, so each 1.56 MiB
@@ -639,6 +649,24 @@ the token stays the experts': about 1 s of expert reads per forward (24,576 FP8 
 behind a 4 GiB trunk on 8 GB) and 290 ms of routed experts, which no chain touches. The
 chain uploads 174 MiB itself (the matrices the placer never sees) and holds 381 MiB of
 state (the K/V, index-key and pooled-key mirrors, the DeltaNet state, the PLE ring).
+
+**A long prompt layer by layer** (`q38cc_forward_lm`, `COLI_CUDA_CHAIN_LAYERWISE`). A
+prompt chunk copies every layer's host pool experts into VRAM before that layer's experts
+run (`q38cc_stage_from`), so a 4K-token prompt in 2048-row chunks copied each layer's pool
+experts twice. Where every layer runs its experts in the frame and a chunk stages them, a
+prompt of more chunks than one now runs layer by layer: each layer's chunks in order, its
+copy waited for at its first chunk and the next staged layer's started after its last (on
+the copy stream, beside the next frames), every row's streams kept on the device between
+layers. Each layer's chunk is a frame waited for, so the K/V rows and the routes' books
+come down a chunk at a time as before, and a chunk runs the same ops on the same rows.
+RTX PRO 4000 (PCIe gen 4 x8), Qwen3.8-Flash-Next IQ2_XS with the host pool, prompts of
+1K / 4K tokens: 321.3 / 309.0 -> 321.2 / 343.0 tok/s, the decode the same (43.6 tok/s).
+The Vulkan chain does the same (`q38c_forward_lm`, `COLI_VK_CHAIN_LAYERWISE`). A prompt longer
+than a segment (8192 rows) runs a segment at a time, so the rows' streams on the device stay
+bounded. The chain's VRAM reserve (`q38cc_reserve_bytes`) counts a segment's streams, a
+verify's copies of the DeltaNet state and the routed experts' scratch of a prompt chunk: with
+2048-row chunks it kept 3.21 GiB where the chain used 3.34-3.51, a verify's copies were refused
+and every verify ran on the CPU (decode 43.6 -> 20.4 tok/s in such a run).
 
 `tests/test_qwen38_cuda_chain.c` (`make qwen38-cuda-chain-check`, in CI beside
 `qwen38-dn-gpu-check`) runs the tiny FP8 fixture's oracle on the fake tier with the

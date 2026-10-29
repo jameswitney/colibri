@@ -192,6 +192,19 @@ class MuseGatewayTest(unittest.TestCase):
                          {"city": "Rome &amp; co", "days": 3, "units": ["C", "mm"]})
         self.assertEqual(openai_server._tool_stream_markers(), ("<atem:function_calls>",))
 
+    def test_a_nullable_string_parameter_stays_a_string(self):
+        tool = {"type": "function", "function": {"name": "lookup", "parameters": {
+            "type": "object", "properties": {"order_id": {"type": ["string", "null"]},
+                                             "note": {"type": ["string", "null"]}},
+            "required": ["order_id", "note"], "additionalProperties": False}}}
+        reply = ('<atem:function_calls>\n<atem:invoke name="lookup">\n'
+                 '<atem:parameter name="order_id">12345</atem:parameter>\n'
+                 '<atem:parameter name="note">null</atem:parameter>\n'
+                 "</atem:invoke>\n</atem:function_calls>")
+        _text, calls = openai_server.parse_arch_tool_calls(reply, [tool])
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"order_id": "12345", "note": None})
+
     def test_turn_ends_on_eot(self):
         self.assertEqual(openai_server.stop_policy({}, True)[0], openai_server.MUSE_STOP_SEQUENCES)
 
@@ -200,6 +213,41 @@ class MuseGatewayTest(unittest.TestCase):
                                              tool_choice="none", current_date=DATE)
         self.assertNotIn("atem:function_calls", got)
         self.assertIn('# Valid recipients: "self", "commentary", "user".', got)
+
+    def test_a_tool_result_survives_malformed_call_history(self):
+        """The name lookup walks every earlier tool_calls list. A non-list, or a
+        function that is not an object, raised before the call validator's 400."""
+        history = [
+            {"role": "user", "content": "hi", "tool_calls": 1},
+            {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+        ]
+        rendered = openai_server.render_chat_muse(history, tools=[WEATHER], current_date=DATE)
+        self.assertIn("sunny", rendered)
+        named = [
+            {"role": "user", "content": "hi",
+             "tool_calls": [{"id": "c1", "function": "get_weather"}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+        ]
+        rendered = openai_server.render_chat_muse(named, tools=[WEATHER], current_date=DATE)
+        self.assertIn("sunny", rendered)
+        ordered = [
+            {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": "get_weather"}]},
+        ]
+        with self.assertRaises(openai_server.APIError):
+            openai_server.render_chat_muse(ordered, tools=[WEATHER], current_date=DATE)
+
+    def test_a_deferred_tool_with_a_non_string_description_renders(self):
+        """A deferred tool appended its note to `description` with +, so a number,
+        array or object there raised TypeError, which do_POST answers with 500."""
+        for description in (5, ["x"], {"a": 1}):
+            with self.subTest(description=description):
+                tool = {"type": "function", "function": {
+                    "name": "lookup", "description": description, "defer_loading": True}}
+                got = openai_server.render_chat_muse([{"role": "user", "content": "x"}],
+                                                     tools=[tool], current_date=DATE)
+                self.assertIn("[deferred: use tool_search to load full schema]", got)
 
 
 if __name__ == "__main__":

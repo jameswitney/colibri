@@ -109,7 +109,7 @@ typedef struct { uint8_t *b; int t; } OlmGx;
 typedef struct {
     float *in_ln, *post_ln, *q, *k, *v, *o, *qn, *kn, *gate;
     OlmGx gq, gk, gv, go, ggate;   /* a GGUF's: the f32 pointer is NULL when set */
-    uint16_t *q_h, *k_h, *v_h, *o_h;   /* half-resident twins of q/k/v/o (COLI_DENSE_F16); the f32 pointer is NULL when set */
+    uint16_t *q_h, *k_h, *v_h, *o_h;   /* half-resident twins of q/k/v/o (FP16 or BF16, COLI_DENSE_F16); the f32 pointer is NULL when set */
 #ifdef COLI_VULKAN
     void *vk_q, *vk_k, *vk_v, *vk_o, *vk_gate;   /* device copies, on first use */
 #endif
@@ -367,7 +367,21 @@ static float g_nuc  = 0.95f;  /* NUCLEUS env overrides */
 #include "sample.h"
 
 #include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
-#include "matmul_f16.h"   /* the same product with W kept as IEEE half: bit-identical, half the bytes (needs F16C) */
+#include "matmul_f16.h"   /* the same product with W kept as half (FP16 needs F16C, BF16 runs anywhere): bit-identical, half the bytes */
+#include "kv16.h"
+
+/* ---- the KV cache's numbers (kv16.h) ------------------------------------------------
+ * Each K and V value is clamped to +-65504 and rounded to the nearest float16 as a step
+ * computes it, before anything reads it (attention(), and the Vulkan chain's rows alike).
+ * The cache stays float32 arrays holding float16's values, so the chain's mirror keeps
+ * them in float16 (olc_kvh) with the same numbers: half a decode step's reads. KV16=0:
+ * float32's. An argv run against a .json reference (the tiny oracle) keeps float32
+ * unless KV16 is set. */
+static int g_olm_kv16 = -1;
+static inline int olm_kv16(void) {
+    if (g_olm_kv16 < 0) { const char *e = getenv("KV16"); g_olm_kv16 = !(e && *e == '0'); }
+    return g_olm_kv16;
+}
 
 /* matmul for a RESIDENT f32 matrix W [O,I], with *vk caching its device copy:
  * on Vulkan when the device is up, the CPU's matmul otherwise. The backend has one
@@ -407,18 +421,30 @@ static void olmoe_vk_report(void) {
 #define MATMUL_RES(y, x, W, vk, S, I, O) matmul(y, x, W, S, I, O)
 #endif
 
-/* Dense weights kept as half. The checkpoint stores attention and lm_head as FP16, and the engine used to widen
- * them to f32 in RAM, doubling the bytes a cached decode step streams from DRAM for them (~0.75 GB of the
- * ~2.3 GB a token reads on OLMoE-1B-7B). Widening half to f32 is exact and matmul_f16w() runs matmul()'s exact
- * lanes on the widened values, so the output is bit-identical (tests/test_matmul_f16.c); only the bytes change.
- * COLI_DENSE_F16=0 turns it off. Standalone engine only (the segment/edge adapters keep f32), and not in a
- * Vulkan build, whose device tier wants the f32 host copy. */
-#if defined(COLI_MATMUL_F16) && !defined(COLI_VULKAN)
+/* Dense weights kept as half. The checkpoint stores attention and lm_head as FP16 or BF16, and the engine used
+ * to widen them to f32 in RAM, doubling the bytes a cached decode step streams from DRAM for them (~0.75 GB of
+ * the ~2.3 GB a token reads on OLMoE-1B-7B). Widening half to f32 is exact and matmul_f16w()/matmul_bf16w() run
+ * matmul()'s exact lanes on the widened values, so the output is bit-identical (tests/test_matmul_f16.c); only
+ * the bytes change. FP16 needs F16C; BF16 runs everywhere, which is what makes this reach ARM boards: a
+ * 4-stage Segment pipeline on Raspberry Pi 5s went from 4.45 to 6.3 tok/s with the same tokens.
+ * COLI_DENSE_F16=0 turns it off. Standalone engine and the segment/edge adapters; not in a Vulkan build,
+ * whose device tier wants the f32 host copy. */
+#ifndef COLI_VULKAN
 #define OLM_DENSE_F16 1
 #endif
 #ifdef OLM_DENSE_F16
 static int g_dense_f16 = 0;
-#define MATMUL_RESH(y, x, W, Wh, vk, S, I, O) do { if (Wh) matmul_f16w(y, x, Wh, S, I, O); else matmul(y, x, W, S, I, O); } while (0)
+static int g_dense_half_dtype = -1;   /* st dtype every half twin was loaded as: 0 BF16, 1 FP16 */
+static void olm_dense_half_init(void) {
+    g_dense_f16 = getenv("COLI_DENSE_F16") ? atoi(getenv("COLI_DENSE_F16")) : 1;
+}
+static void matmul_halfw(float *y, const float *x, const uint16_t *W, int S, int I, int O) {
+#ifdef COLI_MATMUL_F16
+    if (g_dense_half_dtype == 1) { matmul_f16w(y, x, W, S, I, O); return; }
+#endif
+    matmul_bf16w(y, x, W, S, I, O);
+}
+#define MATMUL_RESH(y, x, W, Wh, vk, S, I, O) do { if (Wh) matmul_halfw(y, x, Wh, S, I, O); else matmul(y, x, W, S, I, O); } while (0)
 #else
 #define MATMUL_RESH(y, x, W, Wh, vk, S, I, O) MATMUL_RES(y, x, W, vk, S, I, O)
 #endif
@@ -676,17 +702,25 @@ static float *load_t(Model *m, const char *name, int64_t rows, int64_t columns) 
 }
 
 /* A [rows, columns] matrix of the dense part: the half copy (returned NULL, *h set) when the checkpoint stores it
- * as FP16 and COLI_DENSE_F16 is on, else the usual f32 copy with *h NULL. Shape checks are load_t's. */
+ * as BF16 (or FP16 with F16C) and COLI_DENSE_F16 is on, else the usual f32 copy with *h NULL. Shape checks are
+ * load_t's. One half format per process: a tensor of the other one stays f32. */
 static float *load_t_dense(Model *m, const char *name, int64_t rows, int64_t columns, uint16_t **h) {
     *h = NULL;
 #ifdef OLM_DENSE_F16
     if (g_dense_f16) {
         st_tensor *t = st_find(&m->S, name);
-        if (t && t->dtype == 1 && t->rank == 2 && t->shape[0] == rows && t->shape[1] == columns &&
+        int half = t && (t->dtype == 0
+#ifdef COLI_MATMUL_F16
+                         || t->dtype == 1
+#endif
+                         );
+        if (half && (g_dense_half_dtype < 0 || g_dense_half_dtype == t->dtype) &&
+            t->rank == 2 && t->shape[0] == rows && t->shape[1] == columns &&
             t->nbytes == t->numel * 2) {
             uint16_t *p = malloc((size_t)t->nbytes);
             if (!p) { fprintf(stderr, "out of memory reading %s\n", name); exit(1); }
             st_read_raw(&m->S, name, p, 0);
+            g_dense_half_dtype = t->dtype;
             *h = p;
             return NULL;
         }
@@ -983,6 +1017,9 @@ static void olc_place(Model *m);
 static void olm_dho_start(Model *m);
 static void olm_dho_finish(Model *m);
 #endif
+#ifdef COLI_CUDA
+static void occ_start(Model *m);   /* olmoe_cuda_chain.h */
+#endif
 static void model_init(Model *m, const char *snap, int cap, int bits) {
     model_init_range(m, snap, cap, bits, 0, 0, 1, 1);
 #ifdef COLI_VULKAN
@@ -1008,6 +1045,9 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
                 vkt_ready() ? "routed experts go to the expert tier, the embedding lookup stays on the CPU"
                             : "routed experts and the embedding lookup stay on the CPU");
     olc_start(m);   /* COLI_VK_CHAIN: every layer's dense part as one frame on the device */
+#endif
+#ifdef COLI_CUDA
+    occ_start(m);   /* COLI_CUDA=1: every layer and its experts on the card (olmoe_cuda_chain.h) */
 #endif
 }
 
@@ -1542,6 +1582,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         int pos = m->mux_rows ? m->mux_rows[s].pos : pos_base + s;
         for (int hh = 0; hh < H; hh++) { rope_head(q + (int64_t)s*D + hh*hd, pos, c); rope_head(k + (int64_t)s*D + hh*hd, pos, c); }
     }
+    if (olm_kv16()) { kv16_round(k, (int64_t)S*D); kv16_round(vv, (int64_t)S*D); }   /* the cache's numbers, before anything reads them */
     /* scrive k,v nella kv-cache alle posizioni pos_base..pos_base+S-1 (in un passo
      * multiplexato: ogni riga alla sua, nella cache della sua conversazione) */
     const OlmRow *mr = m->mux_rows;
@@ -2071,6 +2112,10 @@ static void olm_dho_finish(Model *m) {
 }
 #endif
 
+#ifdef COLI_CUDA
+#include "olmoe_cuda_chain.h"   /* COLI_CUDA=1: every layer, its experts too, as one chain on the card */
+#endif
+
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     kv_room_fit(m, pos_base + S);   /* before the positions' pages are written */
@@ -2088,11 +2133,11 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     }
     float *x = falloc((int64_t)S*D);
     for (int s = 0; s < S; s++) olm_embed_row(m, ids[s], x + (int64_t)s*D);
-#ifdef COLI_VULKAN
-    /* COLI_VK_CHAIN: the layers, the final norm and lm_head on the device; x comes
-     * back only when the prefill read-out below needs every row */
+    /* a chain (COLI_VK_CHAIN, or the CUDA one): the layers, the final norm and lm_head on the
+     * device; x comes back only when the prefill read-out below needs every row */
     float *chain_logit = NULL;
     int chain_n = 0;   /* layers the chain ran (a partial chain: the CPU runs the rest and the head) */
+#ifdef COLI_VULKAN
     if (g_vk_chain) {
         int rows_only = 0;
         chain_logit = falloc(c->vocab);
@@ -2105,10 +2150,19 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
             for (int s = 0; s < S; s++) olm_embed_row(m, ids[s], x + (int64_t)s*D);
         } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
     }
-    if (!chain_logit) layers_forward_range(m, x, S, pos_base, chain_n, c->n_layers, 1);
-#else
-    layers_forward_range(m, x, S, pos_base, 0, c->n_layers, 1);
 #endif
+#ifdef COLI_CUDA
+    if (!chain_n && g_occ && g_occ->ok && !g_occ->failed) {
+        chain_logit = falloc(c->vocab);
+        chain_n = occ_forward(m, ids, x, S, pos_base, g_echo_k > 0 && g_echo_id && S > 1, chain_logit);
+        if (!chain_n) {   /* declined or lost: the CPU runs the step from the embedding rows */
+            free(chain_logit); chain_logit = NULL;
+            occ_cpu_step(m, pos_base);
+            for (int s = 0; s < S; s++) olm_embed_row(m, ids[s], x + (int64_t)s*D);
+        }
+    }
+#endif
+    if (!chain_logit) layers_forward_range(m, x, S, pos_base, chain_n, c->n_layers, 1);
     /* count actual tokens processed (S>1 during prefill) */
     m->token_count += S; m->freq_token_count += S;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens)
@@ -2133,13 +2187,11 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         }
         free(erow); free(elog);
     }
-#ifdef COLI_VULKAN
     if (chain_logit) {   /* the chain's last frame ran the final norm and lm_head */
         g_prof_forwards += 1;
         free(x);
         return chain_logit;
     }
-#endif
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
@@ -2560,6 +2612,9 @@ static void run_chat(Model *m, Tok *T, int ctx_cap) {
 #ifdef COLI_VULKAN
         olmoe_vk_report(); vkt_report("turn", m->hits, m->miss); olc_report(m);
 #endif
+#ifdef COLI_CUDA
+        occ_report();
+#endif
     }
     free(line); free(turn); free(newids); free(gen); free(outbuf); free(hist);
 }
@@ -2817,6 +2872,9 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     fflush(stdout);
 #ifdef COLI_VULKAN
     olmoe_vk_report(); vkt_report("turn", m->hits, m->miss); olc_report(m);
+#endif
+#ifdef COLI_CUDA
+    occ_report();
 #endif
     serve_hits(m);
     free(ids);
@@ -3127,7 +3185,7 @@ int main(int argc, char **argv) {
     g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 0;
     g_fused3     = getenv("FUSED3") ? atoi(getenv("FUSED3")) : 0;
 #ifdef OLM_DENSE_F16
-    g_dense_f16  = getenv("COLI_DENSE_F16") ? atoi(getenv("COLI_DENSE_F16")) : 1;   /* standalone engine only, see OLM_DENSE_F16 */
+    olm_dense_half_init();
 #endif
     if (g_wide < 1) g_wide = 1;
     if (g_wide > 4) g_wide = 4;
@@ -3234,6 +3292,7 @@ int main(int argc, char **argv) {
     }
 
     const char *refpath = argc > 3 ? argv[3] : "ref.json";
+    if (!(getenv("KV16") && *getenv("KV16"))) g_olm_kv16 = 0;   /* the oracle's reference: float32 unless asked */
 
     float smooth = getenv("SMOOTH") ? (float)atof(getenv("SMOOTH")) : 0.3f;
     float conf   = getenv("CONF_LIMIT") ? (float)atof(getenv("CONF_LIMIT")) : 0.92f;
@@ -3269,6 +3328,9 @@ int main(int argc, char **argv) {
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
 #ifdef COLI_VULKAN
         fflush(stdout); olmoe_vk_report(); vkt_report("run", m.hits, m.miss); olc_report(&m);
+#endif
+#ifdef COLI_CUDA
+        occ_report();
 #endif
         free(buf); free(arena);
         return 0;      /* PPL is a measurement run: no rt_save on purpose, so a loss
@@ -3322,6 +3384,9 @@ int main(int argc, char **argv) {
     printf("TUNE decode: %d tokens in %.3fs\n", n_new, dt);
 #ifdef COLI_VULKAN
     fflush(stdout); olmoe_vk_report(); vkt_report("run", m.hits, m.miss); olc_report(&m);
+#endif
+#ifdef COLI_CUDA
+    occ_report();
 #endif
     free(buf); free(arena);
     return 0;
@@ -3421,6 +3486,9 @@ static int olmoe_segment_engine_open(
         return coli_segment_adapter_error(error, error_size,
                                            "cannot initialize OLMoE Segment lock");
     }
+#ifdef OLM_DENSE_F16
+    olm_dense_half_init();
+#endif
     model_init_range(&engine->model, options->model_dir, cap, 8,
                      (int)options->layer_begin, (int)options->layer_end, 0, 0);
 
@@ -3674,11 +3742,20 @@ typedef struct {
     Tok tokenizer;
 } OlmoeEdgeEngine;
 
+/* logits[vocab] = x[hidden] @ lm_head^T, from the half copy when the head is held so */
+static void olm_edge_head(float *logits, const float *x, const Model *m) {
+#ifdef OLM_DENSE_F16
+    if (m->lm_head_h) { matmul_halfw(logits, x, m->lm_head_h, 1, m->c.hidden, m->c.vocab); return; }
+#endif
+    matmul(logits, x, m->lm_head, 1, m->c.hidden, m->c.vocab);
+}
+
 static void olmoe_edge_engine_destroy(void *engine_impl) {
     OlmoeEdgeEngine *engine = (OlmoeEdgeEngine *)engine_impl;
     if (!engine) return;
     free(engine->model.embed);
     free(engine->model.lm_head);
+    free(engine->model.lm_head_h);
     free(engine->model.final_norm);
     st_destroy(&engine->model.S);
     tok_free(&engine->tokenizer);
@@ -3704,7 +3781,13 @@ static int olmoe_edge_engine_open(
     st_init(&engine->model.S, options->model_dir);
     const Cfg *ec = &engine->model.c;
     engine->model.embed = load_t(&engine->model, "model.embed_tokens.weight", ec->vocab, ec->hidden);
+#ifdef OLM_DENSE_F16
+    olm_dense_half_init();
+    engine->model.lm_head = load_t_dense(&engine->model, "lm_head.weight", ec->vocab, ec->hidden,
+                                         &engine->model.lm_head_h);
+#else
     engine->model.lm_head = load_t(&engine->model, "lm_head.weight", ec->vocab, ec->hidden);
+#endif
     engine->model.final_norm = load_t(&engine->model, "model.norm.weight", ec->hidden, 0);
     char tokenizer_path[4096];
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
@@ -3713,7 +3796,8 @@ static int olmoe_edge_engine_open(
 
     Cfg *config = &engine->model.c;
     uint64_t cells = (uint64_t)config->vocab * config->hidden;
-    uint64_t resident = (2u * cells + (uint64_t)config->hidden) * sizeof(float);
+    uint64_t resident = (cells + (uint64_t)config->hidden) * sizeof(float) +
+                        cells * (engine->model.lm_head_h ? sizeof(uint16_t) : sizeof(float));
     if (options->memory_limit_bytes && resident > options->memory_limit_bytes) {
         olmoe_edge_engine_destroy(engine);
         return coli_edge_adapter_error(error, error_size,
@@ -3744,7 +3828,9 @@ static int olmoe_edge_engine_open(
     capabilities->max_context_tokens = 4096;
     capabilities->num_layers = (uint32_t)config->n_layers;
     capabilities->bos_token_id = -1;
-    capabilities->eos_token_id = -1;
+    /* The stop the standalone chat arms (bos == eos == "|||IP_ADDRESS|||"). At -1 a
+     * Segment chat never stopped on its own and ran to its token limit. */
+    capabilities->eos_token_id = tok_id_of(&engine->tokenizer, "|||IP_ADDRESS|||");
     capabilities->resident_bytes = resident;
     *engine_impl = engine;
     return 0;
@@ -3805,8 +3891,7 @@ static int olmoe_edge_select(void *engine_impl,
         }
         rmsnorm_row(normalized, input + (size_t)row * config->hidden,
                     engine->model.final_norm, config->hidden, config->eps);
-        matmul(logits, normalized, engine->model.lm_head,
-               1, config->hidden, config->vocab);
+        olm_edge_head(logits, normalized, &engine->model);
         if (coli_edge_argmax(logits, (uint32_t)config->vocab,
                             &request->token_ids[row],
                             request->scores ? &request->scores[row] : NULL)) {
@@ -3835,9 +3920,8 @@ static int olmoe_edge_logits(void *engine_impl,
         }
         rmsnorm_row(normalized, input + (size_t)row * config->hidden,
                     engine->model.final_norm, config->hidden, config->eps);
-        matmul(request->logits + (size_t)row * config->vocab,
-               normalized, engine->model.lm_head,
-               1, config->hidden, config->vocab);
+        olm_edge_head(request->logits + (size_t)row * config->vocab, normalized,
+                      &engine->model);
     }
     free(normalized);
     return 0;

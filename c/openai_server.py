@@ -655,6 +655,10 @@ def _tool_param_types(tools):
         for key, spec in props.items():
             if isinstance(spec, dict):
                 t = spec.get("type")
+                branches = spec.get("anyOf", spec.get("oneOf"))
+                if t is None and isinstance(branches, list):
+                    # pydantic's Optional[str]: {"anyOf": [{"type": "string"}, {"type": "null"}]}
+                    t = [b.get("type") for b in branches if isinstance(b, dict)]
                 if isinstance(t, list):          # {"type": ["string", "null"]}
                     t = next((x for x in t if x != "null"), None)
                 types[key] = t
@@ -1325,14 +1329,21 @@ def decode_wav_mono16k(data, param):
     down), sample rate must already be 16 kHz — resampling belongs at the
     capture edge, not in the gateway."""
     import struct as _struct
-    np = _np()
     if len(data) < 44 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
         raise APIError(400, "Audio must be a RIFF/WAVE file.", param, "invalid_value")
+    end = 8 + _struct.unpack_from("<I", data, 4)[0]
+    if end < 12 or end > len(data):
+        raise APIError(400, "WAV file has an invalid RIFF boundary.", param, "invalid_value")
     pos, fmt, raw = 12, None, None
-    while pos + 8 <= len(data):
+    while pos + 8 <= end:
         cid, size = data[pos:pos + 4], _struct.unpack_from("<I", data, pos + 4)[0]
-        if pos + 8 + size > len(data):
+        if pos + 8 + size > end:
             raise APIError(400, "WAV file has a truncated chunk.", param, "invalid_value")
+        # An odd chunk is word-padded, but the pad is optional when the RIFF
+        # size ends on that chunk's body. Python's wave module reads the PCM
+        # in that file. A missing pad earlier still swallows the next header,
+        # so only a chunk that ends on the boundary may omit it.
+        pad = (size & 1) and (pos + 8 + size < end)
         body = data[pos + 8:pos + 8 + size]
         if cid == b"fmt ":
             if len(body) < 16:
@@ -1340,9 +1351,12 @@ def decode_wav_mono16k(data, param):
             fmt = _struct.unpack_from("<HHIIHH", body, 0)
         elif cid == b"data":
             raw = body
-        pos += 8 + size + (size & 1)
+        pos += 8 + size + pad
+    if pos != end:
+        raise APIError(400, "WAV file has a truncated chunk header.", param, "invalid_value")
     if fmt is None or raw is None:
         raise APIError(400, "WAV file is missing fmt/data chunks.", param, "invalid_value")
+    np = _np()
     audio_format, channels, rate, _, _, bits = fmt
     if channels == 0:
         raise APIError(400, "WAV channel count must be positive.", param, "invalid_value")
@@ -2246,7 +2260,7 @@ def _muse_fn_line(fn, where):
     desc = fn.get("description") or ""
     params = fn.get("parameters") or {}
     if fn.get("defer_loading"):
-        desc = desc + " [deferred: use tool_search to load full schema]"
+        desc = _jinja_string(desc) + " [deferred: use tool_search to load full schema]"
         return ('\n{"name": ' + _muse_esc(_muse_json(name)) + ', "description": ' +
                 _muse_esc(_muse_json(desc)) + ', "defer_loading": true}')
     if isinstance(params, dict) and not params:
@@ -2407,9 +2421,16 @@ def render_chat_muse(messages, enable_thinking=True, reasoning_effort=None, tool
                 call_id = message.get("tool_call_id")
                 name = call_id or ""
                 for other in messages:
-                    for call in (other.get("tool_calls") or []) if isinstance(other, dict) else []:
-                        if call_id is not None and isinstance(call, dict) and call.get("id") == call_id:
-                            name = (call.get("function") or {}).get("name", name)
+                    calls = other.get("tool_calls") if isinstance(other, dict) else None
+                    if not isinstance(calls, list):
+                        continue
+                    for call in calls:
+                        if not isinstance(call, dict) or call.get("id") != call_id:
+                            continue
+                        function = call.get("function")
+                        found = function.get("name") if isinstance(function, dict) else None
+                        if isinstance(found, str) and found:
+                            name = found
             if not name:
                 raise APIError(400, "A tool message needs a `name` or a `tool_call_id` that names a call.",
                                f"messages.{index}")
@@ -2547,8 +2568,10 @@ def _muse_unattr(text):
 def _muse_value(raw, schema):
     """A parameter's text as its schema types it: strings as written, JSON for the rest."""
     kind = schema.get("type") if isinstance(schema, dict) else None
-    if kind == "string" or (isinstance(kind, list) and "string" in kind and len(kind) == 1):
-        return raw
+    kinds = kind if isinstance(kind, list) else [kind]
+    if "string" in kinds:
+        # the template writes None as `null`, and every string as is
+        return None if raw == "null" and "null" in kinds else raw
     try:
         return json.loads(raw)
     except ValueError:
@@ -3211,9 +3234,9 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
-        rtok = role_token.get(role)
-        if rtok is None:
+        if not isinstance(role, str) or role not in role_token:
             raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        rtok = role_token[role]
         # the template emits the effort hint inline, right before the first
         # non-system message — not at the end. Position matters: it changes the
         # exact token sequence the model was trained on.
@@ -3803,7 +3826,11 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
                                    f"messages.{index}.content.{position}.text")
                 texts.append(text)
             content = "".join(texts)
-        content = content or ""
+        if content is None:
+            content = ""
+        elif not isinstance(content, str):
+            raise APIError(400, "Message content must be a string or an array of text parts.",
+                           f"messages.{index}.content")
         if role == "user":
             prompt.append(f"<|user|>{content}")
         elif role == "system":
@@ -3924,7 +3951,8 @@ def _dsv41_merge_turns(messages):
                           "reasoning_content": reasoning,
                           "tool_calls": _history_tool_calls(message.get("tool_calls"), index)})
         elif role in ("user", "tool"):
-            block = ({"kind": "tool_result", "id": message.get("tool_call_id") or "",
+            result_id = message.get("tool_call_id")
+            block = ({"kind": "tool_result", "id": result_id if isinstance(result_id, str) else "",
                       "text": v41_dsml.render_tool_result(text)} if role == "tool"
                      else {"kind": "text", "id": "", "text": text})
             if turns and turns[-1]["role"] == "user":
@@ -3941,7 +3969,7 @@ def _dsv41_merge_turns(messages):
             order = {}
             for at, call in enumerate(turn["tool_calls"]):
                 identifier = call.get("id") if isinstance(call, dict) else None
-                if identifier:
+                if isinstance(identifier, str) and identifier:   # an object or array id is unhashable
                     order[identifier] = at
         elif turn["role"] == "user" and order:
             results = [p for p in turn["parts"] if p["kind"] == "tool_result"]
@@ -4115,8 +4143,14 @@ def resolve_generation_prompt(messages, body):
                        "continue from.", "messages")
     raw = last.get("content")
     if isinstance(raw, list):                       # multimodal parts: only the text counts
-        text = "".join(part.get("text", "") for part in raw
-                       if isinstance(part, dict) and part.get("type") == "text")
+        texts = []
+        for index, part in enumerate(raw):
+            if isinstance(part, dict) and part.get("type") == "text":
+                if not isinstance(part.get("text"), str):
+                    raise APIError(400, "Text content parts require a string `text` field.",
+                                   f"{where}.content.{index}.text")
+                texts.append(part["text"])
+        text = "".join(texts)
     elif raw is None:
         text = ""
     elif isinstance(raw, str):
@@ -7316,6 +7350,10 @@ class APIServer(ThreadingHTTPServer):
         super().close_request(request)
 
 
+def _reject_json_constant(name):
+    raise json.JSONDecodeError(f"{name} is not a JSON value", name, 0)
+
+
 def _content_length(value):
     # int() also accepts signs and underscores, but HTTP lengths are 1*DIGIT.
     # Read and early-error drain must agree on that exact framing grammar.
@@ -7619,7 +7657,8 @@ class APIHandler(BaseHTTPRequestHandler):
         # mid-body, and the drain will notice the EOF and close (#597 item 3).
         self._body_read = len(raw) == length
         try:
-            body = json.loads(raw)
+            # parse_constant: NaN/Infinity/-Infinity are Python extensions, not JSON.
+            body = json.loads(raw, parse_constant=_reject_json_constant)
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise APIError(400, "Request body must be valid JSON.")
         except (ValueError, RecursionError):
@@ -7665,6 +7704,11 @@ class APIHandler(BaseHTTPRequestHandler):
         if not base.is_dir():
             return False
         rel = unquote(path).lstrip("/") or "index.html"
+        # unquote('%00') embeds a NUL. Path raises ValueError, which do_GET
+        # does not catch, and a NUL with no dot also matches the SPA fallback
+        # if the exception is swallowed. Either way it is not a file.
+        if "\x00" in rel:
+            return False
         target = (base / rel).resolve()
         try:
             target.relative_to(base)
@@ -8023,6 +8067,7 @@ class APIHandler(BaseHTTPRequestHandler):
     # theirs are, with this server's error envelope. docs/systemone.md has the
     # mapping table.
     _SYSTEMONE_MAX_QUESTIONS = 64
+    _SYSTEMONE_MAX_ID = 256
 
     @staticmethod
     def _systemone_text(value, where):
@@ -8050,6 +8095,35 @@ class APIHandler(BaseHTTPRequestHandler):
         caller sent (text, object or array), or `level <n>` for one sent as null."""
         return value if isinstance(value, (str, dict, list)) else f"level {index}"
 
+    @staticmethod
+    def _systemone_loc(param):
+        """Jev's `loc` for an error's param: "questions.q.criteria[1]" is ["body",
+        "questions", "q", "criteria", 1]. A dot separates two names unless the next bracket
+        after it closes one (a dot inside [...]), and each name's trailing [n] groups are
+        its indices, a name without them kept whole. One pass each way over the text."""
+        s = param or ""
+        closes = [False] * (len(s) + 1)   # the first bracket at or after i is "]"
+        for i in range(len(s) - 1, -1, -1):
+            closes[i] = s[i] == "]" or (s[i] != "[" and closes[i + 1])
+        parts, start = [], 0
+        for i, ch in enumerate(s):
+            if ch == "." and not closes[i + 1]:
+                parts.append(s[start:i]); start = i + 1
+        parts.append(s[start:])
+        loc = ["body"]
+        for part in parts:
+            end, idx = len(part), []
+            while end and part[end - 1] == "]":
+                at = part.rfind("[", 0, end - 1)
+                digits = part[at + 1:end - 1] if at >= 0 else ""
+                if not digits.isdecimal() or len(digits) > 18:
+                    break
+                idx.append(int(digits)); end = at
+            if end:
+                loc.append(part[:end])
+            loc.extend(reversed(idx))
+        return loc
+
     def systemone(self, body, request_id):
         if body.get("state") is None:
             raise APIError(422, "`state` is required: the content the questions are about.", "state")
@@ -8064,9 +8138,11 @@ class APIHandler(BaseHTTPRequestHandler):
                            "questions")
         plan = []                                   # (id, kind, text, options, levels)
         for qid, question in raw.items():
-            where = f"questions.{qid}"
             if not isinstance(qid, str) or not qid.strip():
                 raise APIError(422, "Every question id must be a non-empty string.", "questions")
+            if len(qid) > self._SYSTEMONE_MAX_ID:
+                raise APIError(422, f"A question id has at most {self._SYSTEMONE_MAX_ID} characters.", "questions")
+            where = f"questions.{qid}"
             if not isinstance(question, dict):
                 raise APIError(422, f"`{where}` must be an object.", where)
             kind = question.get("type")
@@ -8464,13 +8540,7 @@ class APIHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/v1/systemone" and error.status == 422:
             body = error_object(error)
-            loc = ["body"]
-            for part in re.split(r"\.(?![^\[]*\])", error.param or ""):
-                match = re.fullmatch(r"(.*?)((?:\[\d+\])*)", part)
-                if match.group(1):
-                    loc.append(match.group(1))
-                loc.extend(int(i) for i in re.findall(r"\[(\d+)\]", match.group(2)))
-            body["detail"] = [{"loc": loc, "msg": error.message, "type": "value_error"}]
+            body["detail"] = [{"loc": self._systemone_loc(error.param), "msg": error.message, "type": "value_error"}]
             return body
         if path != "/v1/messages":
             return error_object(error)
