@@ -170,6 +170,7 @@ static const CuTierOps *cut_ops(void) {
  * the store's slots keep the malloc path, the CS alias the import branch (itself
  * shimmed above) -- the lever's refusal ladder, never a drop */
 #define coli_vk_slabreg_wanted() (0)
+#define coli_vk_slabreg_status(...) (0)   /* never reached: wanted() declines first */
 #define coli_vk_slabreg_alloc(...) (0)
 #define coli_vk_slabreg_free(...) ((void)0)
 #define coli_vk_slabreg_lookup(...) (0)

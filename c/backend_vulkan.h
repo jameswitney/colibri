@@ -3,10 +3,15 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "vk_policy.h"   /* the default-on levers' env resolution (COLI_VK_LEGACY, coli_vk_env_int) */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* The default-on policy itself lives in vk_policy.h (the inline pair above this
+ * comment's include): the measured levers arm behind their own probes, an explicit
+ * env always wins, COLI_VK_LEGACY=1 is the upstream-base hatch. */
 
 /* Opaque persistent device copy of one resident quantized tensor,
  * mirroring backend_cuda.h. On Strix Halo the "upload" writes into
@@ -202,7 +207,8 @@ int  coli_vk_slabreg_alias(const ColiVkSlabReg *reg, const void *user, size_t wo
                            int fmt, int I, int O, int gs, int wide, ColiVkTensor **tensor);
 int  coli_vk_slabreg_lookup(const void *user, ColiVkSlabReg **reg_out, size_t *base_off);
 size_t coli_vk_slabreg_bytes(void);       /* the registry's live bytes (books) */
-int  coli_vk_slabreg_wanted(void);         /* COLI_VK_V4_DECODE_PATH=fork (env, once) */
+int  coli_vk_slabreg_wanted(void);         /* the lever's resolution (env once): fork default-on, =0 off, LEGACY off */
+int  coli_vk_slabreg_status(long *block_mb, double *cap_gib);   /* arms (the probe) and reports: 1 armed, -1 refused (its one line), 0 device not up */
 void coli_vk_slabreg_reset(void);          /* shutdown: buffers, mappings, blocks */
 
 /* SECOND DEVICE (COLI_VK_DEV2): a self-contained context on another Vulkan GPU that

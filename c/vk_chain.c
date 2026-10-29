@@ -3930,15 +3930,36 @@ static VkPipeline fa4_pipe(int i) {   /* lazy: only an armed attention loads the
     return FA4.pipe[i];
 }
 static VkcBuf *fa16_scratch(size_t bytes) { return scratch_grow(&KC.fa16, bytes); }
-static int attn_fa_wanted(void) {   /* COLI_VK_CHAIN_ATTN_FA: 1 f16 mirror, 2 fp32 rows, else mode 0 */
+static int attn_fa_wanted(void) {   /* COLI_VK_CHAIN_ATTN_FA: 1 f16 mirror, 2 fp32 rows. The
+        * DEFAULT since gap-wave4 is 1 -- the tile and its own gates (a shape it cannot
+        * take or a pipeline that did not load falls back to mode 0, never a misread);
+        * =0 and COLI_VK_LEGACY=1 keep mode 0. Read per call so a test can arm it case
+        * by case. */
     const char *e = getenv("COLI_VK_CHAIN_ATTN_FA");
-    int v = e && *e ? atoi(e) : 0;
-    return v == 1 || v == 2 ? v : 0;
+    int v;
+    if (e && *e) { v = atoi(e); return v == 1 || v == 2 ? v : 0; }
+    return coli_vk_legacy() ? 0 : 1;
+}
+/* The lever's ONE boot line (gap-wave4): the first dsv4 attention states the tile's
+ * standing -- engaged, refused:<reason> (a pipeline that did not load or a shape the
+ * tile cannot take -- mode 0) or legacy -- so a default-on tile can never engage or
+ * decline silently on any hardware (48/32 KiB-LDS cards compile neither build; only
+ * the stats line counted before). First event wins; later dispatches stay quiet. */
+static void fa4_note(int engaged, const char *why) {
+    static int said;
+    if (said) return;
+    said = 1;
+    if (engaged)
+        fprintf(stderr, "[VK] chain: attention FA engaged: the flash tile takes the dsv4 attention (a thresholded class, never bit-identical to mode 0)\n");
+    else fprintf(stderr, "[VK] chain: attention FA refused: %s -- mode 0\n", why);
 }
 int vkc_dsv4_attn(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *prm, VkcBuf *out, const VkcDsAttn *p) {
     if (p->S < 1 || p->S > 65535 || p->H < 1 || p->H > 65535 || p->hd < 1 || p->hd > 1024 || p->cnt < 0 || p->cnt > 3072)
         return 0;
     if (p->cnt == 0) return 0;
+    if (!attn_fa_wanted() && coli_vk_legacy() &&
+        !(getenv("COLI_VK_CHAIN_ATTN_FA") && *getenv("COLI_VK_CHAIN_ATTN_FA")))
+        fa4_note(0, "legacy (COLI_VK_LEGACY=1)");
     if (attn_fa_wanted() && p->hd == 512 && !(p->H % 8) &&
         !((p->q_off | p->q_row | p->o_off | p->o_row | p->w_off | p->c_off) & 3)) {
         int dec = p->S == 1, br = dec ? 2 : 8;   /* the decode twin keeps a head's order */
@@ -3968,11 +3989,13 @@ int vkc_dsv4_attn(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *prm
             VkcBind fbd[6] = {B(q, 0), B(kv ? kv : win, 0), B(kv ? kv : (cmp ? cmp : win), 0), B(list, 0), B(prm, 0),
                               B(out, 1)};
             if (dsv4_rec(PK_ATTN, fp, 0, p, sizeof *p, fbd, 6, (uint32_t)p->S, (uint32_t)(p->H / br))) {
+                fa4_note(1, NULL);
                 KC.st.attn_fa++;
                 return 1;
             }
-        }
-    }
+        } else fa4_note(0, "the tile's pipelines did not load");
+    } else if (attn_fa_wanted())
+        fa4_note(0, "a shape the tile cannot take");
     VkcBind bd[6] = {B(q, 0), B(win, 0), B(cmp ? cmp : win, 0), B(list, 0), B(prm, 0), B(out, 1)};
     return dsv4_rec(PK_ATTN, D4.pipe, 0, p, sizeof *p, bd, 6, (uint32_t)p->H, (uint32_t)p->S);
 }

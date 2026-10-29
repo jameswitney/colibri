@@ -266,12 +266,17 @@ static double step(int layer, int S, const int *idx, const float *w, Books *bk) 
     uint8_t *taken = malloc((size_t)S * K); const float **dev = malloc(sizeof(*dev) * S * K);
     for (int i = 0; i < S * H; i++) x[i] = frnd();
     int n = vkt_issue(layer, x, S, K, idx, taken);
+    /* the armed default (gap-wave4): a rows-1 step defers to the finish site, so the
+     * helper owes the group exactly as the engine's token finish does (vk_tier.c's
+     * own contract); took == 0 there means nothing flew -- every selection the CPU's */
+    int def = S == 1 && vkt_cs_armed();
+    int grp = def ? vkt_issue_group(layer, x, S, K, idx, NULL, NULL, taken) : 0;
     for (int i = 0; i < S * K; i++) {
         if (taken[i]) continue;
         expert_ref(&ex[layer][idx[i]], x + (size_t)(i / K) * H, cpu + (size_t)i * H);
         VktExpertSrc s = src_of(&ex[layer][idx[i]]); vkt_note(layer, idx[i], &s);
     }
-    int joined = n ? vkt_join(dev) : 1;
+    int joined = grp ? vkt_join(dev) : (def ? 1 : (n ? vkt_join(dev) : 1));
     CHECK(joined, "join failed");
     double worst = 0;
     for (int s = 0; s < S; s++)
@@ -714,6 +719,10 @@ static void sync_evict(void) {
  * their own with the extra layer's share of the budget; uploads awaited throughout. */
 static void extra(void) {
     VktFmt fm = {VKT_SRC_I4U_PAIRS_GS, 64}, fx = {VKT_SRC_F32, 0};
+    /* gap-wave4: the case's own subject is the extra layers' residency -- an armed
+     * compute site defers their rows-1 steps too, so the =0 half pins the standing
+     * path this case asserts (the unset default runs it through the cs cases) */
+    setenv("COLI_VK_TIER_EXPERTS", "0", 1);
     layer_make(0, fm, fm); layer_make(1, fx, fx); g_act = VKT_ACT_SWIGLU; g_limit = 0;
     size_t mb = vkt_expert_bytes(H, F, fm, fm), xb = vkt_expert_bytes(H, F, fx, fx);
     int per = (int)((xb + mb - 1) / mb);
@@ -795,6 +804,7 @@ static void extra(void) {
         CHECK(vkt_issue(1, x, 1, K, id, taken) == 0, "extra: a layer past the tier's took rows");
         vkt_shutdown();
     }
+    unsetenv("COLI_VK_TIER_EXPERTS");   /* back to the armed default for the cases after */
     model_free();
 }
 
@@ -875,12 +885,14 @@ static void v4_act(void) {
             memcpy(xq, x, sizeof(float) * S * H);
             for (int s = 0; s < S; s++) qdq128(xq + (size_t)s * H, H);   /* the engine's rounding of x */
             int n = vkt_issue_w(l, xq, S, K, idx, w, taken);
+            int def = S == 1 && vkt_cs_armed();   /* the armed default defers: the finish site's group (the engine's order) */
+            int grp = def ? vkt_issue_group(l, xq, S, K, idx, w, NULL, taken) : 0;
             for (int i = 0; i < S * K; i++) {
                 if (taken[i]) continue;
                 expert_v4(&ex[l][idx[i]], xq + (size_t)(i / K) * H, w[i], limit, cpu + (size_t)i * H);
                 VktExpertSrc src = src_of(&ex[l][idx[i]]); vkt_note(l, idx[i], &src);
             }
-            int joined = n ? vkt_join(rows) : 1;
+            int joined = grp ? vkt_join(rows) : (def ? 1 : (n ? vkt_join(rows) : 1));
             CHECK(joined, "v4: join failed");
             for (int s = 0; s < S; s++)
                 for (int k = 0; k < K; k++) {
@@ -971,6 +983,8 @@ static double stream_step(int layer, int S, const int *idx, const float *w, int 
     for (int i = 0; i < S * K; i++) res[i] = (uint8_t)vkt_resident(layer, idx[i]);
     if (prefetch) vkt_stream_prefetch(layer, S);
     int n = v4 ? vkt_issue_w(layer, xq, S, K, idx, w, taken) : vkt_issue(layer, xq, S, K, idx, taken);
+    int def = S == 1 && vkt_cs_armed();   /* the armed default defers: the finish site's group (the engine's order) */
+    int grp = def ? vkt_issue_group(layer, xq, S, K, idx, v4 ? w : NULL, NULL, taken) : 0;
     for (int i = 0; i < S * K; i++) {
         if (taken[i]) continue;
         if (v4) expert_v4(&ex[layer][idx[i]], xq + (size_t)(i / K) * H, w[i], 10.0f, cpu + (size_t)i * H);
@@ -978,7 +992,7 @@ static double stream_step(int layer, int S, const int *idx, const float *w, int 
         VktExpertSrc s = src_of(&ex[layer][idx[i]]); vkt_note(layer, idx[i], &s);
         (*kept)++;
     }
-    int joined = n ? vkt_join(dev) : 1;
+    int joined = grp ? vkt_join(dev) : (def ? 1 : (n ? vkt_join(dev) : 1));
     CHECK(joined, "stream: join failed");
     double worst = 0;
     for (int s = 0; s < S; s++)
@@ -1303,8 +1317,10 @@ static void decode_grow(int dg) {
     CHECK(strstr(line, "decode grow: 3 installed by decode-only rank (cutoff 30)"), "dgrow B: the report's growth clause");
     vkt_shutdown();
     unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS"); unsetenv("COLI_VK_TIER_FILL");
-    /* --- leg C: the default -- the env unset, nothing grows --- */
-    unsetenv("COLI_VK_TIER_DECODE_GROW"); unsetenv("COLI_VK_TIER_DECODE_GROW_GB");
+    /* --- leg C: the off half -- the growth is the DEFAULT since gap-wave4, so the
+     * "nothing grows" invariant is the =0 hatch's (and COLI_VK_LEGACY=1's: same
+     * resolution, backend_vulkan.h's policy) --- */
+    setenv("COLI_VK_TIER_DECODE_GROW", "0", 1); unsetenv("COLI_VK_TIER_DECODE_GROW_GB");
     unsetenv("COLI_VK_TIER_DECODE_GROW_RESERVE_GB");
     set_budget(6, f, f);
     vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
@@ -1321,9 +1337,9 @@ static void decode_grow(int dg) {
         }
     vkt_settle();
     report_line(line, sizeof line);
-    printf("  decode grow C (default off): residents %d after the same decode sequence, no growth clause\n", dg_res());
-    CHECK(dg_res() == 6, "dgrow C: the default grew (%d residents)", dg_res());
-    CHECK(!strstr(line, "decode grow:"), "dgrow C: the default printed a growth clause");
+    printf("  decode grow C (the =0 hatch): residents %d after the same decode sequence, no growth clause\n", dg_res());
+    CHECK(dg_res() == 6, "dgrow C: the =0 hatch grew (%d residents)", dg_res());
+    CHECK(!strstr(line, "decode grow:"), "dgrow C: the =0 hatch printed a growth clause");
     vkt_shutdown();
     if (dg) {   /* the dgrow invocation's own legs -- see the case's comment above */
         /* --- legs D-F: COLI_VK_TIER_DECODE_GROW_HEADROOM -- the live guard owns the free
@@ -2473,13 +2489,15 @@ static double sum_step(int layer, int S, const int *idx, const float *w, Books *
     uint8_t *taken = malloc((size_t)S * K); const float **dev = malloc(sizeof(*dev) * S * K);
     for (int i = 0; i < S * H; i++) x[i] = frnd();
     int n = vkt_issue_w(layer, x, S, K, idx, w, taken);
+    int def = S == 1 && vkt_cs_armed();   /* the armed default defers: the finish site's group (the engine's order) */
+    int grp = def ? vkt_issue_group(layer, x, S, K, idx, w, NULL, taken) : 0;
     for (int i = 0; i < S * K; i++) {
         if (taken[i]) continue;
         expert_ref(&ex[layer][idx[i]], x + (size_t)(i / K) * H, cpu + (size_t)i * H);
         VktExpertSrc s = src_of(&ex[layer][idx[i]]); vkt_note(layer, idx[i], &s);
     }
     const float *sum = NULL;
-    int joined = n ? vkt_join_sum(dev, w, &sum) : 1;
+    int joined = grp ? vkt_join_sum(dev, w, &sum) : (def ? 1 : (n ? vkt_join_sum(dev, w, &sum) : 1));
     CHECK(joined, "grouped: join failed");
     double worst = 0;
     for (int s = 0; s < S; s++)
@@ -2716,7 +2734,9 @@ static void cs_group_v4(int armed) {
     uint32_t hist[L][E], *rows[L];
     for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = 0; }
     hist[0][0] = 100; hist[0][1] = 90;   /* two resident places: layer 0's experts 0 and 1 */
-    if (armed) setenv("COLI_VK_TIER_EXPERTS", "1", 1); else unsetenv("COLI_VK_TIER_EXPERTS");
+    /* gap-wave4: the unarmed half pins =0 -- unset is the ARMED default now, and a
+     * deferred step without its finish-site group leaves the residents' rows unjoined */
+    if (armed) setenv("COLI_VK_TIER_EXPERTS", "1", 1); else setenv("COLI_VK_TIER_EXPERTS", "0", 1);
     setenv("COLI_VK_TIER_SYNC", "1", 1);
     setenv("COLI_VK_TIER_RATE", "64", 1);
     set_budget(2, f, f);
@@ -2769,7 +2789,7 @@ static void cs_group_i8(int armed) {
     uint32_t hist[L][E], *rows[L];
     for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = 0; }
     hist[0][0] = 100; hist[0][1] = 90; hist[0][2] = 80;   /* three resident places: the whole routed set */
-    if (armed) setenv("COLI_VK_TIER_EXPERTS", "1", 1); else unsetenv("COLI_VK_TIER_EXPERTS");
+    if (armed) setenv("COLI_VK_TIER_EXPERTS", "1", 1); else setenv("COLI_VK_TIER_EXPERTS", "0", 1);   /* gap-wave4: the unarmed half pins =0 (unset arms) */
     setenv("COLI_VK_TIER_SYNC", "1", 1);
     setenv("COLI_VK_TIER_RATE", "64", 1);
     set_budget(3, f, f);
@@ -3629,6 +3649,7 @@ static void pool_layer(void) {
 static unsigned long long hy_pairs(const char *line);   /* below: the report's hybrid pairs */
 static void model_hybrid_case(void) {
     enum { MH = 4096, MF = 2048, ME = 8, MK = 6, GS = 32 };   /* the model's geometry, a layer's slice */
+    setenv("COLI_VK_TIER_EXPERTS", "0", 1);   /* gap-wave4: the hybrid classification is the case's subject; the armed compute site skips it at rows-1 */
     const float limit = 10.0f;
     static const float lut[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
     static const VktFmt mf = {VKT_SRC_MXFP4_E8M0, GS};
@@ -3742,6 +3763,7 @@ static void model_hybrid_case(void) {
     }
 free_model:
     for (int e = 0; e < ME; e++) { free(m[e].gc); free(m[e].uc); free(m[e].dc); free(m[e].gs); free(m[e].us); free(m[e].ds); }
+    unsetenv("COLI_VK_TIER_EXPERTS");   /* gap-wave4: the hybrid pin lifts */
 }
 
 /* A pool short of every expert, promotions on (COLI_VK_TIER_PROMOTE): a routed pooled
@@ -3947,6 +3969,7 @@ static void host_pairs_case(double tol) {
     }
 }
 static void hybrid_case(VktFmt gu, VktFmt dn, const char *nm) {
+    setenv("COLI_VK_TIER_EXPERTS", "0", 1);   /* gap-wave4: the hybrid classification is the case's subject; the armed compute site skips it at rows-1 */
     const int H0 = H, F0 = F;
     H = 512; F = 256;   /* whole blocks of 256 */
     const int blk = gu.kind >= VKT_SRC_GGML;
@@ -4002,6 +4025,7 @@ static void hybrid_case(VktFmt gu, VktFmt dn, const char *nm) {
     setenv("COLI_VK_TIER_HOST", "0", 1);
     model_free();
     H = H0; F = F0;
+    unsetenv("COLI_VK_TIER_EXPERTS");   /* gap-wave4: the hybrid pin lifts */
 }
 
 /* DeepSeek V4's expert in the hybrid: MXFP4 ue8m0 experts, four on the device and the rest
@@ -4011,6 +4035,7 @@ static void hybrid_case(VktFmt gu, VktFmt dn, const char *nm) {
  * one close; then the same steps with COLI_VK_HYBRID=0. */
 static void v4_hybrid_case(void) {
     VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    setenv("COLI_VK_TIER_EXPERTS", "0", 1);   /* gap-wave4: the hybrid classification is the case's subject; the armed compute site skips it at rows-1 */
     model_make(f, f);
     const float limit = 10.0f;
     const double eb = (double)vkt_expert_bytes(H, F, f, f) / 1073741824.0;
@@ -4072,6 +4097,7 @@ static void v4_hybrid_case(void) {
     unsetenv("COLI_VK_TIER_HOST_GB"); unsetenv("COLI_VK_TIER_SYNC");
     setenv("COLI_VK_TIER_HOST", "0", 1);
     model_free();
+    unsetenv("COLI_VK_TIER_EXPERTS");   /* gap-wave4: the hybrid pin lifts */
 }
 
 /* the report's ", and S prompt steps' P pairs": P, 0 without the part */
@@ -4470,9 +4496,22 @@ static void packed_scales(int bytes) {
  * dynamic offsets and the pick itself -- and, without the lever, that nothing armed. */
 static void s1gemv_case(int leg) {
     if (!leg) {
+        /* gap-wave4: unset ARMS the kernel (the parity gate is the lever's own probe),
+         * so the off-state invariants are the explicit halves': COLI_VK_V4_S1GEMV=0
+         * and COLI_VK_LEGACY=1 (vk-tier-check's legacy leg runs them) assert the
+         * nothing-armed/no-dispatch pair, the unset default the armed kernel */
         ColiVkXbStats st; coli_vk_xb_stats(&st);
-        CHECK(!coli_vk_xb_s1gemv_armed(0), "s1gemv: armed without the lever");
-        CHECK(st.s1_gemvs == 0, "s1gemv: %llu dispatches without the lever", st.s1_gemvs);
+        const char *e = getenv("COLI_VK_V4_S1GEMV");
+        int off = (e && *e && !atoi(e)) || coli_vk_legacy();
+        if (off) {
+            CHECK(!coli_vk_xb_s1gemv_armed(0), "s1gemv: armed with the lever off");
+            CHECK(st.s1_gemvs == 0, "s1gemv: %llu dispatches with the lever off", st.s1_gemvs);
+        } else {
+            CHECK(coli_vk_xb_s1gemv_armed(0),
+                  "s1gemv: the unset default armed nothing (shader absent or the parity leg refused)");
+            printf("  %-44s the default armed the kernel (%llu dispatches so far)\n",
+                   "MXFP4 ue8m0 S=1 down: the default arm", st.s1_gemvs);
+        }
         return;
     }
     int h0 = H, f0 = F;
@@ -4511,11 +4550,13 @@ static void s1gemv_case(int leg) {
                 for (int i = 0; i < S * H; i++) xq[i] = frnd() * 4.0f;
                 for (int s = 0; s < S; s++) qdq128(xq + (size_t)s * H, H);
                 int nq = vkt_issue_w(l, xq, S, K, idx, w, taken);
+                int def = S == 1 && vkt_cs_armed();   /* the armed default defers: the finish site's group (the engine's order) */
+                int grp = def ? vkt_issue_group(l, xq, S, K, idx, w, NULL, taken) : 0;
                 for (int i = 0; i < S * K; i++) {   /* the engine's share: the tier learns these bytes (v4_act's flow) */
                     if (taken[i]) continue;
                     VktExpertSrc src = src_of(&ex[l][idx[i]]); vkt_note(l, idx[i], &src);
                 }
-                int joined = nq ? vkt_join(rows) : 1;
+                int joined = grp ? vkt_join(rows) : (def ? 1 : (nq ? vkt_join(rows) : 1));
                 CHECK(joined, "s1gemv: join failed (arm %d)", arm);
                 for (int i = 0; i < S * K; i++) {
                     if (!arm) {

@@ -176,6 +176,7 @@
 #define COLI_VK_TIER_H
 #include <stdint.h>
 #include <stddef.h>
+#include "vk_policy.h"   /* the default-on levers' env resolution (the engine's store unit reads it through this header) */
 
 typedef enum {
     VKT_SRC_NONE = 0,

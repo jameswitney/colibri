@@ -2790,6 +2790,11 @@ tests/test_vk_degrade$(EXE): tests/test_vk_degrade.c $(VK_OBJ)
 # the s1gemv case A/Bs the same rows through the generic and the dedicated kernel bit
 # for bit -- on top of the arm's own in-init parity leg (xb_s1gemv_parity), which
 # refuses the arm on any bit difference.
+# The ninth (`COLI_VK_LEGACY=1`) runs the whole suite at the upstream-base hatch:
+# every gap-wave4 default lever off (the s1gemv case's off half asserts the
+# not-armed/no-dispatch pair there), the cases that arm a lever explicitly still arm
+# it (an explicit env always wins over the hatch) -- the byte-comparable base leg
+# the strict gate's equivalence cases lean on.
 # The routed-expert tier on a CUDA device (cu_tier.h) against a CPU reference.
 tests/test_cu_tier$(EXE): tests/test_cu_tier.c $(CUDA_OBJ)
 	@case "$(CUDA_OBJ)" in *cu_tier.o*) ;; *) echo "tests/test_cu_tier needs CUDA=1 (or HIP=1)" >&2; exit 1 ;; esac
@@ -2807,6 +2812,7 @@ vk-tier-check: tests/test_vk_tier$(EXE) tests/test_deepseek_v4$(EXE)
 	COLI_VK_TIER_PILOT=1 COLI_VK_TIER_PILOT_DEPTH=1 ./tests/test_deepseek_v4$(EXE) pilot
 	COLI_VK_TIER_EXPERTS=1 COLI_VK_V4_DECODE_PATH=fork ./tests/test_deepseek_v4$(EXE) forkdec shaders/qmatmul.spv
 	COLI_VK_V4_S1GEMV=1 ./tests/test_vk_tier$(EXE) shaders/qmatmul.spv s1gemv
+	COLI_VK_LEGACY=1 ./tests/test_vk_tier$(EXE) shaders/qmatmul.spv
 
 # The dense chain's ops (vk_chain.c, shaders/chain_*.comp) against CPU references, on
 # a Vulkan device (CI: Lavapipe); like test_vk_tier it needs VK=1 and stays out of

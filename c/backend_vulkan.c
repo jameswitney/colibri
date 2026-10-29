@@ -2733,6 +2733,7 @@ static struct {
     long block_mb;           /* the block size asked for (env), what the driver allows */
     uint32_t memtype;
     int state;               /* 0 unset, 1 armed, -1 refused (ladder: malloc path) */
+    int announced;           /* the ONE engaged line said (the store line or the first slab) */
     unsigned long long nslabs, nblocks, nrefused;
 } g_slabreg = {.mx = PTHREAD_MUTEX_INITIALIZER};
 static size_t slabreg_heap_room(void) {
@@ -2744,16 +2745,33 @@ static size_t slabreg_heap_room(void) {
     if (!room || room > size) room = size;
     return room - g_slabreg.bytes > room ? 0 : room - g_slabreg.bytes;
 }
+/* The fork lever's ONE engaged line. The store's plan line prints it when the probe
+ * ran at store open (the usual path, vkt_forkdec_store_line -- it carries the arena
+ * and slot plan beside the registry's own numbers); a first slab reaching the
+ * registry before that (no store line, tests) prints it here. Exactly one line per
+ * outcome: armed here or at the store line, refused in slabreg_arm, legacy at the
+ * lever's wanted() resolution (gap-wave4's boot contract). */
+static void slabreg_announce(void) {
+    if (g_slabreg.announced) return;
+    g_slabreg.announced = 1;
+    fprintf(stderr, "[VK] slab registry armed: block=%ldMiB cap=%.2fGiB memtype=%u%s\n",
+            g_slabreg.block_mb, g_slabreg.cap / 1073741824.0, g_slabreg.memtype,
+            G.has_bda ? " storage+device-address" : "");
+}
 static int slabreg_arm(void) {
     if (g_slabreg.state) return g_slabreg.state > 0;
+    if (!G.ready) return 0;   /* not up yet: never memoize a pre-device read (the store line probes here) */
     g_slabreg.state = -1;
-    if (!G.ready || G.memtype_sys < 0) return 0;   /* no coherent system-RAM type: ladder step 2 */
-    g_slabreg.memtype = (uint32_t)G.memtype_sys;
+    const char *why = NULL;   /* the refusal's reason: the lever's ONE refused line (gap-wave4) */
+    if (G.memtype_sys < 0) why = "no coherent non-device-local system-RAM memory type (unified memory?)";
+    g_slabreg.memtype = (uint32_t)(G.memtype_sys >= 0 ? G.memtype_sys : 0);
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
-    VkMemoryPropertyFlags fl = mp.memoryTypes[g_slabreg.memtype].propertyFlags;
-    if ((fl & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) !=
-        (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) return 0;
+    VkMemoryPropertyFlags fl = G.memtype_sys >= 0 ? mp.memoryTypes[g_slabreg.memtype].propertyFlags : 0;
+    if (!why &&
+        (fl & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) !=
+        (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+        why = "the system-RAM type is not host-visible and coherent";
     const char *bm = getenv("COLI_VK_V4_SLAB_BLOCK_MB");
     long mb = bm && *bm ? atol(bm) : 2048;
     if (mb < 16) mb = 16;
@@ -2767,18 +2785,22 @@ static int slabreg_arm(void) {
     }
     if ((uint64_t)mb << 20 > max_alloc) mb = (long)(max_alloc >> 20);
     g_slabreg.block_mb = mb;
-    uint32_t hi = mp.memoryTypes[g_slabreg.memtype].heapIndex;
-    size_t room = slabreg_heap_room();
+    uint32_t hi = G.memtype_sys >= 0 ? mp.memoryTypes[g_slabreg.memtype].heapIndex : 0;
+    size_t room = why ? 0 : slabreg_heap_room();
     size_t heap_frac = (size_t)mp.memoryHeaps[hi].size / 8 * 7;   /* never past 7/8 of the heap: the probe's overcommit */
     if (room > heap_frac) room = heap_frac;
     const char *ag = getenv("COLI_VK_V4_SLAB_ARENA_GB");
     double gb = ag && *ag ? atof(ag) : 0;
     if (gb > 0) { size_t want = (size_t)(gb * 1073741824.0); if (room > want) room = want; }
+    if (!why && room < (size_t)16 << 20)
+        why = "the system heap has no room for one minimum block (the budget's heapUsage already counts the arena)";
+    if (why) {
+        g_slabreg.cap = 0;
+        fprintf(stderr, "[VK] slab registry refused: %s -- decode-path=fork's slots keep the malloc/import path\n", why);
+        return 0;
+    }
     g_slabreg.cap = room;
     g_slabreg.state = 1;
-    fprintf(stderr, "[VK] slab registry armed: block=%ldMiB cap=%.2fGiB memtype=%u%s\n",
-            g_slabreg.block_mb, g_slabreg.cap / 1073741824.0, g_slabreg.memtype,
-            G.has_bda ? " storage+device-address" : "");
     return 1;
 }
 int coli_vk_slabreg_alloc(size_t bytes, void **host_out, ColiVkSlabReg **reg_out) {
@@ -2796,6 +2818,7 @@ int coli_vk_slabreg_alloc(size_t bytes, void **host_out, ColiVkSlabReg **reg_out
     size_t need = ((size_t)req.size + align - 1) / align * align;
     pthread_mutex_lock(&g_slabreg.mx);
     if (!slabreg_arm()) goto refuse;
+    slabreg_announce();   /* no store line ran first (tests): the first slab says the engaged line */
     if (g_slabreg.bytes + need > g_slabreg.cap) goto refuse;   /* the arena cap (ladder: fewer registry slots) */
     SlabRegBlock *b = g_slabreg.blocks;
     while (b && b->cap - b->used < need) b = b->next;
@@ -2878,10 +2901,36 @@ size_t coli_vk_slabreg_bytes(void) {
 int coli_vk_slabreg_wanted(void) {
     static int w;
     if (!w) {
+        /* gap-wave4: fork is the default decode path -- unset arms it, an explicit
+         * value always wins ("fork" on, anything else -- =0 included -- off), and
+         * COLI_VK_LEGACY=1 turns the unset default off (the one legacy line) */
         const char *p = getenv("COLI_VK_V4_DECODE_PATH");
-        w = p && *p && !strcmp(p, "fork") ? 1 : -1;
+        const char *lg = getenv("COLI_VK_LEGACY");
+        int legacy = lg && *lg && atoi(lg) != 0;
+        w = p && *p ? (!strcmp(p, "fork") ? 1 : -1) : (legacy ? -1 : 1);
+        if (w < 0 && legacy && !(p && *p))
+            fprintf(stderr, "[VK] tier: decode-path=fork legacy (COLI_VK_LEGACY=1) -- the slots keep the malloc/import path\n");
     }
     return w > 0;
+}
+int coli_vk_slabreg_status(long *block_mb, double *cap_gib) {
+    /* the probe, for the store's engagement line: arms the registry (memoizing its
+     * state, printing its refusal line on the way) and reports its block size and
+     * arena cap -- on success the CALLER owns the one engaged line, so the first
+     * slab's own announce stays quiet. 0 only when the device is not up yet
+     * (nothing memoized, no line, the first slab announces). */
+    if (block_mb) *block_mb = 0;
+    if (cap_gib) *cap_gib = 0;
+    if (!G.ready) return 0;
+    pthread_mutex_lock(&g_slabreg.mx);
+    int st = slabreg_arm() ? 1 : -1;
+    if (st > 0) {
+        g_slabreg.announced = 1;
+        if (block_mb) *block_mb = g_slabreg.block_mb;
+        if (cap_gib) *cap_gib = (double)g_slabreg.cap / 1073741824.0;
+    }
+    pthread_mutex_unlock(&g_slabreg.mx);
+    return st;
 }
 void coli_vk_slabreg_reset(void) {
     pthread_mutex_lock(&g_slabreg.mx);
@@ -2898,6 +2947,7 @@ void coli_vk_slabreg_reset(void) {
     g_slabreg.blocks = NULL;
     g_slabreg.bytes = 0;
     g_slabreg.state = 0;
+    g_slabreg.announced = 0;
     pthread_mutex_unlock(&g_slabreg.mx);
 }
 /* The registry alias: the fork's coli_vk_tensor_alias over an arena slab -- the tensor
@@ -5898,10 +5948,12 @@ static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a,
     if (!xb_reserve(X, 64 * (size_t)D * 4 + 16 * X->align, 64 * (size_t)I * 4 + 16 * X->align,
                     64 * (size_t)D * 4 + 16 * X->align)) return 0;
     {   /* COLI_VK_V4_S1GEMV: the fork's dedicated fmt-15 S=1 GEMV on the down of a decode
-         * row. Default off; armed only past the parity leg -- a mismatch destroys the
-         * pipeline so nothing can take it, and the generic form stays (one line each). */
+         * row. The default since gap-wave4: unset arms it behind the parity leg (a
+         * mismatch destroys the pipeline so nothing can take it, and the generic form
+         * stays -- one line each way); =0 keeps the generic form, and COLI_VK_LEGACY=1
+         * turns the unset default off with the lever's one legacy line. */
         const char *s1 = getenv("COLI_VK_V4_S1GEMV");
-        if (s1 && atoi(s1)) {
+        if (coli_vk_env_int("COLI_VK_V4_S1GEMV", 1)) {
             char s1_path[1100];
             derive_dir_file(X->spv, "qmatmul_s1_mx.spv", s1_path, sizeof s1_path);
             X->sh_s1 = load_spv(X->dev, s1_path);
@@ -5918,7 +5970,8 @@ static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a,
                                X->d ? " (dev2)" : "");
                 X->p_s1 = VK_NULL_HANDLE;
             }
-        }
+        } else if (coli_vk_legacy() && !(s1 && *s1))
+            fprintf(stderr, "[VK] tier s1gemv: legacy (COLI_VK_LEGACY=1) -- the generic GEMV\n");
     }
     if (act == COLI_VK_ACT_SWIGLU_V4 && !xb_v4_init(X)) return 0;
     X->ready = 1;

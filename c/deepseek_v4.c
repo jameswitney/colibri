@@ -10102,9 +10102,9 @@ static int hot_rows16_wanted(void) {
          * view of a repacked slab would read garbage (the alias-layout hazard), so the
          * arm carries the COLI_V4_ROWS16=0 valve's rule at launch; the armed leg loses
          * the rows16 kernel's speed on the CPU fallback and the prefill host-MoE, a
-         * priced cost, not a silent one */
-        const char *cs = getenv("COLI_VK_TIER_EXPERTS");
-        if (cs && *cs && atoi(cs) > 0) rows16 = 0;
+         * priced cost, not a silent one. The arm reads with the default-on policy
+         * (gap-wave4): unset EXPERTS is 1, =0 and COLI_VK_LEGACY=1 leave it off */
+        if (coli_vk_env_int("COLI_VK_TIER_EXPERTS", 1) > 0) rows16 = 0;
     }
     return rows16;
 }

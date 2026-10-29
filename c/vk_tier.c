@@ -3170,8 +3170,10 @@ int vkt_forkdec_wanted(void) {
     if (!w) {
         w = -1;
         if (coli_vk_slabreg_wanted()) {
-            const char *xe = getenv("COLI_VK_TIER_EXPERTS");
-            int csx = xe && *xe ? atoi(xe) : 0;
+            /* EXPERTS reads with the default-on policy (gap-wave4): unset is 1, so the
+             * gate's refusal line below fires only on an explicit 0 (or a =2 without
+             * its headroom) -- the compute site is the alias's consumer either way */
+            int csx = coli_vk_env_int("COLI_VK_TIER_EXPERTS", 1);
             if (csx == 1 || csx == 2) w = 1;
             else fprintf(stderr, VKT_TAG " tier: COLI_VK_V4_DECODE_PATH=fork needs COLI_VK_TIER_EXPERTS=1; the forked decode path stays off, slots keep the malloc/import path\n");
         }
@@ -3188,10 +3190,18 @@ void vkt_slabreg_slot_free(void *reg, void *host) {
     if (reg) coli_vk_slabreg_free((ColiVkSlabReg *)reg);
 }
 void vkt_forkdec_store_line(int slots, size_t slab_bytes) {
-    if (!vkt_forkdec_wanted()) return;
-    fprintf(stderr, VKT_TAG " tier %s: decode-path=fork arena=%.2fGiB slabs=%d slab=%.2fMiB\n",
-            T.engine, (double)slots * (double)slab_bytes / 1073741824.0, slots,
-            slab_bytes / 1048576.0);
+    if (!vkt_forkdec_wanted()) return;   /* legacy and the EXPERTS gate said their one line */
+    /* the lever's ONE engaged line, over the plan just sized and the registry's probe:
+     * armed (the plan is real -- the arena takes these slots) or the probe's refusal
+     * line already said the slots keep the malloc path (nothing printed here) */
+    long bm = 0; double cap = 0;
+    if (coli_vk_slabreg_status(&bm, &cap) < 0) return;
+    fprintf(stderr, VKT_TAG " tier %s: decode-path=fork arena=%.2fGiB slabs=%d slab=%.2fMiB engaged", T.engine,
+            (double)slots * (double)slab_bytes / 1073741824.0, slots, slab_bytes / 1048576.0);
+    if (bm > 0)
+        fprintf(stderr, " (registry block=%ldMiB cap=%.2fGiB)", bm, cap);
+    else fprintf(stderr, " (registry arms at the first slab)");
+    fprintf(stderr, "\n");
 }
 
 /* One aliased expert over its imported slab: CS-1a's capability, VktAliasSrc's three
@@ -4370,37 +4380,44 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         T.pool_layer = po && *po ? atoi(po) : -1;
         const char *bk = getenv("COLI_VK_TIER_BANK_LAYER");
         T.bank_layer = bk && *bk ? atoi(bk) : -1;
-        /* decode growth: off unless asked; the cap and the reserve are its own knobs
+        /* decode growth: the DEFAULT since gap-wave4 (unset arms it, =0 off,
+         * COLI_VK_LEGACY=1 off with one line); the cap and the reserve are its own knobs
          * (COLI_VK_TIER_DECODE_GROW_GB bounds the whole growth, free VRAM and retired
          * slots together; _RESERVE_GB is what the probe leaves for what still allocates
          * at decode -- the KV's growth, scratch, the driver: the big pre-decode masses
          * are inside the probe already) */
         const char *dge = getenv("COLI_VK_TIER_DECODE_GROW");
-        T.dgrow = dge && *dge && atoi(dge) != 0 ? 1 : 0;
+        T.dgrow = coli_vk_env_int("COLI_VK_TIER_DECODE_GROW", 1) != 0;
+        if (!T.dgrow && coli_vk_legacy() && !(dge && *dge))
+            fprintf(stderr, VKT_TAG " tier %s: decode grow: legacy (COLI_VK_LEGACY=1) -- the warm set stands\n", eng);
         if (T.dgrow) {
             const char *ce = getenv("COLI_VK_TIER_DECODE_GROW_GB");
             T.dgrow_cap = ce && *ce && atof(ce) > 0 ? (size_t)(atof(ce) * 1073741824.0) : 0;
-            /* headroom: the growth's free places are the live guard's, not the one-time
+            /* headroom: the DEFAULT with the growth (unset arms it); the growth's free
+             * places are the live guard's, not the one-time
              * probe's; the target (_TARGET, the fork's gpu_cap class) is the residents'
              * count it may grow to -- W2 grew 0 free places (the budget full at the arm)
              * and only recycled slots while the card had room the probe never re-read */
-            const char *he = getenv("COLI_VK_TIER_DECODE_GROW_HEADROOM");
-            T.dgrow_head = he && *he && atoi(he) != 0 ? 1 : 0;
+            T.dgrow_head = coli_vk_env_int("COLI_VK_TIER_DECODE_GROW_HEADROOM", 1) != 0;
             if (T.dgrow_head) {
                 const char *te = getenv("COLI_VK_TIER_DECODE_GROW_TARGET");
                 T.dgrow_target = te && *te ? atoi(te) : 0;
                 if (T.dgrow_target < 0) T.dgrow_target = 0;
             }
         }
-        /* the compute site (CS-1b): off unless asked. 1 moves decode's routed-expert
-         * compute out of the engine's serial CPU loop into the tier's ONE expert-batch
-         * group, issued at the token's finish site -- the residents' cached handles
-         * beside zero-copy fmt-15 aliases of the store's host slabs (CS-1a's import),
-         * rows16 packing off at store open while armed. 2 is 1 composed with the growth
-         * machinery (the arm needs COLI_VK_TIER_DECODE_GROW_HEADROOM's levers landed and
-         * armed; no second growth mechanism, no second guard). */
+        /* the compute site (CS-1b): the DEFAULT since gap-wave4 (unset is 1; =0 the
+         * per-lever escape hatch; COLI_VK_LEGACY=1 off with one line). 1 moves decode's
+         * routed-expert compute out of the engine's serial CPU loop into the tier's
+         * ONE expert-batch group, issued at the token's finish site -- the residents'
+         * cached handles beside zero-copy fmt-15 aliases of the store's host slabs
+         * (CS-1a's import), rows16 packing off at store open while armed. 2 is 1
+         * composed with the growth machinery (the arm needs
+         * COLI_VK_TIER_DECODE_GROW_HEADROOM's levers landed and armed; no second
+         * growth mechanism, no second guard). */
         const char *xe = getenv("COLI_VK_TIER_EXPERTS");
-        T.csx = xe && *xe ? atoi(xe) : 0;
+        { int v = coli_vk_env_int("COLI_VK_TIER_EXPERTS", 1); T.csx = v == 2 ? 2 : v != 0; }
+        if (!T.csx && coli_vk_legacy() && !(xe && *xe))
+            fprintf(stderr, VKT_TAG " tier %s: cs experts: legacy (COLI_VK_LEGACY=1) -- the serial CPU loop\n", eng);
         if (T.csx != 1 && T.csx != 2) T.csx = 0;
         if (T.csx == 2 && !(T.dgrow && T.dgrow_head)) {
             fprintf(stderr, VKT_TAG " tier %s: COLI_VK_TIER_EXPERTS=2 is the growth composition and needs COLI_VK_TIER_DECODE_GROW_HEADROOM armed with it; the compute site stays off\n", eng);
@@ -4728,7 +4745,9 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     if (dprof && T.d_routed)   /* COLI_VK_CHAIN_DPROF: the decode steps' wait/device/CPU split, promote's bytes */
         fprintf(stderr, " | decode dprof: waited %.1f ms, device %.1f ms, CPU %.1f ms, promoted %.1f MiB",
                 T.d_wait_ms, T.d_dev_ms, T.d_cpu_ms, (double)T.d_up_bytes / 1048576.0);
-    if (T.cs_groups) {   /* COLI_VK_TIER_EXPERTS: the finish-site group's own books (one group a layer-token) */
+    if (T.cs_groups || T.cs_refuse) {   /* COLI_VK_TIER_EXPERTS: the finish-site group's own books (one group a layer-token);
+                                   * cs_refuse alone still prints -- a run whose every alias refused (no import
+                                   * alignment, an import cap hit) must not lose its refusal count to silence */
         fprintf(stderr, " | cs: %llu groups, %llu resident + %llu aliased entries on the device, %llu cpu-fallback (%llu alias refusals",
                 T.cs_groups, T.cs_res, T.cs_alias, T.cs_fallback, T.cs_refuse);
         if (T.cs_fork)   /* COLI_VK_V4_DECODE_PATH=fork: how many of the aliased came off the registry (no import) */
