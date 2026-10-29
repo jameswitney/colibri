@@ -1219,7 +1219,11 @@ static void vk_strict_boot(void) {   /* one line per process, before any early r
 enum { PROF_NONE = 0, PROF_TTFT, PROF_DECODE, PROF_BALANCED, PROF_STAGE };
 static const char *const prof_ttft[] = {
     "COLI_VK_MM8", "1", "COLI_VK_CHAIN_GEMM_ROWS", "-1",
-    "COLI_VK_TIER_STREAM_SLOTS", "256", "COLI_VK_TIER_GEMM_ROWS", "4", NULL };
+    "COLI_VK_TIER_STREAM_SLOTS", "256", "COLI_VK_TIER_GEMM_ROWS", "4",
+    /* the measured prefill shape (the gap2/gap3 arms): without the chunk cap the
+     * planner steps 128 rows a window -- 860 sub-batch round trips, the defaults
+     * leg's 461 s TTFT class; with it the 1,792-row windows (146-156 s) */
+    "COLI_VK_CHAIN_ROWS_MAX", "2048", "COLI_VK_TIER_STREAM_BYPASS", "1", NULL };
 static const char *const prof_decode[] = {
     "COLI_VK_MM8", "1", "COLI_VK_TIER_HOST_GB", "8", "COLI_VK_TIER_PROMOTE", "32", NULL };
 static const char *const prof_balanced[] = {
@@ -1251,14 +1255,12 @@ static int prof_knob(void) {
         snprintf(prof_named, sizeof prof_named, "%s", !strcmp(e, "auto") ? "auto" : "RDNA2");
     }
     if (!e && k == PROF_NONE && !getenv("COLI_VK_LEGACY")) {
-        /* wave-4 default: the measured perf levers arm unset, and their arming shape
-         * (the prefill stream, the chunking, the GEMM row rules) is the stage preset --
-         * without it the kept-rows rule strands 83k prefill rows on the CPU (the gap4
-         * defaults leg: TTFT 438.7 s vs 156.9 with it). Opt out with COLI_VK_PROFILE=0
-         * or the whole-stack COLI_VK_LEGACY=1. */
-        k = PROF_STAGE;
-        snprintf(prof_named, sizeof prof_named, "%s", "RDNA2(default)");
-        fprintf(stderr, "[VK] profile: the stage preset arms by default (COLI_VK_PROFILE=0 or COLI_VK_LEGACY=1 opts out)\n");
+        /* wave-4 NOTE: the stage preset does NOT arm by default yet -- the preset's
+         * knobs (STREAM_SLOTS/GEMM_ROWS/BYPASS/ROWS_MAX) reshape every tier test
+         * case's geometry and need the fmt-15-class expectations sweep first (the
+         * gap4 bench: levers-default-without-profile = 461 s TTFT; +PROFILE=RDNA2
+         * = the measured 146-156 s shape). The six levers default on; the profile
+         * stays the one documented opt-in that completes the shape. */
     }
     if (e && strcmp(e, "0") && k == PROF_NONE)
         fprintf(stderr, "[VK] profile: COLI_VK_PROFILE=%s is not one of RDNA2, ttft, decode, balanced, auto; nothing set\n", e);

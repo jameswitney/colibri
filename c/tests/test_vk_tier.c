@@ -4641,6 +4641,9 @@ static void s1gemv_case(int leg) {
  * A device that is staged on its own account (no Resizable BAR, COLI_VK_HOST_VISIBLE_CAP_MB) never gets to the
  * probe: the case skips the rows that want the mapped path. */
 static void window_case(const char *spv) {
+    /* the window probe's mechanics predate the wave-4 profile default; the preset's
+     * STREAM_BYPASS changes the staging decision this case measures -- pin it off */
+    setenv("COLI_VK_PROFILE", "0", 1);
     /* probe: COLI_VK_WINDOW_PROBE_MB, the answer without asking; ask: COLI_VK_WINDOW_ASK_MB, how much the real loop asks;
      * cap: COLI_VK_DEVICE_CAP_MB, which refuses the blocks past it as a full card does */
     static const struct { const char *staged, *probe, *ask, *cap; int want; const char *what; } t[] = {
