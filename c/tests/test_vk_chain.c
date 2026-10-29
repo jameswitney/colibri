@@ -5205,8 +5205,14 @@ int main(int argc, char **argv) {
     else CHECK(0, "inkling's ops: chain_sconv.spv or chain_relattn.spv did not load");
     if (!vkc_dsv4_ready()) { fails++; printf("FAIL: the DeepSeek V4 shader did not load\n"); }
     else {
+        /* gap-wave4: the mode-0 reference legs pin COLI_VK_CHAIN_ATTN_FA=0 -- the
+         * default arms the tile, and these legs' shapes all refuse it (head dim, head
+         * count, unaligned offsets), so they ran mode 0 by accident of shape; the pin
+         * makes the reference the construction, not the gate's side effect */
+        setenv("COLI_VK_CHAIN_ATTN_FA", "0", 1);
         test_ds_attn(1, 4, 64, 8, 5, 13, 0); test_ds_attn(3, 2, 512, 128, 40, 300, 0); test_ds_attn(2, 3, 100, 6, 9, 20, 0);
         test_ds_attn(2, 2, 64, 8, 12, 2900, 0); test_ds_attn(3, 4, 64, 8, 5, 13, 1);
+        unsetenv("COLI_VK_CHAIN_ATTN_FA");
         {   /* the flash tile's oracle (COLI_VK_CHAIN_ATTN_FA), the stream kept for the rest */
             unsigned keep = rng;
             VkcStats s0; vkc_stats(&s0);
@@ -5214,7 +5220,7 @@ int main(int argc, char **argv) {
             test_ds_attn_fa(1, 8, 128, 64, 640, 0, 1);      /* the V4.1 class (no bf16 rounds) */
             test_ds_attn_fa(3, 16, 128, 40, 300, 1, 1);     /* the prefill tile over dead entries and both row kinds */
             test_ds_attn_fa(2, 8, 6, 9, 20, 1, 2);          /* the fp32 arm */
-            test_ds_attn(1, 4, 64, 8, 5, 13, 1);            /* a shape the tile refuses: mode 0 under the armed lever */
+            test_ds_attn(1, 4, 64, 8, 5, 13, 1);            /* a shape the tile refuses: mode 0 under the armed lever -- the unset default since gap-wave4 */
             VkcStats s1; vkc_stats(&s1);
             CHECK(s1.attn_fa - s0.attn_fa >= 4, "dsv4 attn FA: the tile engaged (%llu of the runs)",
                   s1.attn_fa - s0.attn_fa);

@@ -246,6 +246,31 @@ static void model_make(VktFmt gu, VktFmt dn) { for (int l = 0; l < L; l++) layer
 static void model_free(void) {
     for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) { mat_free(&ex[l][e].g); mat_free(&ex[l][e].u); mat_free(&ex[l][e].d); }
 }
+/* gap-wave4: the suite pins and restores the default levers' envs parent-transparently.
+ * The strict gate's hatch case runs the suite once with every lever at =0 and once
+ * with COLI_VK_LEGACY=1 and byte-compares: a case's unsetenv would erase the caller's
+ * value, and the unset resolution then differs between the two legs (=0's parent is
+ * "off by value", LEGACY's is "off by hatch") -- so every case that touches these
+ * envs saves them at entry and restores them at exit ("" = unset). The suite's own
+ * standing between cases is whatever the caller brought, exactly as before the flip. */
+static char g_pin_experts[64], g_pin_dg[64], g_pin_dgh[64], g_pin_dgt[64], g_pin_dggb[64], g_pin_dgr[64];
+static const char *env_or_empty(const char *n) { const char *e = getenv(n); return e ? e : ""; }
+static void lever_pin_save(void) {
+    snprintf(g_pin_experts, sizeof g_pin_experts, "%s", env_or_empty("COLI_VK_TIER_EXPERTS"));
+    snprintf(g_pin_dg, sizeof g_pin_dg, "%s", env_or_empty("COLI_VK_TIER_DECODE_GROW"));
+    snprintf(g_pin_dgh, sizeof g_pin_dgh, "%s", env_or_empty("COLI_VK_TIER_DECODE_GROW_HEADROOM"));
+    snprintf(g_pin_dgt, sizeof g_pin_dgt, "%s", env_or_empty("COLI_VK_TIER_DECODE_GROW_TARGET"));
+    snprintf(g_pin_dggb, sizeof g_pin_dggb, "%s", env_or_empty("COLI_VK_TIER_DECODE_GROW_GB"));
+    snprintf(g_pin_dgr, sizeof g_pin_dgr, "%s", env_or_empty("COLI_VK_TIER_DECODE_GROW_RESERVE_GB"));
+}
+static void lever_pin_restore(void) {
+    if (g_pin_experts[0]) setenv("COLI_VK_TIER_EXPERTS", g_pin_experts, 1); else unsetenv("COLI_VK_TIER_EXPERTS");
+    if (g_pin_dg[0]) setenv("COLI_VK_TIER_DECODE_GROW", g_pin_dg, 1); else unsetenv("COLI_VK_TIER_DECODE_GROW");
+    if (g_pin_dgh[0]) setenv("COLI_VK_TIER_DECODE_GROW_HEADROOM", g_pin_dgh, 1); else unsetenv("COLI_VK_TIER_DECODE_GROW_HEADROOM");
+    if (g_pin_dgt[0]) setenv("COLI_VK_TIER_DECODE_GROW_TARGET", g_pin_dgt, 1); else unsetenv("COLI_VK_TIER_DECODE_GROW_TARGET");
+    if (g_pin_dggb[0]) setenv("COLI_VK_TIER_DECODE_GROW_GB", g_pin_dggb, 1); else unsetenv("COLI_VK_TIER_DECODE_GROW_GB");
+    if (g_pin_dgr[0]) setenv("COLI_VK_TIER_DECODE_GROW_RESERVE_GB", g_pin_dgr, 1); else unsetenv("COLI_VK_TIER_DECODE_GROW_RESERVE_GB");
+}
 static double rel(const float *a, const float *b, int n) {
     double num = 0, den = 0;
     for (int i = 0; i < n; i++) { double d = (double)a[i] - b[i]; num += d * d; den += (double)b[i] * b[i]; }
@@ -722,6 +747,7 @@ static void extra(void) {
     /* gap-wave4: the case's own subject is the extra layers' residency -- an armed
      * compute site defers their rows-1 steps too, so the =0 half pins the standing
      * path this case asserts (the unset default runs it through the cs cases) */
+    lever_pin_save();
     setenv("COLI_VK_TIER_EXPERTS", "0", 1);
     layer_make(0, fm, fm); layer_make(1, fx, fx); g_act = VKT_ACT_SWIGLU; g_limit = 0;
     size_t mb = vkt_expert_bytes(H, F, fm, fm), xb = vkt_expert_bytes(H, F, fx, fx);
@@ -804,7 +830,7 @@ static void extra(void) {
         CHECK(vkt_issue(1, x, 1, K, id, taken) == 0, "extra: a layer past the tier's took rows");
         vkt_shutdown();
     }
-    unsetenv("COLI_VK_TIER_EXPERTS");   /* back to the armed default for the cases after */
+    lever_pin_restore();   /* the caller's standing back: the armed default, or the strict legs' =0 / LEGACY=1 */
     model_free();
 }
 
@@ -1209,6 +1235,7 @@ static void bank_layer_case(void) {
 static int dg_res(void) { int n = 0; for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) n += vkt_resident(l, e); return n; }
 static void report_line(char *out, size_t n);   /* below: the tier's report line as a string */
 static void decode_grow(int dg) {
+    lever_pin_save();   /* the legs set/unset the growth envs: restore the caller's standing at exit */
     rng = 7;
     VktFmt f = {VKT_SRC_I8_ROW, 0};
     model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
@@ -2734,6 +2761,7 @@ static void cs_group_v4(int armed) {
     uint32_t hist[L][E], *rows[L];
     for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = 0; }
     hist[0][0] = 100; hist[0][1] = 90;   /* two resident places: layer 0's experts 0 and 1 */
+    lever_pin_save();
     /* gap-wave4: the unarmed half pins =0 -- unset is the ARMED default now, and a
      * deferred step without its finish-site group leaves the residents' rows unjoined */
     if (armed) setenv("COLI_VK_TIER_EXPERTS", "1", 1); else setenv("COLI_VK_TIER_EXPERTS", "0", 1);
@@ -2780,6 +2808,7 @@ static void cs_group_v4(int armed) {
     CHECK(no_nan(worst) < 2e-2, "cs v4 (%s): rows off the reference (%.3g)", armed ? "armed" : "unarmed", no_nan(worst));
     vkt_shutdown();
     for (int e = 0; e < E; e++) free(slabs[e]);
+    lever_pin_restore();
     model_free();
 }
 static void cs_group_i8(int armed) {
@@ -2789,6 +2818,7 @@ static void cs_group_i8(int armed) {
     uint32_t hist[L][E], *rows[L];
     for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = 0; }
     hist[0][0] = 100; hist[0][1] = 90; hist[0][2] = 80;   /* three resident places: the whole routed set */
+    lever_pin_save();
     if (armed) setenv("COLI_VK_TIER_EXPERTS", "1", 1); else setenv("COLI_VK_TIER_EXPERTS", "0", 1);   /* gap-wave4: the unarmed half pins =0 (unset arms) */
     setenv("COLI_VK_TIER_SYNC", "1", 1);
     setenv("COLI_VK_TIER_RATE", "64", 1);
@@ -2830,6 +2860,7 @@ static void cs_group_i8(int armed) {
  * places, and route the two hot aliases: both install, the below-cutoff alias does
  * not, and the group's rows stay on the reference. */
 static void cs_grow(void) {
+    lever_pin_save();
     rng = 7;
     VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
     model_make(f, f); g_act = VKT_ACT_SWIGLU_V4; g_limit = 10.0f;
@@ -2890,6 +2921,7 @@ static void cs_grow(void) {
     unsetenv("COLI_VK_TIER_DECODE_GROW"); unsetenv("COLI_VK_TIER_DECODE_GROW_GB");
     unsetenv("COLI_VK_TIER_DECODE_GROW_RESERVE_GB");
     unsetenv("COLI_VK_TIER_EXPERTS");
+    lever_pin_restore();
 }
 /* COLI_VK_TIER_CS_DEVSUM: the whole group's rows summed ON THE DEVICE -- each bf16
  * rounded, added in rank order from 0, exactly the finish site's host merge
@@ -3101,6 +3133,7 @@ static void cs_cache_report(const char *line, int *n, size_t *bytes,
  * across joins (a hit), a slot rewritten in place to another geometry invalidates the old
  * entry and re-imports, and the byte bound retires the coldest entries at the join. */
 static void cs_alias_cache(void) {
+    lever_pin_save();
     VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
     static const int route[K] = {0, 1, 2};
     float w[K] = {0.5f, 0.3f, 0.2f};
@@ -3198,7 +3231,7 @@ static void cs_alias_cache(void) {
     unsetenv("COLI_VK_TIER_CS_ALIAS_CACHE");
     unsetenv("COLI_VK_TIER_CS_ALIAS_CACHE_MB");
     unsetenv("COLI_VK_TIER_SYNC");
-    unsetenv("COLI_VK_TIER_EXPERTS");
+    lever_pin_restore();
 }
 /* The VA-reuse guard (vkt_slab_forget, gap-wave1's mandatory hardening): the cache's
  * geometry key cannot tell two generations of one address apart. A slab is aliased
@@ -3211,6 +3244,7 @@ static void cs_alias_cache(void) {
  * one geometry. A POSIX-only leg: the Windows build skips it (no MAP_FIXED). */
 static void cs_alias_va_reuse(void) {
 #ifndef _WIN32
+    lever_pin_save();
     VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
     rng = 7;
     model_make(f, f); g_act = VKT_ACT_SWIGLU_V4; g_limit = 10.0f;
@@ -3278,7 +3312,7 @@ out:
     unsetenv("COLI_VK_TIER_CS_ALIAS_CACHE");
     unsetenv("COLI_VK_TIER_CS_ALIAS_CACHE_MB");
     unsetenv("COLI_VK_TIER_SYNC");
-    unsetenv("COLI_VK_TIER_EXPERTS");
+    lever_pin_restore();
 #else
     printf("  (skipped on Windows: no MAP_FIXED)\n");
 #endif
@@ -3293,6 +3327,7 @@ out:
  * the first expert's verdicts, its repeat skips, the rewrite to the second expert
  * rescans (and re-records), and its repeat skips again -- the rows right throughout. */
 static void cs_alias_scan_skip(int dprof) {
+    lever_pin_save();
     VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
     rng = 7;
     model_make(f, f); g_act = VKT_ACT_SWIGLU_V4; g_limit = 10.0f;
@@ -3379,7 +3414,7 @@ out2:
     unsetenv("COLI_VK_TIER_CS_ALIAS_CACHE_MB");
     unsetenv("COLI_VK_TIER_CS_ALIAS_SCAN_SKIP");
     unsetenv("COLI_VK_TIER_SYNC");
-    unsetenv("COLI_VK_TIER_EXPERTS");
+    lever_pin_restore();
 }
 /* The hot set overlay (COLI_VK_TIER_HOT): the history's top share of the resident places,
  * ranked on the RAW counts, marked on the slots and skipped by every victim path. The
@@ -3649,6 +3684,7 @@ static void pool_layer(void) {
 static unsigned long long hy_pairs(const char *line);   /* below: the report's hybrid pairs */
 static void model_hybrid_case(void) {
     enum { MH = 4096, MF = 2048, ME = 8, MK = 6, GS = 32 };   /* the model's geometry, a layer's slice */
+    lever_pin_save();
     setenv("COLI_VK_TIER_EXPERTS", "0", 1);   /* gap-wave4: the hybrid classification is the case's subject; the armed compute site skips it at rows-1 */
     const float limit = 10.0f;
     static const float lut[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
@@ -3763,7 +3799,7 @@ static void model_hybrid_case(void) {
     }
 free_model:
     for (int e = 0; e < ME; e++) { free(m[e].gc); free(m[e].uc); free(m[e].dc); free(m[e].gs); free(m[e].us); free(m[e].ds); }
-    unsetenv("COLI_VK_TIER_EXPERTS");   /* gap-wave4: the hybrid pin lifts */
+    lever_pin_restore();   /* gap-wave4: the hybrid pin lifts */
 }
 
 /* A pool short of every expert, promotions on (COLI_VK_TIER_PROMOTE): a routed pooled
@@ -3969,6 +4005,7 @@ static void host_pairs_case(double tol) {
     }
 }
 static void hybrid_case(VktFmt gu, VktFmt dn, const char *nm) {
+    lever_pin_save();
     setenv("COLI_VK_TIER_EXPERTS", "0", 1);   /* gap-wave4: the hybrid classification is the case's subject; the armed compute site skips it at rows-1 */
     const int H0 = H, F0 = F;
     H = 512; F = 256;   /* whole blocks of 256 */
@@ -4025,7 +4062,7 @@ static void hybrid_case(VktFmt gu, VktFmt dn, const char *nm) {
     setenv("COLI_VK_TIER_HOST", "0", 1);
     model_free();
     H = H0; F = F0;
-    unsetenv("COLI_VK_TIER_EXPERTS");   /* gap-wave4: the hybrid pin lifts */
+    lever_pin_restore();   /* gap-wave4: the hybrid pin lifts */
 }
 
 /* DeepSeek V4's expert in the hybrid: MXFP4 ue8m0 experts, four on the device and the rest
@@ -4035,6 +4072,7 @@ static void hybrid_case(VktFmt gu, VktFmt dn, const char *nm) {
  * one close; then the same steps with COLI_VK_HYBRID=0. */
 static void v4_hybrid_case(void) {
     VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    lever_pin_save();
     setenv("COLI_VK_TIER_EXPERTS", "0", 1);   /* gap-wave4: the hybrid classification is the case's subject; the armed compute site skips it at rows-1 */
     model_make(f, f);
     const float limit = 10.0f;
@@ -4097,7 +4135,7 @@ static void v4_hybrid_case(void) {
     unsetenv("COLI_VK_TIER_HOST_GB"); unsetenv("COLI_VK_TIER_SYNC");
     setenv("COLI_VK_TIER_HOST", "0", 1);
     model_free();
-    unsetenv("COLI_VK_TIER_EXPERTS");   /* gap-wave4: the hybrid pin lifts */
+    lever_pin_restore();   /* gap-wave4: the hybrid pin lifts */
 }
 
 /* the report's ", and S prompt steps' P pairs": P, 0 without the part */

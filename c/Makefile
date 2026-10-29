@@ -1049,6 +1049,39 @@ deepseek-v4-tiny-check-s1gemv: deepseek-v4-tiny-generate
 		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
 		--fixture $(CURDIR)/deepseek_v4_tiny
 
+# gap-wave4's own gate: the tiny harnesses at the NEW DEFAULTS -- no lever env at
+# all (the plain deepseek-v4-tiny-check runs the portable build with no device, so
+# the levers never engage there): the fork registry's arena slots, the compute
+# site's finish-site groups, the decode growth, the dedicated S=1 GEMV and the FA
+# tile all standing as a boot with no environment now arms them, against the same
+# token-exact oracle. The second half is the hatch: COLI_VK_LEGACY=1, the upstream
+# base -- the fmt-15 precedent's escape-hatch leg, now for the whole default set.
+# If the FA tile's thresholded class ever flips a tiny token, the defaults half is
+# the leg that says so (regenerate the fixture's expectations under the defaults,
+# the hatch half keeps the base's -- never silently one class for both).
+.PHONY: deepseek-v4-tiny-check-defaults
+deepseek-v4-tiny-check-defaults: deepseek-v4-tiny-generate
+	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) VK=1 deepseek-v4
+	COLI_VULKAN=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_LEGACY=1 $(PYTHON) tests/test_deepseek_v4_tiny.py \
+		--binary ./$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture ./deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_LEGACY=1 $(PYTHON) tests/test_deepseek_v4_prefix.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+	COLI_VULKAN=1 COLI_VK_LEGACY=1 $(PYTHON) tests/test_deepseek_v4_brio.py \
+		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
+		--fixture $(CURDIR)/deepseek_v4_tiny
+
 # COLI_VK_TIER_PILOT's own gate (the decode read-ahead, gap-wave2): the same three
 # harnesses and the same token-exact oracle with the pilot armed beside the compute
 # site. The tiny fixture keeps one hash layer (its layer 0), so no chain host-step has

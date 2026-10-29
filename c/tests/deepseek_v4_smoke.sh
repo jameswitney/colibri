@@ -23,7 +23,10 @@
 #
 # The tier's format lever rides the caller's environment: the gate at defaults
 # runs the tree's standing default, `COLI_VK_TIER_FMT15=1 make deepseek-v4-smoke`
-# the packed form armed — the P0's two legs.
+# the packed form armed — the P0's two legs. gap-wave4 adds the hatch leg: the
+# same generation under COLI_VK_LEGACY=1 (every default lever off, the upstream
+# base standing) runs beside the defaults leg — the W1 lesson's leg count doubled,
+# because the default flip changed what "defaults" means.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -84,6 +87,25 @@ timeout "$TIMEOUT_S" env COLI_VULKAN=1 COLI_TEMP=0 KVSAVE=0 V4_PREFIX_CKPT=0 COL
     "$BIN" "$MODEL" --prompt-file "$PROMPT" --max-tokens "$TOKENS" \
     --memory-gb "$RAM_GB" >"$LOG" 2>&1
 rc=$?
+RC_DEFAULTS=$rc
+# gap-wave4: the hatch leg -- the SAME generation under COLI_VK_LEGACY=1, the
+# upstream-base standing (every default lever off, the levers' one legacy line
+# each on stderr; the fmt-15 escape-hatch precedent's model, now the gate's own
+# leg). Skipped where the caller pinned COLI_VK_LEGACY themselves: their leg IS
+# the hatch. The model's state window (above) covers both runs.
+LOG2=""
+RC_LEGACY=0
+if [ -z "${COLI_VK_LEGACY:-}" ]; then
+    LOG2=$(mktemp -t dsv4-smoke-legacy-XXXXXX.log)
+    set +e
+    timeout "$TIMEOUT_S" env COLI_VULKAN=1 COLI_TEMP=0 KVSAVE=0 V4_PREFIX_CKPT=0 COLI_V4_PREWARM=0 \
+        OMP_NUM_THREADS=$OMP OMP_PROC_BIND=close OMP_PLACES=cores COLI_VK_LEGACY=1 \
+        "$BIN" "$MODEL" --prompt-file "$PROMPT" --max-tokens "$TOKENS" \
+        --memory-gb "$RAM_GB" >"$LOG2" 2>&1
+    RC_LEGACY=$?
+    set -e
+fi
+rc=$RC_DEFAULTS
 set -e
 # and back out: the engine writes its own counts at exit, so the frozen snapshots
 # return (every rig consumer copies them in fresh anyway -- the arms' protocol);
@@ -102,28 +124,33 @@ done
 rm -f "$MODEL/.coli_ckpt"   # whatever the run left; the pre-run one returns below
 [ "$CKPT_OWN" = 1 ] && mv "$KEEP/coli_ckpt" "$MODEL/.coli_ckpt"
 rm -rf "$KEEP"
-echo "deepseek-v4-smoke: rc=$rc, log $LOG"
+echo "deepseek-v4-smoke: defaults rc=$RC_DEFAULTS, log $LOG${LOG2:+, hatch (COLI_VK_LEGACY=1) rc=$RC_LEGACY, log $LOG2}"
 
-# absent environment is a skip, not a failure
-grep -q "no Vulkan device" "$LOG" && skip "no Vulkan device on this host"
-[ "$rc" = 124 ] && fail "timeout after ${TIMEOUT_S}s (log $LOG)"
-[ "$rc" = 0 ] || { tail -5 "$LOG" >&2; fail "rc=$rc (log $LOG)"; }
+# one leg's verdict: rc, the failure classes, a coherent generation
+check_leg() {
+    local leg=$1 lg=$2 rcs=$3
+    grep -q "no Vulkan device" "$lg" && skip "no Vulkan device on this host ($leg)"
+    [ "$rcs" = 124 ] && fail "$leg: timeout after ${TIMEOUT_S}s (log $lg)"
+    [ "$rcs" = 0 ] || { tail -5 "$lg" >&2; fail "$leg: rc=$rcs (log $lg)"; }
+    # the failure classes the window found: a tier/chain default that corrupts
+    # resident-expert compute dies mid-decode with the router's non-finite class
+    grep -q "chained block failed" "$lg" && fail "$leg: chained block failed in MoE (log $lg)"
+    grep -qi "device is lost" "$lg" && fail "$leg: device is lost (log $lg)"
+    grep -q "submit failed" "$lg" && fail "$leg: a submit failed (log $lg)"
+    grep -Eq "\[VK\][^(]*failed [1-9][0-9]*" "$lg" && fail "$leg: a [VK] failed counter is nonzero (log $lg)"
+    # a real generation: the line exists and carries words. The || true inside the
+    # substitution keeps set -e from aborting on the missing line -- the fail below
+    # owns that verdict, with its message.
+    local txt words unique
+    txt=$(grep -m1 "^generated_text=" "$lg" | cut -d= -f2- || true)
+    [ -n "$txt" ] || fail "$leg: no generated_text line (log $lg)"
+    words=$(echo "$txt" | wc -w)
+    unique=$(echo "$txt" | tr -s '[:space:]' '\n' | sort -u | grep -c . || true)
+    [ "$words" -ge 3 ] && [ "$unique" -ge 2 ] || \
+        fail "$leg: generated_text is not coherent text ($words words, $unique distinct: '$txt')"
+    echo "deepseek-v4-smoke: $leg PASS (${words} words: $(echo "$txt" | cut -c1-72)...)"
+}
 
-# the failure classes the window found: a tier/chain default that corrupts
-# resident-expert compute dies mid-decode with the router's non-finite class
-grep -q "chained block failed" "$LOG" && fail "chained block failed in MoE (log $LOG)"
-grep -qi "device is lost" "$LOG" && fail "device is lost (log $LOG)"
-grep -q "submit failed" "$LOG" && fail "a submit failed (log $LOG)"
-grep -Eq "\[VK\][^(]*failed [1-9][0-9]*" "$LOG" && fail "a [VK] failed counter is nonzero (log $LOG)"
-
-# a real generation: the line exists and carries words. The || true inside the
-# substitution keeps set -e from aborting on the missing line -- the fail below
-# owns that verdict, with its message.
-TXT=$(grep -m1 "^generated_text=" "$LOG" | cut -d= -f2- || true)
-[ -n "$TXT" ] || fail "no generated_text line (log $LOG)"
-WORDS=$(echo "$TXT" | wc -w)
-UNIQUE=$(echo "$TXT" | tr -s '[:space:]' '\n' | sort -u | grep -c . || true)
-[ "$WORDS" -ge 3 ] && [ "$UNIQUE" -ge 2 ] || \
-    fail "generated_text is not coherent text ($WORDS words, $UNIQUE distinct: '$TXT')"
-echo "deepseek-v4-smoke: PASS (${WORDS} words: $(echo "$TXT" | cut -c1-72)...)"
+check_leg defaults "$LOG" "$RC_DEFAULTS"
+[ -n "$LOG2" ] && check_leg "hatch (COLI_VK_LEGACY=1)" "$LOG2" "$RC_LEGACY"
 exit 0

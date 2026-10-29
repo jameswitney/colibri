@@ -16,6 +16,10 @@
 #        op=expert batch fence;
 #   the default is untouched: unset and 0 give the same stderr (cmp), exit 0,
 #        and the old fault line — nothing about strict anywhere;
+#   the hatch is the base: all five gap-wave4 default levers at =0 vs
+#        COLI_VK_LEGACY=1 (levers unset) agree byte for byte (stdout exact,
+#        stderr past the hatch's own legacy lines) — per-lever =0 still wins,
+#        and the hatch reproduces exactly that base;
 #   the refusal is not fatal: a strict run of test_vk_tier serves the layers
 #        whose extra form has no device form ("[VK] refused:", the run continues)
 #        and aborts only at its deliberate final wait fault — exactly one
@@ -77,7 +81,7 @@ grep -q "op=expert batch fence" "$TMP/err" || fail "case: op=expert batch fence"
 # VRAM reading (GiB/MiB/KiB) that jitter between ANY two runs — the baseline
 # against itself differs the same way — so those fields are masked for the
 # comparison; everything else must match byte for byte.
-norm() { sed -E 's/[0-9]+(\.[0-9]+)? (ms|us|GB\/s)/X/g; s/[0-9]+%/X%/g; s/[0-9]+(\.[0-9]+)? (GiB|MiB|KiB)/X/g; s/frag [0-9]+(\.[0-9]+)?/frag X/g' "$1"; }
+norm() { sed -E 's/[0-9]+(\.[0-9]+)? (ms|us|GB\/s)/X/g; s/[0-9]+%/X%/g; s/[0-9]+(\.[0-9]+)? (GiB|MiB|KiB)/X/g; s/frag [0-9]+(\.[0-9]+)?/frag X/g' "${1:--}"; }
 rc=$(rc_of env -u COLI_VK_STRICT "$TIER" "$SPV"); mv "$TMP/out" "$TMP/a.out"; mv "$TMP/err" "$TMP/a.err"
 [ "$rc" = 0 ] || fail "case: unset must pass (rc $rc)"
 rc=$(rc_of env COLI_VK_STRICT=0 "$TIER" "$SPV"); mv "$TMP/out" "$TMP/b.out"; mv "$TMP/err" "$TMP/b.err"
@@ -86,6 +90,21 @@ cmp -s "$TMP/a.out" "$TMP/b.out" || fail "case: unset and 0 stdout differ"
 cmp -s <(norm "$TMP/a.err") <(norm "$TMP/b.err") || fail "case: unset and 0 stderr differ"
 grep -q "expert batch: fence wait failed" "$TMP/a.err" || fail "case: the old fault line kept"
 if grep -q "strict" "$TMP/a.out" "$TMP/a.err"; then fail "case: strict must not appear unset"; fi
+
+#   — the hatch is the base (gap-wave4): the five default levers at =0 are the
+# pre-flip standing, and COLI_VK_LEGACY=1 must reproduce exactly that — stdout
+# byte for byte, stderr past the hatch's own "legacy (COLI_VK_LEGACY=1)" lines
+# (an explicit env always wins over the hatch, so the =0 side prints nothing).
+OFF="COLI_VK_TIER_EXPERTS=0 COLI_VK_TIER_DECODE_GROW=0 COLI_VK_TIER_DECODE_GROW_HEADROOM=0 COLI_VK_V4_DECODE_PATH=0 COLI_VK_V4_S1GEMV=0"
+rc=$(rc_of env -u COLI_VK_STRICT $OFF "$TIER" "$SPV"); mv "$TMP/out" "$TMP/c.out"; mv "$TMP/err" "$TMP/c.err"
+[ "$rc" = 0 ] || fail "case: the =0 base must pass (rc $rc)"
+rc=$(rc_of env -u COLI_VK_STRICT COLI_VK_LEGACY=1 "$TIER" "$SPV"); mv "$TMP/out" "$TMP/d.out"; mv "$TMP/err" "$TMP/d.err"
+[ "$rc" = 0 ] || fail "case: LEGACY=1 must pass (rc $rc)"
+cmp -s "$TMP/c.out" "$TMP/d.out" || fail "case: =0 and LEGACY=1 stdout differ"
+cmp -s <(norm "$TMP/c.err") <(sed -E '/legacy \(COLI_VK_LEGACY=1\)/d' "$TMP/d.err" | norm) \
+    || fail "case: =0 and LEGACY=1 stderr differ (past the hatch's own lines)"
+grep -q "legacy (COLI_VK_LEGACY=1)" "$TMP/d.err" || fail "case: the hatch said its legacy lines"
+grep -q "legacy (COLI_VK_LEGACY=1)" "$TMP/c.err" && fail "case: the =0 base must not print legacy lines"
 
 #   — the refusal is not fatal: the extra layers' form has no device form, the
 # tier says so and serves the rest; the ONLY abort of the run is its deliberate
