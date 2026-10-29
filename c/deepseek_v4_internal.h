@@ -864,9 +864,11 @@ extern int (*coli_v4_expert_store_device_tier)(int layer, int expert);
  * stats) is skipped on the pilot's threads, so a misprediction costs a slot, never a
  * placement decision. Outside the tier guard above: the pilot lives in the store unit,
  * which every build compiles. v4_pilot_classify is the DPROF-only marker at the loader's
- * preload (hit/late/unpredicted); v4_pilot_quiesce drains before a store is destroyed;
- * v4_pilot_report prints the pilot's own DPROF line. Unset: wanted() is 0, fire does
- * nothing, zero cost. */
+ * preload (hit/late/unpredicted); v4_pilot_quiesce drains at the hot store's own destroy,
+ * before its no-active-leases assert, so no caller needs to drain first and the units
+ * that destroy a store (RUNTIME, the tools) keep no reference to it -- the ownership
+ * test links RUNTIME without the store unit; v4_pilot_report prints the pilot's own DPROF
+ * line. Unset: wanted() is 0, fire does nothing, zero cost. */
 int v4_pilot_wanted(void);
 int v4_pilot_depth(void);
 void v4_pilot_fire(ColiExpertStore *store, int layer, int token, int topk,

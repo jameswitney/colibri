@@ -3146,17 +3146,19 @@ V4_TEST_EXTRA_TARGETS = COLI_V4_UNIT_GPU.o backend_loader_dsv4.o
 endif
 # Under VK=1 the test's units compile with -DCOLI_VULKAN, and CS-1c's forget hook
 # (vkt_slab_forget at both store destroys, deepseek_v4.c's EXPERT_STORE unit)
-# references the tier's symbol: the link needs the same VK objects the engine
-# binary links (Makefile.deepseek-v4's V4_VK_OBJ), built by the sub-make under
-# their own -flto names. vk_chain_v4.o is not among them: nothing the test's
-# units compile reaches vk_chain.c.
+# references the tier's symbol: the link needs the Vulkan backend, and the rule
+# takes it from $(VK_OBJ), the objects every other VK-calling test link uses --
+# the shape tests/test_makefile_vk_obj pins (backend_vulkan.o on the link line,
+# $(VK_OBJ) a prerequisite of the rule itself). backend_vulkan.c and vk_tier.c
+# read none of the sub-make's V4-only defines, so the main Makefile's objects
+# are the same code; the engine binary keeps its own -flto V4_VK_OBJ
+# (Makefile.deepseek-v4).
 ifeq ($(VK),1)
-V4_TEST_LINK_OBJS += backend_vulkan_v4.o vk_tier_v4.o
-V4_TEST_EXTRA_TARGETS += backend_vulkan_v4.o vk_tier_v4.o
+V4_TEST_LINK_OBJS += $(VK_OBJ)
 endif
 
 tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c sse41_kernels.h deepseek_v4.c deepseek_v4.h compat.h \
-		Makefile.deepseek-v4.units Makefile.deepseek-v4
+		Makefile.deepseek-v4.units Makefile.deepseek-v4 $(VK_OBJ)
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
 		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
 		COLI_V4_UNIT_ROUTE_BF16.o \

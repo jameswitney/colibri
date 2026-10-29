@@ -9415,6 +9415,13 @@ static void stats(const ColiExpertStore *store, ColiExpertStoreStats *output) {
 
 static void destroy(ColiExpertStore *store) {
     if (!store) return;
+    /* COLI_VK_TIER_PILOT's warm reads must drop their leases first: the drain
+     * lives at the destroy that owns the no-active-leases invariant (the assert
+     * below), so every path that frees the hot store -- the engine's, the tools',
+     * a test's -- drains, and no other unit needs the pilot's symbols (the
+     * ownership test links RUNTIME without this one, so its engine destroy must
+     * not reference them; the pilot leases through this store only). */
+    v4_pilot_quiesce();
     V4ExpertStoreState *state = store->state;
     if (state) {
         assert(state->active_leases == 0 && "destroy with active expert leases");
@@ -11052,6 +11059,24 @@ void coli_v4_expert_store_decode_phase(ColiExpertStore *store, int decode) {
     pthread_mutex_unlock(&state->mutex);
 }
 
+/* The slab a leased view reads and its bytes (deepseek_v4_internal.h, CS-1b): the
+ * hot store's own slot state, a property of the store rather than of the device
+ * tier that aliases it, so it is defined in every build -- the forkdec gate's
+ * no-device leg (tests/test_deepseek_v4 forkdec) reads it in the plain one --
+ * beside ram_first/ram_gave above, not in the tier's block below. */
+const void *coli_v4_expert_store_view_slab(ColiExpertStore *store, const ColiExpertView *view,
+                                           size_t *bytes) {
+    if (bytes) *bytes = 0;
+    if (!store || !store->state || !view || !view->lease || !hot_find(store)) return NULL;
+    V4ExpertStoreState *state = store->state;
+    V4ExpertSlot *slot = view->lease;
+    /* the slot this lease names holds the view's own expert: a stale or foreign lease
+     * would alias the wrong pages, so only an exact match serves */
+    if (!slot->slab || !state->record_bytes || slot->expert != view->key.expert) return NULL;
+    *bytes = (size_t)state->record_bytes;
+    return slot->slab;
+}
+
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
 /* The Vulkan routed-expert tier's side of the store (deepseek_v4_internal.h). A
  * routing the device served never comes through lookup_hot, so it is counted here
@@ -11109,19 +11134,6 @@ int coli_v4_expert_store_in_ram(ColiExpertStore *store, ColiExpertKey key) {
 uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store) {
     return store && store->state && hot_find(store)
         ? ((V4ExpertStoreState *)store->state)->record_bytes : 0;
-}
-
-const void *coli_v4_expert_store_view_slab(ColiExpertStore *store, const ColiExpertView *view,
-                                           size_t *bytes) {
-    if (bytes) *bytes = 0;
-    if (!store || !store->state || !view || !view->lease || !hot_find(store)) return NULL;
-    V4ExpertStoreState *state = store->state;
-    V4ExpertSlot *slot = view->lease;
-    /* the slot this lease names holds the view's own expert: a stale or foreign lease
-     * would alias the wrong pages, so only an exact match serves */
-    if (!slot->slab || !state->record_bytes || slot->expert != view->key.expert) return NULL;
-    *bytes = (size_t)state->record_bytes;
-    return slot->slab;
 }
 
 int coli_v4_expert_store_gguf_form(ColiExpertStore *store, int layer, int types[3], int *mx) {
@@ -12210,7 +12222,6 @@ void coli_v4_engine_destroy(ColiV4Engine *engine) {
     engine->head_cache.data = NULL;
     if (engine->owns_experts && engine->experts && engine->experts->ops &&
         engine->experts->ops->destroy) {
-        v4_pilot_quiesce();   /* COLI_VK_TIER_PILOT's warm reads must drop their leases first */
         engine->experts->ops->destroy(engine->experts);
     }
     engine->experts = NULL;
@@ -16321,7 +16332,6 @@ int main(int argc, char **argv) {
     free(attention);
     free(generated_ids); free(prompt_ids);
     free(hidden); free(next); free(state);
-    v4_pilot_quiesce();   /* COLI_VK_TIER_PILOT's warm reads must drop their leases first */
     experts->ops->destroy(experts);
     coli_st_index_close(index);
     return 0;

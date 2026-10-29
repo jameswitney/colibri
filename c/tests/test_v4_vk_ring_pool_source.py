@@ -78,17 +78,22 @@ class V4VkRingPoolSourceTest(unittest.TestCase):
         """The ring pool's busy flag changes in exactly three places: the reader's own
         failure paths, its hand-back helper -- and nothing else (an engine-path write
         would be the leak again). Matched by identifier, not by spelling: the
-        declaration's qualifiers and the take/write sites may be reflowed."""
+        declaration's qualifiers and the take/write sites may be reflowed, and the
+        pool's own lifecycle sites (STREAM_DEPTH's calloc, its shutdown reset, the
+        free and the allocation guard) read and rebind the pointer without a flag
+        ever changing."""
         writes = [i for i in range(len(self.text)) if self.text.startswith("v4_vkt_ring_stage_busy", i)]
         self.assertTrue(writes)
         for at in writes:
             line = self.text[at:self.text.find("\n", at)]
-            self.assertIn("v4_vkt_ring_stage_busy[", line)
             self.assertTrue(
                 ";" in line.strip() and "=" not in line          # the declaration, whatever its qualifiers
                 or "v4_vkt_ring_stage_busy[stage] = 0" in line    # the hand-back helper
                 or "v4_vkt_ring_stage_busy[st[i]] = 0" in line    # the reader's own failure paths
-                or "v4_vkt_ring_stage_busy[j] = 1" in line,       # the reader's take
+                or "v4_vkt_ring_stage_busy[j] = 1" in line        # the reader's take
+                or line.startswith(("v4_vkt_ring_stage_busy = calloc",   # the pool's creation (STREAM_DEPTH)
+                                    "v4_vkt_ring_stage_busy = NULL",     # its shutdown reset
+                                    "v4_vkt_ring_stage_busy)")),         # free() and the allocation guard: the pointer, not a flag
                 f"an unexpected hand on the ring's stage pool: {line.strip()!r}",
             )
 
