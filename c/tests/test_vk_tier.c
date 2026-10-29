@@ -4261,7 +4261,7 @@ static const char *const prof_knobs[] = {
     "COLI_VK_TIER_GEMM_ROWS", "COLI_VK_TIER_HOST_GB", "COLI_VK_TIER_PROMOTE", NULL };
 static void prof_unset(void) {   /* nothing a case set outlives it */
     for (int i = 0; prof_knobs[i]; i++) unsetenv(prof_knobs[i]);
-    unsetenv("COLI_VK_PROFILE");
+    setenv("COLI_VK_PROFILE", "0", 1);   /* pin off: unset is the wave-4 default-on now */
 }
 static int prof_is(const char *k, const char *v) {   /* k holds exactly v (NULL: unset) */
     const char *e = getenv(k);
@@ -4302,11 +4302,9 @@ static void profile(void) {
           "profile pick: the %ld-token boundary is not the rule", COLI_VK_PROFILE_PROMPT_MIN);
     CHECK(coli_vk_profile_pick(2515) == 1 && coli_vk_profile_pick(64) == 0,
           "profile pick: the 2,515-token arm and the 64-token decode disagree");
-    /* the default, unset and `0`: no knob set, no line (the counter-assert) */
+    /* the default, unset: the stage preset now arms by default (wave-4) unless LEGACY;
+     * the old "nothing set" semantics live behind an explicit 0 (and LEGACY below) */
     prof_unset();
-    cap_fill();
-    CHECK(prof_none_set(), "profile unset: a knob set by nothing");
-    CHECK(!strstr(prof_cap, "[VK] profile:"), "profile unset: a boot line anyway");
     setenv("COLI_VK_PROFILE", "0", 1);
     cap_fill();
     CHECK(prof_none_set(), "profile 0: a knob set");

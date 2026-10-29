@@ -1250,6 +1250,16 @@ static int prof_knob(void) {
         k = PROF_STAGE;
         snprintf(prof_named, sizeof prof_named, "%s", !strcmp(e, "auto") ? "auto" : "RDNA2");
     }
+    if (!e && k == PROF_NONE && !getenv("COLI_VK_LEGACY")) {
+        /* wave-4 default: the measured perf levers arm unset, and their arming shape
+         * (the prefill stream, the chunking, the GEMM row rules) is the stage preset --
+         * without it the kept-rows rule strands 83k prefill rows on the CPU (the gap4
+         * defaults leg: TTFT 438.7 s vs 156.9 with it). Opt out with COLI_VK_PROFILE=0
+         * or the whole-stack COLI_VK_LEGACY=1. */
+        k = PROF_STAGE;
+        snprintf(prof_named, sizeof prof_named, "%s", "RDNA2(default)");
+        fprintf(stderr, "[VK] profile: the stage preset arms by default (COLI_VK_PROFILE=0 or COLI_VK_LEGACY=1 opts out)\n");
+    }
     if (e && strcmp(e, "0") && k == PROF_NONE)
         fprintf(stderr, "[VK] profile: COLI_VK_PROFILE=%s is not one of RDNA2, ttft, decode, balanced, auto; nothing set\n", e);
     return k;

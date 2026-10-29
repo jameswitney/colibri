@@ -95,7 +95,7 @@ if grep -q "strict" "$TMP/a.out" "$TMP/a.err"; then fail "case: strict must not 
 # pre-flip standing, and COLI_VK_LEGACY=1 must reproduce exactly that — stdout
 # byte for byte, stderr past the hatch's own "legacy (COLI_VK_LEGACY=1)" lines
 # (an explicit env always wins over the hatch, so the =0 side prints nothing).
-OFF="COLI_VK_TIER_EXPERTS=0 COLI_VK_TIER_DECODE_GROW=0 COLI_VK_TIER_DECODE_GROW_HEADROOM=0 COLI_VK_V4_DECODE_PATH=0 COLI_VK_V4_S1GEMV=0"
+OFF="COLI_VK_PROFILE=0 COLI_VK_CHAIN_ATTN_FA=0 COLI_VK_TIER_EXPERTS=0 COLI_VK_TIER_DECODE_GROW=0 COLI_VK_TIER_DECODE_GROW_HEADROOM=0 COLI_VK_V4_DECODE_PATH=0 COLI_VK_V4_S1GEMV=0"
 rc=$(rc_of env -u COLI_VK_STRICT $OFF "$TIER" "$SPV"); mv "$TMP/out" "$TMP/c.out"; mv "$TMP/err" "$TMP/c.err"
 [ "$rc" = 0 ] || fail "case: the =0 base must pass (rc $rc)"
 rc=$(rc_of env -u COLI_VK_STRICT COLI_VK_LEGACY=1 "$TIER" "$SPV"); mv "$TMP/out" "$TMP/d.out"; mv "$TMP/err" "$TMP/d.err"
