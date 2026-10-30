@@ -304,6 +304,9 @@ struct ColiVkTensor {
 typedef struct {
     int on;                           /* staged uploads on this device */
     int later;                        /* mapped for now: staged if vk_window_decide finds the window small */
+    double shadow;                    /* the heap's free GB before the window probe asked for it: what the
+                                         driver owes the budget read once the probe's blocks are freed (-1:
+                                         nothing to wait for) */
     uint32_t mt_dev, mt_stage;        /* the device-local target type, the host staging type */
     VkDevice dev; VkQueue q; uint32_t fam; int shared;   /* shared: q is the main queue, locked */
     uint32_t fams[3], nfams;          /* the families that touch device-local tensors (CONCURRENT when > 1) */
@@ -680,6 +683,7 @@ static void vk_window_mapped(VkUp *u) {
  * COLI_VK_DEVICE_CAP_MB limits them (a capped device reads as a small window). */
 static void vk_window_decide(VkUp *u) {
     u->later = 0;   /* decided from here on */
+    u->shadow = -1;   /* nothing to wait for until the probe below asks for the window */
     VkPhysicalDeviceMemoryProperties m;
     vkGetPhysicalDeviceMemoryProperties(G.phys, &m);
     const uint32_t hi = m.memoryTypes[G.memtype].heapIndex;
@@ -695,10 +699,13 @@ static void vk_window_decide(VkUp *u) {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
         VkPhysicalDeviceMemoryProperties2 mp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud};
         vkGetPhysicalDeviceMemoryProperties2(G.phys, &mp2);
+        double free0 = bud.heapBudget[hi] > bud.heapUsage[hi]
+                     ? (double)(bud.heapBudget[hi] - bud.heapUsage[hi]) / 1e9 : 0;   /* GB, before the probe asks */
         if (bud.heapBudget[hi]) {
             const int room = bud.heapBudget[hi] > bud.heapUsage[hi] ? (int)((bud.heapBudget[hi] - bud.heapUsage[hi]) >> 30) : 0;
             if (room < want) want = room;
         }
+        u->shadow = free0 > 0 ? free0 : -1;   /* the wait below reads it back */
     }
 #endif
     int got = 0;
@@ -715,6 +722,39 @@ static void vk_window_decide(VkUp *u) {
         }
         for (int i = 0; i < got; i++) vkFreeMemory(G.dev, blk[i], NULL);
         ms = vk_now() - t0;
+        /* The probe's freed blocks stay on the driver's books a moment: RADV's
+         * VK_EXT_memory_budget read right after the free still counts them (measured:
+         * 13 GiB freed, the budget read 0.98 GB and gave the bytes back within
+         * ~0.3 s), and the first sizing read after init -- a dense chain's fit --
+         * would size a whole run from a window that is no longer held (the chain
+         * stayed off, the dense part fell to the CPU, prefill walked 128-row
+         * windows). Wait for the driver to read the bytes back before anything
+         * sizes itself from them, bounded: a co-tenant may have honestly taken
+         * them while the probe held its own, and then the wait ends having
+         * shadowed nothing. COLI_VK_WINDOW_PROBE_MB skips the allocations and
+         * this wait with them. */
+#ifdef VK_EXT_memory_budget
+        if (got > 0 && G.has_budget && u->shadow > 0) {
+            double tw = vk_now();
+            double f = 0;
+            for (;;) {
+                VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+                VkPhysicalDeviceMemoryProperties2 mp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud};
+                vkGetPhysicalDeviceMemoryProperties2(G.phys, &mp2);
+                f = bud.heapBudget[hi] > bud.heapUsage[hi]
+                  ? (double)(bud.heapBudget[hi] - bud.heapUsage[hi]) / 1e9 : 0;
+                if (f + 0.0625 >= u->shadow || vk_now() - tw > 2000.0) break;
+                usleep(20000);
+            }
+            double waited = vk_now() - tw;
+            if (f + 0.0625 < u->shadow)
+                fprintf(stderr, "[VK] memory: the window probe freed %d GiB; the driver's budget still shows them after %.0f ms, proceeding\n",
+                        got, waited);
+            else
+                fprintf(stderr, "[VK] memory: the window probe freed %d GiB; the driver's budget read them back in %.0f ms\n",
+                        got, waited);
+        }
+#endif
     }
     free(blk);
     if (got >= want) {

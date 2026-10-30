@@ -22,24 +22,43 @@ Evidence: `/root/bench-colibri/up2276/{gap2,gap3,gap4}-*` (same rig, RX 6900 XT/
 |---|---:|---:|
 | LEGACY (= upstream base) | 0.49 | 454–464 |
 | **defaults (levers on)** | **0.68 (+39%)** | ~461 |
-| defaults + PROFILE (recommended line) | — | **see the open item** |
+| defaults + PROFILE + host pool (the full measured shape) | 0.92–1.04 | **139.8–148.8** |
 | reference: fork colibri-ds4-vulkan | 0.95–1.01 | 108–110 |
 | reference: the same stack pre-merge (gap3, PROFILE-class env) | 0.91–0.96 | 146–156 |
 
 Decode-only summary across sessions: upstream-on-Vulkan 0.587 → this stack's full shape 0.91–0.96 (+55–64%), fork parity at matched memory.
 
-## ⚠️ Open item (the honest blocker for the prefill half)
+## ✅ Resolved: the prefill chunk-budget regression (was the open item)
 
-The 276-commit rebase onto current dev introduced a **prefill chunk-budget regression**: `vkc_chunk_rows`'s
-free-memory computation reads ~0.27 GiB where the pre-merge tree read 4.0 GiB → 128-row prompt windows
-(860 sub-batches) → TTFT 460–550 s vs the pre-merge 146–156 s. **Reproduced with every new lever disabled**
-(`gap4-legacyprof` leg: 515 s) — this is a merge/upstream-plan interaction (upstream's kv-oom-era memory-plan
-work meeting our tier accounting), NOT the levers. The planner function itself merged intact; the exact
-collapsing term (device-budget read vs host-available clamp vs the stage-room subtraction) is the next
-diagnosis step. Interim operator workaround does not exist yet (bounding the registry arena and the host
-pool did not restore the read). Until fixed: decode benefits ship as-is; for TTFT-sensitive use, upstream
-base ≈ the same TTFT (the regression affects it equally — legacy 454–464 s), so no user is worse off than
-base, and pre-merge parity returns with the fix.
+**Root cause (measured, `gap4-diag-r1/r2`): not the cgroup walk.** Instrumentation of the merged tree's boot
+showed `compat_mem_available_gb` healthy at every read (28.0–32.2 GiB; the walk's room 28–30 GiB with the
+file cache correctly credited) while the **device** budget read at the dense chain's fit collapsed to
+0.67 GiB. The 276-commit rebase brought upstream's mapped-weights window probe (`ed196461`, "stage uploads
+when the mapped window is under 9/10 of the heap" — the gap4 "upstream healthy" reference binary `c1c06ac6`
+predates it, which is why upstream's own engine looked clean): the probe asks the host-visible device-local
+heap for 13 GiB one GiB at a time and frees them all, and RADV's `VK_EXT_memory_budget` still counts the
+freed blocks for ~0.2 s after. The chain fit lands inside that window → "the chain stays off (free 641 MiB)"
+→ the dense part falls back to host RAM → the CPU prefill walks fixed 128-row windows (860 sub-batches) →
+TTFT 460–550 s. Reproduced with every lever off because the probe is upstream's, not a lever; the planner
+`vkc_chunk_rows` itself was never at fault. Counterfactual: the same tree with the probe's allocations
+skipped (`COLI_VK_WINDOW_PROBE_MB`) read 14.67 GiB at the fit, chained 43/43 layers, sized 1,792-row chunks,
+and ran 150.5 s TTFT — with no code change.
+
+**Fix (`c/backend_vulkan.c`, `vk_window_decide`):** the probe now waits for the driver to read its freed
+blocks back before anything sizes itself from the budget — poll `VK_EXT_memory_budget` until the heap's
+free returns to its pre-probe reading (64 MiB slack), bounded at 2 s (a co-tenant may have honestly taken
+the bytes; then it proceeds and says so). Measured: **201 ms**, one stderr line
+(`[VK] memory: the window probe freed 13 GiB; the driver's budget read them back in 201 ms`), skipped when
+the probe made no allocations (`COLI_VK_WINDOW_PROBE_MB`) or the extension is absent. No change to
+`compat.h`'s walk, the fit, or any sizing semantic; boot-timing only, so LEGACY/unset outputs stay
+byte-identical (tiny oracle PASS on defaults, LEGACY=1, and the all-off base).
+
+**After (`gap4-full2-r{1,2,3}`, same rig/harness as gap4):** the engagement line at boot, 43/43 chain layers
+on the device, **"prompt chunks of up to 2048 rows"** (4.15 GiB free at the chunk read), tier 6.40 GiB —
+and TTFT **139.8 / 148.8 / 147.5 s** (decode 0.92–1.04 tok/s): pre-merge parity restored (gap3 measured
+146–156 s) and the recommended line now beats upstream's own current engine in the same session (263.6 s,
+768-row chunks). The interim note is retired: no user was ever worse than base, and now none is worse than
+pre-merge.
 
 ## Hardware notes (from the wave-4 audit, `gap-wave4/hw-risk.md`)
 
