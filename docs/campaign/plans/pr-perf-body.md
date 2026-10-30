@@ -16,17 +16,21 @@ Evidence: `/root/bench-colibri/up2276/{gap2,gap3,gap4}-*` (same rig, RX 6900 XT/
 3. **Stayed opt-in** (measured non-wins or trade-offs): ring/ring-cold (decode-for-TTFT), alias-cache (−39% thrash), attn-cell (neutral), stream rows/depth/group/pred, queue0.
 4. Gates: the full VK suite green on the merged tree (vk-tier 8 legs incl. the forkdec/s1gemv legs, vk-chain, vk-strict with the new LEGACY-equivalence case, oracles, serve-framing, syntax); the portable build fixed (`view_slab` guard + `$(VK_OBJ)` wiring); `make check` at its 3 pre-existing failures; `COLI_VK_LEGACY=1` == upstream base byte-identical (tiny-fixture md5 `4b5a583d…`).
 
-## Measured (same-session quartet + isolation legs, gap4)
+## Measured (same-session quartet + isolation legs, gap4 — post chunk-fix 739727c8)
 
 | arm | decode tok/s | TTFT s |
 |---|---:|---:|
-| LEGACY (= upstream base) | 0.49 | 454–464 |
-| **defaults (levers on)** | **0.68 (+39%)** | ~461 |
-| defaults + PROFILE + host pool (the full measured shape) | 0.92–1.04 | **139.8–148.8** |
+| LEGACY (= upstream base) | 0.65–0.71 | 264–270 |
+| upstream's own engine, same session | ~0.59 | 263.6 |
+| **defaults (levers on, zero env)** | **0.95–0.97 (+41–46% decode)** | 236–248 |
+| **defaults + PROFILE=RDNA2 + TIER_HOST_GB=2 (the one-line recommended shape)** | **0.92–1.04** | **139.8–148.8 (−45% TTFT)** |
 | reference: fork colibri-ds4-vulkan | 0.95–1.01 | 108–110 |
 | reference: the same stack pre-merge (gap3, PROFILE-class env) | 0.91–0.96 | 146–156 |
 
-Decode-only summary across sessions: upstream-on-Vulkan 0.587 → this stack's full shape 0.91–0.96 (+55–64%), fork parity at matched memory.
+**Decode parity with the fork from env-free defaults** (0.95–0.97 vs the fork's 0.95–1.01); TTFT within ~13% with
+the one-line shape. The LEGACY arm now matches upstream's own engine exactly (263.6 s both) — merge-faithfulness
+evidence. Pre-fix shadow-era numbers preserved in the gap4 logs; the cross-session story (upstream-on-Vulkan
+0.587 → this stack 0.91–1.04, +56–77%) is in the campaign record.
 
 ## ✅ Resolved: the prefill chunk-budget regression (was the open item)
 
