@@ -925,6 +925,7 @@ void vkc_stats(VkcStats *st);
 void vkc_mm8_set(int on);
 void vkc_mm8_set_tile(int v);
 void vkc_mm8_set_ndbuf(int v);   /* the staging constant: -2 the measured default (0; COLI_VK_CHAIN_MM8_NDBUF=2 arms the ping-pong), 0 single, 2 ping-pong */
+int vkc_mm8_ndbuf_baked(void);   /* the staging constant the LAST mm8 pipeline build baked (spec id 11): the env arm's observable, the env leg asserts it */
 const char *vkc_mm8_tile_name(int v);
 int vkc_mm8_tile_count(void);
 /* the split-K count a call takes (COLI_VK_MM8_SPLITK: 0 off/bitwise, unset auto -- the

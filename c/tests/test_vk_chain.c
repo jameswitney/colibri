@@ -3481,6 +3481,24 @@ static void test_mm8_tiles(void) {
           okn0, okn2, samen, s3.mm8 - s2.mm8);
     printf("  mm8 ndbuf: forced ping-pong vs forced single buffer %s\n",
            samen ? "bitwise equal" : "DIFFERS");
+    /* the env arm itself (mm8_ndbuf_auto's getenv parse, the path the forced pins above
+     * bypass): setenv 2 and drop the pipelines, so the next build reads the env, says its
+     * armed line and bakes the ping-pong; unset and dropped again, the build bakes the
+     * measured single buffer in silence. The observable is the baked spec constant -- the
+     * outputs are bitwise either way, the legs above -- and the f tile's doubled staging
+     * (26,112 B) fits the spec's 32 KiB shared-memory floor every conformant device has */
+    setenv("COLI_VK_CHAIN_MM8_NDBUF", "2", 1);
+    vkc_mm8_set_ndbuf(-2); vkc_mm8_set(1); vkc_mm8_set_tile(f);
+    vkc_begin(); int oke = f >= 0 && vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    CHECK(oke && vkc_mm8_ndbuf_baked() == 2,
+          "mm8 ndbuf env: COLI_VK_CHAIN_MM8_NDBUF=2 arms the ping-pong (baked %d)", vkc_mm8_ndbuf_baked());
+    unsetenv("COLI_VK_CHAIN_MM8_NDBUF");
+    vkc_mm8_set_ndbuf(-2);
+    vkc_begin(); int oku = f >= 0 && vkc_matmul(t, xb, 0, yb, 0, S); vkc_submit(1);
+    CHECK(oku && vkc_mm8_ndbuf_baked() == 0,
+          "mm8 ndbuf env: unset bakes the measured single buffer (baked %d)", vkc_mm8_ndbuf_baked());
+    printf("  mm8 ndbuf: the env arm's builds baked 2 then 0\n");
+    vkc_mm8_set(0); vkc_mm8_set_tile(-2);
         vkc_free(xb); vkc_free(yb); coli_vk_tensor_free(t);
     free(w); free(sc); free(x); free(yf); free(yv);
 }

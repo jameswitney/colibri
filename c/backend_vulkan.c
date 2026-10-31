@@ -2850,6 +2850,15 @@ static int slabreg_arm(void) {
 int coli_vk_slabreg_alloc(size_t bytes, void **host_out, ColiVkSlabReg **reg_out) {
     if (!G.ready || !coli_vk_slabreg_wanted() || !bytes || !host_out || !reg_out) return 0;
     *host_out = NULL; *reg_out = NULL;
+    pthread_mutex_lock(&g_slabreg.mx);
+    if (!slabreg_arm()) {   /* the memoized refusal lands BEFORE any driver object: a refusing
+                             * device (UMA, Lavapipe) pays no create/destroy pair a slot */
+        g_slabreg.nrefused++;   /* under the mutex: the counter is plain, not atomic */
+        pthread_mutex_unlock(&g_slabreg.mx);
+        return 0;
+    }
+    slabreg_announce();   /* no store line ran first (tests): the first slab says the engaged line */
+    pthread_mutex_unlock(&g_slabreg.mx);
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = bytes,
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                  (G.has_bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0),
@@ -2861,8 +2870,6 @@ int coli_vk_slabreg_alloc(size_t bytes, void **host_out, ColiVkSlabReg **reg_out
     size_t align = req.alignment > 4096 ? (size_t)req.alignment : 4096;   /* 4096: the store's direct-I/O reads */
     size_t need = ((size_t)req.size + align - 1) / align * align;
     pthread_mutex_lock(&g_slabreg.mx);
-    if (!slabreg_arm()) goto refuse;
-    slabreg_announce();   /* no store line ran first (tests): the first slab says the engaged line */
     if (g_slabreg.bytes + need > g_slabreg.cap) goto refuse;   /* the arena cap (ladder: fewer registry slots) */
     SlabRegBlock *b = g_slabreg.blocks;
     /* room at the BIND offset, not at b->used: the record binds at round_up(b->used, align),

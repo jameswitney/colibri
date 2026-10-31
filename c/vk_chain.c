@@ -1503,6 +1503,7 @@ static const VkcMm8Tile vkc_mm8_tile[VKC_MM8_VAR] = {
 static int g_mm8_mode = -2;      /* -2 unread, 0 off (the default), 1 every eligible, -1 the fill rule */
 static int g_mm8_tile_sel = -2;  /* -2 the frozen F tile, -1 the per-shape rule, >=0 forced (the bench) */
 static int g_mm8_ndbuf = -2;     /* id 11: -2 the measured default (single buffer; COLI_VK_CHAIN_MM8_NDBUF=2 arms the ping-pong), 0/2 forced (the tests) */
+static int g_mm8_ndbuf_baked = -1;   /* what the LAST pipeline build baked at id 11 (the env arm's observable, the tests assert it) */
 void vkc_mm8_set(int on) { g_mm8_mode = on; }
 void vkc_mm8_set_tile(int v) { g_mm8_tile_sel = v; }
 const char *vkc_mm8_tile_name(int v) { return v >= 0 && v < VKC_MM8_VAR ? vkc_mm8_tile[v].name : "?"; }
@@ -1527,10 +1528,44 @@ static int mm8_variant_for(int O) {
  * (2,515-token prompt, 3 reps under the single-buffer arm's floor; outputs bit-identical,
  * the streaming sub-batches regularized 402..16413-erratic -> a stable ~596), so it rides
  * COLI_VK_CHAIN_MM8_NDBUF=2, capped to 0 where the doubled staging does not fit the device's
- * shared-memory limit */
-static int32_t mm8_ndbuf_auto(uint32_t lds2) {
+ * shared-memory limit. A SET env states its standing in one boot line below -- armed, the
+ * cap's refusal naming the tile and the limit, or =1 rejected (the historically broken
+ * incantation) -- while an unset env stays byte-silent, so no LEGACY or strict
+ * byte-equality leg (which never sets it) can see a line */
+/* the lever's ONE boot line, fa4_note's pattern: first event wins, later builds quiet.
+ * Exactly one line a run, and only for a set env (the note is mm8_ndbuf_auto's alone --
+ * the tests' pin bypasses the env and stays silent) */
+static void mm8_ndbuf_note(const char *line) {
+    static int said;
+    if (said) return;
+    said = 1;
+    fputs(line, stderr);
+}
+static int32_t mm8_ndbuf_auto(uint32_t lds2, const char *tile) {
     const char *e = getenv("COLI_VK_CHAIN_MM8_NDBUF");
-    return (e && atoi(e) >= 2 && lds2 <= kc_shared_limit()) ? 2 : 0;
+    if (!e || !*e) return 0;
+    int v = atoi(e);
+    if (v >= 2) {
+        uint32_t lim = kc_shared_limit();
+        if (lds2 <= lim) {
+            char line[128];
+            snprintf(line, sizeof line,
+                     "[VK] chain: mm8 ndbuf: ping-pong armed (COLI_VK_CHAIN_MM8_NDBUF=%s, spec 11)\n", e);
+            mm8_ndbuf_note(line);
+            return 2;
+        }
+        char line[224];
+        snprintf(line, sizeof line,
+                 "[VK] chain: mm8 ndbuf: COLI_VK_CHAIN_MM8_NDBUF=%s refused: the %s tile's doubled staging "
+                 "(%u B) is over the device's %u B shared-memory limit; the single buffer stands\n",
+                 e, tile, lds2, lim);
+        mm8_ndbuf_note(line);
+        return 0;
+    }
+    if (v == 1)
+        mm8_ndbuf_note("[VK] chain: mm8 ndbuf: COLI_VK_CHAIN_MM8_NDBUF=1 is not a mode (0 single buffer, 2 ping-pong); "
+                       "the single buffer stands\n");
+    return 0;
 }
 static VkPipeline mm8_pipe(int v) {
     if (v < 0 || v >= VKC_MM8_VAR) v = MM8_F;
@@ -1547,7 +1582,8 @@ static VkPipeline mm8_pipe(int v) {
      * vec2 -- 2*(bm+bn)*(bk/2+1)*8 bytes, the shader's own arrays */
     uint32_t lds2 = 2u * (uint32_t)(t->bm + t->bn) * (uint32_t)(t->bk / 2 + 1) * 8u;
     int32_t vals[12] = {t->blk, t->bm, t->bn, t->bk, t->wm, t->wn, t->wmiter, t->tm, t->tn,
-                        t->tk, t->warp, g_mm8_ndbuf >= 0 ? g_mm8_ndbuf : mm8_ndbuf_auto(lds2)};
+                        t->tk, t->warp, g_mm8_ndbuf >= 0 ? g_mm8_ndbuf : mm8_ndbuf_auto(lds2, t->name)};
+    g_mm8_ndbuf_baked = vals[11];   /* what this build baked: the env arm's observable */
     VkSpecializationMapEntry e[12];
     for (int i = 0; i < 12; i++) e[i] = (VkSpecializationMapEntry){(uint32_t)i, (uint32_t)(i * 4), 4};
     VkSpecializationInfo si = {12, e, sizeof vals, vals};
@@ -1574,6 +1610,7 @@ void vkc_mm8_set_ndbuf(int v) {
     if (KC.mm8red) { vkDestroyPipeline(KC.dev, KC.mm8red, NULL); KC.mm8red = VK_NULL_HANDLE; }
     KC.mm8red_tried = 0;
 }
+int vkc_mm8_ndbuf_baked(void) { return g_mm8_ndbuf_baked; }
 struct VkcMm8PC { int S, I, O, rowWords, gs, k_split; };   /* qmatmul_mm8.comp */
 /* ---- the split-K arm (COLI_VK_MM8_SPLITK, the fork's T2) ----------------------------------
  * A small-O shape starves the tile grid (wkv: O 512 at bm 32 is 16 M-tiles), so the K
