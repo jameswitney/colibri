@@ -7,6 +7,445 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `COLI_VK_TIER_STREAM_RING` (default off): the stream's prefills move off the engine
+  thread onto a ring worker — the fork's `v4_ram` class on the port's slots (the parity
+  census's rank-1 never-tested row, the mechanism behind the measured STAGE 105.6 s prefill
+  bucket). The prefetch call for layer L joins the running job (the take) and hands the
+  worker layer L+1's predicted set (`T.pred`), read through a bypass stage pool of the ring's
+  own and uploaded into the half of the streaming slots the running step is not reading; a
+  step of another layer runs beside the job, every miss (a cold layer, an unpredicted
+  expert, a refused read, a failed worker) takes the inline fill at the step,
+  `COLI_VK_TIER_SYNC=1`'s deterministic drain includes the ring, and the teardown cancels
+  between reads. Unset: the ring's reader is never called, the inline prefetch byte-identical
+  (proven by a base-vs-arm tiny A/B). Evidence:
+  `docs/research/AN-pw-b-stream-ring-2026-10-26.md`; measured at the campaign shape by the W2
+  bench window (STAGE 106.3 → 1.1 s but TTFT +50.6 s — empty plans strand the fills on the
+  inline path: `docs/research/AO-pw-w2-2026-10-26.md`).
+- `COLI_VK_TIER_STREAM_RING_COLD` (default off, needs the ring): the ring's cold branch fills
+  instead of declining — the fork's literal whole-layer cold shape. A next layer with no
+  prediction behind it (the prompt's first chunk, the layer's first visit) is planned whole
+  instead of handed to the inline fill, so the worker covers the next layer's whole
+  non-resident set ahead (the below-rule filter drops in that branch — there is no prediction
+  to scale at the coming step's S; the resident and in-RAM exclusions and the `st_per` cap
+  stand); W2 measured the landed cold branch's decline a strict pessimization (the whole fill
+  back on the engine thread: host-MoE 44.9 → 131.0 s). Where a prediction exists the plan is
+  the prediction's, unchanged. Evidence: `docs/research/AP-pw-b2-2026-10-26.md`.
+- The stream ring's stage pool never freed (PW-B's, found by the cold arm above): the shared
+  release hook `v4_vkt_unhold` keyed its hand-back on the hold's stage index alone, which
+  indexes whichever pool handed it out — a ring fill's release cleared an *engine* stage's
+  flag and left the ring's busy forever, capping the ring's fills at the pool's 8 buffers per
+  run (W2's `the ring 42 jobs (8 experts)` line) and falsely freeing an engine stage a
+  concurrent engine fill could be reading into. `V4VkHold` now carries its pool and the
+  release frees the one it came from; pinned at source level by
+  `tests/test_v4_vk_ring_pool_source.py`. Evidence:
+  `docs/research/AP-pw-b2-2026-10-26.md` §2.
+
+### Fixed
+
+- `vk-tier-check`/`vk-strict-check` at the W1 hotfix tip (test-only, PW-A2's close): `d73b82e1`
+  made fmt 15 opt-in (`COLI_VK_TIER_FMT15`) without updating PW-D's `packed_scales` unit case,
+  which asserts the packed-form byte shrink (12.75 vs 15.00 MiB, ×1.1765) through
+  `vkt_expert_bytes` — un-armed that now returns the f32 form's bytes, so the case (and the
+  strict gate's unset leg, which re-runs the same binary) failed at every post-hotfix head.
+  The case now keeps its env-independent half (ue8m0↔f32 identity, scale-word counts) in every
+  leg and runs the shrink half in a new armed third leg of `vk-tier-check`
+  (`COLI_VK_TIER_FMT15=1 … fmt15`, the host-pairs pattern, the env set before
+  `tier_fmt15()`'s one-time cache) — which holds whichever way the default later lands.
+
+### Notes
+
+- The parity wave's decode-disk lane (PW-A2, "zero-disk decode") closed **premise-falsified,
+  no code change** — the fork's `bytes=0` decode line is its *store lease counter only*: beside it
+  the same log reads `v4_direct … payload_bytes=199.82 GB`, and net of the 11,008-record prefill
+  ring pass (147.2 GB) the fork reads **52.7 GB at decode** — at parity with the port's measured
+  decode window (53.9–59.3 GB, 59–63 % of its ~92–98 GB run total; the split is derived exactly
+  from the landed decode-only `hit_rate_d` counters). "Zero-disk decode" was never the fork's
+  property — this is the placement census's second counter-class error (its §4 caught the same
+  population error in the hit-rate row and kept it in the bytes row; §1.2 row 8 stands corrected).
+  The mechanism is dead twice over on the tree's own evidence: the decode working set is
+  **~4,000–4,440 distinct experts (~102/layer) against the store's 48 slots/layer** (25.70 GiB
+  exactly spent — a perfect-oracle preload saves ≤ 2,064 of the ~4,400 loads), and the S7 arms
+  already measured the mandated `.coli_mfu` rank: the full-store seeded prewarm moved
+  decode-window misses 4,435 → 4,534 (worse), pin tenure worse still (`hit_rate_d` 68.1 → 62.9) —
+  the boot prewarm's real, kept win is TTFT −5.4 s via page-cache warming, which a prompt-end
+  preload cannot get. Where the lever actually is: the fork *hides* the same ~53 GB behind six
+  async MoE read+compute lanes (census row 7, never-tested on the port, fork-priced +23 % decode)
+  — handed to the campaign as the re-briefed PW-E. Evidence and arithmetic:
+  `docs/research/AK-pw-a2-zero-disk-decode-2026-10-25.md`.
+- **PW-Dfix (2026-10-26): the W1 fmt-15 P0 is found, fixed, and fmt 15 is the default
+  again.** The defect was never the packed form itself: `host_pairs` — the tier's hybrid
+  CPU path that computes host-pool experts in place — advanced each output row's *scale*
+  pointer by the f32-scale stride, so fmt 15's packed ue8m0 bytes were read 4× too deep
+  (past the 256 KiB scale range into the host pool's other bytes; a byte ≥ 0xC0 decodes to
+  a scale ≥ 2^65, garbage bytes to 2^127 — non-finite expert rows, and one layer below the
+  router fails exactly as the window saw; a 1-expert pool reads past the mapping and
+  segfaults). Row 0 is always correct — a decode-class step's single-row hybrid pair
+  passes — and no unit geometry leaves the scale range, which is how every gate stayed
+  green while the model died (the green runs also leaned on `rel()`'s NaN comparison being
+  false: a NaN row never raises a `worst`). Fixed by `host_scale_row` (vk_tier.c: the byte
+  stride for fmt 15, the f32 stride for every other format); the same class found and
+  closed in `qmatmul_grp_gemv.comp`'s writer tail (`fmt != 15` added to the per-row scale
+  guard — latent, the grouped GEMV needs cooperative matrices this rig lacks).
+  `COLI_VK_TIER_FMT15` is now the **default-on** form with `0` as the fmt-7 escape hatch;
+  the model-scale evidence: the new `deepseek-v4-smoke` gate PASSes at defaults, with
+  `COLI_VK_TIER_FMT15=1`, and with `=0`, where the pre-fix tree failed the same legs
+  deterministically (rc=1, "chained block failed in MoE"). The regression test is the
+  minimized repro (`model_hybrid_case`, test_vk_tier.c: fmt 15 at hidden 4096/inter 2048
+  with the hybrid forced — 18 rows, 32768 non-finite values pre-fix, clean post-fix).
+  Full record: `docs/research/AJ-pw-dfix-2026-10-26.md`.
+
+- The parity wave's first kernel slice (PW-C1, "move the LM head matmul to the
+  device") closed **premise-falsified, no code change**: the head matmul already
+  runs on the Vulkan device at the standing config — the prompt tail and every
+  decode token, through the per-matrix hook landed in `9f4eb917` (2026-10-02) —
+  in the fork's own placement (GPU bf16 matvec + score readback + host argmax,
+  identical tie-break). The audits' "port keeps the head (and the router matvec)
+  on the host" read the DHO host-RAM-copy placement line and the chain header's
+  in-frame-ownership comments as compute placement. The measured 72.9–88.1
+  ms/tok DPROF/CLI head term is the per-op wall of the device call (submit,
+  fence wait over queued chain/tier work, the 1.06 GB bf16 GEMV, readback), not
+  host compute; the pre-registered −60…−70 ms/tok does not exist as a placement
+  win. Evidence and the audit-series corrections: `docs/research/AF-pw-c1-head-2026-10-25.md`
+  (gdb call census at tiny, exact GPU-matmul count decompositions at two chunkings,
+  the 1010.0 MiB + 86.0 MiB close-line arithmetic).
+
+### Added
+
+- `COLI_VK_CHAIN_MHC_S1` (DeepSeek V4's chain, default off): the S=1 mHC slice of the
+  parity wave (PW-C3) — the fork's single-dispatch decode mHC pair (`mhc_dec_{pre,post}.comp`,
+  its Level-1 fusion) as `chain_mhc_dec.comp` on `chain_mhc`'s own buffers, offsets and
+  `hp` layout. A one-row forward's mHC site drops from eight dispatches (the fn matmul,
+  SPLIT, COLLAPSE, two bf16 rounds, the branch norm, POST and its round — the multi-
+  dispatch class the fork measured regressing at one row, 0.315 -> 1.161 ms/call) to
+  three (the matmul, one 256-thread workgroup for the whole pre tail, one thread-an-
+  output post with the round folded). The fork's own numbers for the pair: the op tick a
+  wash (0.317-0.321 vs the host loop's 0.306-0.311 ms/call), its +19 % decode win living
+  in the serialized host path the port's in-frame chain never had — so this is the
+  in-frame consolidation slice, not that number. Thresholded class against the standing
+  chain per D11 (the fused bodies' single-rounding fmas, fma reduction trees, the other
+  multiply order in the branch norm): unit-oracle at S=1 measures 5.8e-11 on the state
+  and bit-identical outputs at the model geometry, the tiny oracle token-exact with the
+  lever on; any refusal (streams > 8, hidden > 4096, a missing pipeline, the lever
+  unset) records the standing chain, byte-identical by construction. The lane also
+  re-armed `test_vk_tier`'s `packed_scales` around `COLI_VK_TIER_FMT15` — the W1 hotfix
+  (`d73b82e1`) made fmt 15 opt-in and left the test expecting the packed bytes by
+  default, which had `vk-tier-check`/`vk-strict-check` red at the branch point (proven
+  on the base tree; PW-D's debt, not the mHC change). Report:
+  `docs/research/AL-pw-c3-mhc-s1-fusion-2026-10-25.md`.
+- `COLI_VK_TIER_FMT15` — the P0 hotfix of the W1 bench window (2026-10-25): PW-D's
+  ue8m0-packed scales (device fmt 15) landed unconditional after a lossless proof at unit
+  scale, but the window's first model-scale arms found the packed form corrupts
+  resident-expert compute at the model's shapes (the router's input goes non-finite one
+  layer below a resident expert; bisected clean→broken exactly at the PW-D merge, with
+  PW-C2's tip clean beside it — `docs/research/AI-pw-w1-2026-10-25.md`). Every unit/tiny gate had
+  stayed green: their geometries cannot reach the model's, a class of miss the window
+  itself now prices. The hotfix keeps all the fmt-15 code and makes it opt-in —
+  `COLI_VK_TIER_FMT15=1` arms the packed form (+17.6 % tier capacity at the same bytes
+  once its resident-path defect is found and fixed); unset, the f32-scale fmt 7 is the
+  standing default again, byte-identical to the pre-PW-D tier. **Superseded by PW-Dfix
+  (2026-10-26)**: the defect is found and fixed (the hybrid path's scale stride, not the
+  packed form) and fmt 15 is the default again — see the Notes above and
+  `docs/research/AJ-pw-dfix-2026-10-26.md`.
+- `deepseek-v4-smoke` — the model-scale smoke gate (make target,
+  tests/deepseek_v4_smoke.sh): the W1 window's institutional lesson made standing — a
+  slice that changes a tier/chain default owes one ~2-minute generation on the real model
+  before merge. Runs DeepSeek V4 Flash (MODEL, default the rig's path) on a ~100-token
+  prompt for 16 tokens; checks rc=0, a coherent generated_text, and the failure lines
+  ("chained block failed", "device is lost", a nonzero failed counter); skips cleanly
+  when the model, the Vulkan device or the build is absent, fails when the card has other
+  holders.
+
+- `COLI_VK_TIER_DECODE_GROW` (the Vulkan expert tier, default off): demand-growing decode
+  residency — the tier's resident set stops being the warm start's fixed one. At the first
+  decode-class step the tier probes what the device actually has free (the boot budget could only
+  guess at what the chain, the KV mirror and the head take; by now they have taken it) and grows its
+  budget into that first, then — only beyond it — retires stream slots one place at a time as decode
+  demand installs (`COLI_VK_TIER_DECODE_GROW_GB` bounds both sources,
+  `COLI_VK_TIER_DECODE_GROW_RESERVE_GB`, default 0.5, is what the probe leaves for what still
+  allocates at decode). The installs rank by the engine's decode-only counts (the `.coli_mfu` table,
+  handed over as `VktConfig.decode_heat` through `coli_v4_expert_store_mfu_history`): the cutoff is
+  the K-th largest count over the experts the device does not hold — the fork's `cache_reorder`
+  rule — and an expert at or above it installs into a grown place, never a victim's (no eviction,
+  the warm set stands), while one below it installs not at all at a decode step: the grown room is
+  the rank's. `vkt_wants` mirrors the gate and `promote` takes it too where grown room exists, so
+  the merged-history warm cannot spend the growth before decode's hot; prefill keeps the standing
+  note path. The census's asymmetry answered: the fork's decode grew ~8.3 GiB of MFU-ranked demand
+  installs (`gpu_cap=954`) where the port's set was fixed (277 residents, `evictions 0`, decode
+  device share 13–22 %). Unit proof (`test_vk_tier` `decode_grow`): free-VRAM growth 6 -> 8 by
+  decode-only rank with the below-cutoff routed experts never installed (cutoff 40), slot-beyond
+  growth 6 -> 9 with slots 6 -> 3 and the cap refusing the fourth install (cutoff 30), the default
+  growing nothing; the report line's `decode grow:` clause is the engagement print. Evidence:
+  `docs/research/AH-pw-a1-decode-grow-2026-10-25.md`.
+- `COLI_VK_CHAIN_ATTN_FA` (DeepSeek V4/V4.1's chain): the fork's `sparse_attn_fa` tile
+  ported onto `vkc_dsv4_attn`'s contract (`chain_dsv4_fa.comp` — same bindings and push
+  constants as `chain_dsv4.comp` mode 0, so the one call dispatches either): a workgroup
+  Br query heads of one token streams the row list in Bc tiles with the K/V rows staged
+  once in LDS (K == V), an online softmax and llama's sink end block, against mode 0's a
+  workgroup a (head, row) re-reading every row twice per head (the shader census' ~32x
+  the KV bytes). Four builds from the one source, the fork's four: Br 8 prefill, the
+  Br 2 decode twin at tokens == 1 (a head's numerics unchanged, heads/2 workgroups),
+  each with a KV_F16 twin reading the f16 mirror `chain_dsv4_fa_gather.comp` writes a
+  dispatch ahead — the fork's storage-only fp16 (its standing arm) as a read-side mirror
+  over this port's fp32 stores: half the KV read bytes, the same numerics class, nothing
+  permanent, no writer touched. `1` = tile + mirror (the fork's standing class), `2` =
+  tile over fp32 (its KV_F16=0 arm); unset/0 = mode 0, byte-identical, the FA modules
+  not even loaded; every refusal (head dim != 512, heads % 8, unaligned q/o/w/c offsets
+  or strides, a missing pipeline) falls back to mode 0 — never a misread — and the
+  KV-split path (`chain_kvs.comp`) is untouched. Thresholded class where it engages
+  (the unit oracle: 4.1e-3 f16 / 6.5e-3 worst against the 8e-3 mode-0 bar, the fork's
+  own gate 2e-3; token-exact at tiny holds — the tile cannot engage at the tiny
+  fixture's head dim 32). RX 6900 XT, the model's decode geometry: 1920 -> 228 us a
+  layer-dispatch (8.4x, ~= the fork's ~10 ms/tok over 43 layers vs the 63.8 ms/tok
+  bucket), a 256-row chunk 304 -> 6.0 ms (51x). `VkcStats.attn_fa` counts engagements;
+  the grown-scratch pattern (`adec_scratch`) refactored to a second user.
+  Report: `docs/research/AG-pw-c2-fa-flash-attention-2026-10-25.md`.
+- **fmt 15 — the tier's MXFP4 experts with packed ue8m0 scales** (the parity wave's PW-D
+  slice): `VKT_SRC_MXFP4_E8M0` experts (DeepSeek V4/V4.1, Kimi K3, MiMo) now keep their
+  group scales on the device **as the ue8m0 bytes the store holds them in** — 1 byte a
+  32-input group, 4 to a word — instead of expanding each to f32 at upload. The round
+  trip is the identity (the byte's value is the float's exponent field: 2^(e−127),
+  exactly what the old expansion wrote), so the packing changes bytes, never values:
+  a DeepSeek V4 expert's device payload drops **15.0 → 12.75 MiB (−17.6 %)** — the fork's
+  own slab class — and every stream, promote and upload byte for MXFP4 experts drops
+  with it; at the same budget the tier holds 1.1765× the experts (both residents and
+  stream slots shrink; 277→~374 residents beside 256 slots at the census rig's 7.85 GiB).
+  A new device format number rather than a redefinition: fmt 7 (f32 scales) stays for
+  `VKT_SRC_MXFP4_F32` sources and the generic dense matmul APIs (which take `float*`
+  scales and refuse the packed form); every resident-expert consumer reads the bytes
+  with one extract branch — `qmatmul_grp_mx`(+gate_up), `chain_moe_gv`, `chain_moe`,
+  `qmatmul`, `qmatmul_gate_up`, `qmatmul_gemm`, `qmatmul_coop`, `qmatmul_grp_gemv` — and
+  the CPU host-rows path decodes them the same way. Proof: the packed form's device rows
+  are **bit-identical** to the f32 form's over the same codes and scales (the new
+  `run_xbatch_mx_pack` case), the ue8m0⇄f32 identity is unit-checked over all 256 bytes,
+  and the tiny oracle is token-exact with the tier on fmt 15 (decode, prefill, dmoe,
+  bank and the composed legs). The CUDA tier keeps fmt 7 (its ops table has no packed
+  form yet); no env, no gate. Report: `docs/research/AE-pw-d-ue8m0-u8-scale-packing-2026-10-25.md`.
+- `COLI_VK_CHAIN_ORDER=layer` (DeepSeek V4's chain) + `COLI_VK_DMOE=all` (the dmoe arm's
+  multi-layer form): the prompt loop reordered layer-outer — the fork's own prefill
+  order ("A true prefill is layer-major: every prompt position crosses this layer before
+  the next one begins"), behind a default-off env whose unset value runs today's chunk
+  loop untouched. The layer-outer pass lowers each layer's attention mirrors at its own
+  head (against a pre-pass snapshot of the window rings — the live `slot_pos` follows the
+  earlier layers' chunks), keeps the prompt's streams resident across the layer's pass
+  (`ch->xall`; each layer-chunk unit copies its rows in and out of the chunk's scratch),
+  and lays the chunks' lists and RoPE tables side by side on the device so a later
+  layer's unit reads the chunk it is visiting (`V4cFwd.lbase`). The unit is the chunk
+  path's layer body verbatim — the same frames, the same per-row GEMV batches — so at
+  `COLI_VK_CHAIN_GEMM_ROWS=0` the reorder is bit-neutral by construction (verified
+  bit-equal against the chunk order at the tiny gate) and the default is byte-identical.
+  The loop drives the bank's rotation (`vkt_bank_switch` at each layer head, over the
+  quiescent tail the layer before left): one bank — or one stream-slot window — serves a
+  layer's every chunk before it moves, the at-most-once refill holding per tenure; that
+  is the regime S1's chunk leg measured the absence of (chunk-outer order needs the slots
+  for the other 42 layers every chunk, so the 3.75 GiB carve and the streaming could not
+  coexist). `COLI_VK_DMOE=all` arms the chain's whole lo..L range in one prepare (each
+  layer's gate looked up at its visit, hash layers and gate-less layers masked to the
+  host's step), declining with one line without the layer order. The tier's books and
+  DSpark's taps drain at the loop's wait points (a host-step unit's A1, the split's
+  copy-back, each layer tail) where the frames that wrote them are through. Prompts of
+  more than one chunk only; the reorder declines to the chunk order (one line) where the
+  prompt's streams, lists and tables do not fit beside the chunk's scratch.
+- `COLI_VK_TIER_BANK_LAYER` (the routed-expert tier) + `COLI_VK_DMOE_ROWS_MAX` (the
+  dmoe arm's prompt path): the VRAM bank and its frame-split cap. The bank is the fork's
+  eg2_bank discipline in the tier's own places — one layer's experts planned whole to
+  the device, pinned for the tenure, and paid for by an explicit carve of the stream
+  slots' budget (256 slots ≈ 3.75 GiB → DeepSeek V4's 256 MXFP4 experts at the standing
+  arm), so the bank and the slots never add and a resident keeps its place; the boot
+  line ledgers the trade and every decline (out of range, a hash layer, streaming off,
+  no room) prints one line and leaves the plan the history's. Because banked experts are
+  ordinary residents, `vkt_dev_table` counts them with no new gate code (the dmoe gate
+  opens — the POOL_LAYER precedent), and the bank adds the tenure discipline the slots
+  never had: a per-layer validity bitmap with at-most-once refill at the routed step
+  (post-router, pre-issue, through the bypass group reader), and an explicit switch seam
+  (`vkt_bank_switch`) that clears the bitmap, frees the old layer's places at a
+  quiescent point and refills the new layer's under the same at-most-once rule — a
+  rotation never re-reads what a tenure already read, and the engine's step never
+  rotates the bank (the chunk-outer order would thrash a place a layer; the layer-outer
+  reorder is what will drive it). `COLI_VK_DMOE_ROWS_MAX=R` caps the rows a dmoe frame's grouped GEMMs may
+  carry, `vkc_submit` + `vkc_begin` between row groups (the `vkc_layer_recorded`
+  pattern), each group routing its own rows into its own slice of the routed sum — the
+  amdgpu hard-recovery boundary (~2–4 s of GPU work in one submission; the armed chunk
+  lost the device at model scale) becomes a knob while the bits stay the whole chunk's
+  (the split-vs-unsplit unit gate is bit-exact). Both default off, byte-identical; the
+  unit gates cover the carve's ledger, the 2-layer rotation both ways, the declines, and
+  the split at equal rows, and the tiny dmoe check runs a bank-armed leg token-exact.
+- `COLI_VK_CHAIN_DPROF` (the chain, the tier, the V4 CLI bench): G1's slice S0 — the
+  instrumented decode window that settles whether the ~200 ms/token fence-wait-versus-
+  device-time gap is real before any code slice spends on it. `1` (default unset,
+  changing nothing, the output byte for byte) arms three reports over one window:
+  DeepSeek V4's chain opens it on a forward of one row (`vkc_dwin`, a decode step —
+  the prompt's chunked forwards close it again) and stamps each frame at its submission
+  with the role the record site names (`vkc_role`: the dense A1, the shared-expert A2,
+  the dmoe path's frame when armed, the forward's closing tail), so the exit line
+  `chain decode: N fwd, S submits, W waits, X ms wait (A1 … / A2 … / dmoe … / tail …),
+  Y ms device (…), Z ms in vkQueueSubmit` attributes the host's fence waiting to the
+  frame it waited for and the device time (the same timestamps `COLI_VK_CHAIN_PROF`
+  reads; on without it the device split stays 0) to the same frames; the run's own
+  chain line gains the fence-wait count it always counted and never printed
+  (`VkcStats.waits`); the tier adds its decode steps' (`S <= VKT_UP_ROWS`, the share
+  `vkt_report` already splits) waited / device / CPU ms and the MiB `promote` queues
+  over PCIe — H1's traffic term; and the CLI bench prints `v4_dprof decode` with
+  wall / block / head / other per token, `block` the one-row forwards' own span, so
+  the unattributed pool behind the gap is a difference of printed numbers instead of
+  a subtraction PORT_STATUS had to guess at. Counters only, filled where the existing
+  ones already tick — no allocation in the frame, submit or join paths, cheap enough
+  to leave on in an arm; the chain's test gains the window's case (frames inside it
+  counted once each by role, their waits with them, frames outside it counted
+  nowhere).
+
+- `COLI_VK_TIER_POOL_LAYER` (the routed-expert tier): the L2 Stage C lever —
+  `COLI_VK_DMOE`'s residency activator that is **not a device pin**. `=n`
+  (default unset, changing nothing) plans layer n's experts into the host pool
+  at the warm start, ahead of the heat history: no device place, no staging
+  slot, no prefetch entry is spent, and `vkt_dev_table` counts them anyway (a
+  pool resident keeps `dev` 0), so `vk_dmoe.h`'s all-or-nothing gate opens for
+  a layer the device tier could never hold whole — the measured reason Stages
+  A+B stayed inert at model scale (T-l2-arms-2026-10-24: every D-run declined,
+  zero layer steps through the dmoe path, all timing deltas noise). All or
+  nothing like the gate it serves: a pool that cannot hold all E of the layer
+  places none of them and says so once. `hot_pin` pins the placed layer and
+  `promote` skips it, so the tier's own promotions cannot move it up to the
+  device and churn the residents there — the exact mechanism that made the
+  device-pinned variant a measured negative (`98fcee51`: prefetch 12,644->1,890,
+  TTFT x2 on 16 GiB). The pool must be on and hold the layer
+  (`COLI_VK_TIER_HOST_GB`; ~3.75 GiB of system RAM for DeepSeek V4's 256 MXFP4
+  experts), which is the trade: the layer's visits are PCIe-bound instead of
+  device-resident. DeepSeek V4's `VktConfig.stage` stays unset on purpose (the
+  staging carve is block-format-gated at two layers and fmt 7 never stages; the
+  reasoning now sits beside the config for a future block-format V4). The
+  tier's test gains the lever's case: exactly E of the layer planned into the
+  pool ahead of the history, resident there with the device's mask empty, the
+  table whole for the gate, still in the pool after the books' promotions with
+  the device keeping its own residents, and a pool one place short placing
+  nothing — the plan then identical, entry for entry, to the lever-free tier's.
+- `COLI_VK_DMOE` + `COLI_VK_DMOE_ROWS` (DeepSeek V4's chain): the L2 Stage A
+  wiring — DeepSeek V4 joins `vk_dmoe.h`, the shape upstream's own MoE engines
+  (olmoe, qwen36, qwen38) already have. `COLI_VK_DMOE=n` (default `0`, changing
+  nothing) arms one non-hash layer on the primary device: a step of up to 8 rows
+  (decode, a short verify) whose tier holds all of that layer's experts routes
+  and computes its routed experts in the dense chain's frame — the gate logits
+  (`ffn.gate.weight`, the chain's GEMV) and the router through `vkc_route` with
+  `route_bf16_impl`'s exact parameters (sqrt(softplus), the gate bias for the
+  pick only, the weights score/sum x `routed_scaling_factor`, no eps), the
+  experts through `vkc_dmoe_prepare/on/layer`, the shared expert recorded beside
+  them, no wait and no host step at that layer, the join taking `dm.y`, the
+  tier's books (`vkt_dev_count`) from the ids after the frame, and
+  `vkc_dmoe_upload` at every frame start (after each host layer too — the epoch
+  discipline, a layer the host steps through may evict what an in-flight
+  frame's table names). A layer the tier does not hold whole keeps the host's
+  step (the exit report says so whatever the run did), as do hash layers
+  (`vkc_route` cannot express their token table), the second device and
+  `COLI_VK_CHAIN_MOE=0`; the arm's parse runs before any `vkc_dmoe_*` call, so
+  unset arms nothing and reserves nothing. `COLI_VK_DMOE_ROWS=1` (default `0`)
+  lifts the 8-row cap through `vkc_moe_rows`' fmt-7 grouped GEMMs — the same
+  chunking invariant `COLI_VK_CHAIN_GEMM_ROWS` documents, so it stays opt-in;
+  the tier's `COLI_VK_TIER_PIN_LAYER` (0c6ddae2) is the arm's residency
+  scaffolding. The experts' weighted sum is `chain_moe.comp`'s rank order
+  against the CPU block's ascending expert id — the chain's float-reassociation
+  class, gated by the token-exact oracle, not bit equality. Measured on the
+  whole-layer pin variant: **a negative** — a 3.75 GiB all-or-nothing layer
+  strangled prefetch and doubled TTFT on 16 GiB (prefetch 12,644->1,890,
+  `docs/HANDOVER-2026-10-23.md` 2.3; the disk-load figures live only in the
+  `98fcee51` message), so this lands as wiring and alignment, not a TTFT claim;
+  the pool-placed lever (Stage C) is untried. New gate
+  `make VK=1 deepseek-v4-tiny-check-dmoe` = the tiny check with the arm on
+  (layer 1, and the chunk path for the 72-token case), token-exact; the tier's
+  test gains the pin lever's plan/table row and the chain's gains `COLI_VK_DMOE`'s
+  parse cases and V4's kind-2 router shape against the reference arithmetic.
+- `vkc_moe_rows` takes fmt 7 (MXFP4): a prompt chunk's routed experts in the
+  tier's native format, through `qmatmul_grp_mx.comp` (the expert batch's
+  mode-4 GEMM, in floats — no matrix-unit variant exists for it) beside the
+  block formats' and our formats' pipelines, its 36-byte push constant beside
+  their 24-byte one. `vkc_moe_rows_ready(7, 7)` turns true and
+  `VkcPrewarm.ex_mx` prewarms the pair like `ex_ours`'s. No engine routes a
+  chunk through it yet — DeepSeek V4's `vk_dmoe` wiring is the next slice;
+  until one asks, every engine's bits are unchanged. The chain's test gains
+  the fmt-7 rows against `chain_moe`'s float form of the same experts (max
+  |diff| ~1e-9) and DeepSeek V4's kind-2 router (`route_bf16_impl`'s math,
+  ties included) against `chain_route.comp`.
+- `COLI_V4_FROZEN_PCT` + `.coli_mfu` + `hit_rate_d` (DeepSeek V4): the
+  engine-store MFU cache — the fork's cache approach on the port's store
+  (S-store map, `docs/research/S-store-mfu-map-2026-10-23.md`). The fork's
+  `mfu_table.{c,h}` is lifted as-is: a flat decode-only counter per expert,
+  one `mfu_record` per routed selection of a decode/spec token (the token
+  seam `v4_vk_token_issue` — the batch/prefill seam never counts), persisted
+  as `<model>/.coli_mfu` at store close whenever anything was recorded,
+  knob or no knob (the fork's rule: the file is the next run's seed; a run
+  that recorded nothing writes nothing — CPU-only and prefill-only runs
+  leave no file). On top of it: `COLI_V4_FROZEN_PCT` (default `0` = today's
+  exact policy) freezes that percent of each layer's slots, victim-exempt
+  and ranked by `.coli_mfu`, riding the existing pin machinery — a separate
+  `frozen_count` beside `pin_count` (capped at `slots_per_layer - 6`, not
+  the 16-slot pin cap, so 100% lifts to 42/48) in the same `pins[]` row, so
+  no new victim selector and the `.coli_usage` pins keep their exact
+  semantics; `COLI_V4_PREWARM` ranks a layer by `.coli_mfu` when the
+  decode-only history has seen it (the merged usage otherwise) and
+  re-stamps LRU age in reverse rank order after the fill — without it the
+  fill order leaves the hottest seeds the oldest and the first misses eat
+  exactly them (the fork measured this); and the store's stats gain
+  `requests_decode`/`hits_decode`, printed as `hit_rate_d=` on the
+  `v4_tokens` line always — the decode-only hit rate the campaign's verdict
+  is pre-registered on. The mfu table's own decay knob is the fork's
+  `COLI_DSV4_VK_MFU_DECAY_SHIFT` (default `0` = no load decay).
+- `COLI_VK_TIER_STREAM_BYPASS` (DeepSeek V4): the stream fills' cache-bypassing
+  reads and the engine's parallel batch reader — the S1+S2 pair of the L1
+  byte-economy map (`docs/research/R-l1-byte-economy-map-2026-10-23.md`). The
+  tier's `load_batch` hook existed unused; the engine now fills it, reading a
+  group of up to 8 experts at once (the prewarm's parallel-lookup shape), and a
+  cold expert of a stream fill is read straight from the disk into a bounded
+  stage pool (8 x 16 MiB, 4096-aligned, process lifetime) through
+  `coli_v4_expert_store_read_private` — the warm start's reader, which takes no
+  lease, no LRU slot and no store counter — instead of through a lease, whose
+  every fill evicted a slot the decode hot set or the rows16 pins could have
+  kept (~192 GiB of one-shot experts a run through it; the store's hit rate
+  stays a real measure of service). An expert the store already holds is still
+  leased (a RAM hit beats the disk), `note_routed` keeps the `.coli_usage`
+  history whatever loaded the expert, a bypass read that fails falls back to
+  the lease, and the bytes are the lease path's bit for bit — so the arm is
+  numerics-identical, only which cache sees the bytes differs. Default `0`
+  wires no `load_batch` and changes no bit; the tier's run line now carries the
+  `R` it settled at (an arm that moves the load path moves `bw_up`, so `R`
+  moves with it — arms compare at the same `R`).
+- `COLI_VK_TIER_HOT`/`_SCOPE`/`_UPDATE`/`_HOT_HASH`: the routed-expert tier's
+  hot set — the history's top share of the resident places, ranked on the raw
+  `.coli_usage` counts (the same ranking the warm start uses, never the scaled
+  1..31 heat), marked on the slots and skipped by every victim path, so the
+  adaptive tail's promotions cannot churn the warm start's head. Default `0`
+  is byte-identical (the guards are pure skips); `COLI_VK_TIER_PIN_LAYER`, the
+  dmoe arm's lever, is the explicit form (a whole layer pinned and planned
+  first), and streaming's staging slots are clamped so they cannot eat the
+  frozen section. The tier's report line gains the pin count (`pins N (hot P%
+  of K resident places, scope, fixed or re-pinned)`) and a decode-only device
+  share (`decode: N of M routed experts on the device`) — the run-level `device
+  N of M` is dominated by a prompt's rows.
+- `COLI_VK_PROFILE`: one knob for the measured operating points. `RDNA2`, the
+  headline value, is the hardware profile tuned on the RX 6900 XT and applies
+  the stage-aware best set itself (a queued prompt of 1,000 tokens or more
+  takes the ttft set, a smaller one the decode set, a length the engine cannot
+  know when the knobs are read — serve, streaming — the balanced set);
+  `ttft`/`decode`/`balanced` force one stage's set, `auto` is `RDNA2`'s other
+  name. The fills land in unset variables only (an explicit env var always
+  wins), one `[VK] profile: ...` boot line says what was applied, and unset or
+  `0` is byte-for-byte today's behaviour. The three sets, RX 6900 XT,
+  2,515-token prompt / 64 tokens, 28 GiB plan (`bench/up2276/`): ttft
+  187.7 s / 0.533 / 305.9, decode 239.5 / 0.670 / 333.5, balanced
+  205.7 / 0.557 / 318.9 with the 24 GiB plan budget on the `--memory-gb`/
+  `RAM_GB` path where no budget was named. Likely beneficial on other devices,
+  but benchmarks are needed to confirm.
+- `COLI_VK_MM8`/`COLI_VK_MM8_SPLITK`: DeepSeek V4's fp8 dense projections
+  may run on the tiled weight-stationary GEMM `qmatmul_mm8.spv` — the weights
+  staged once a tile, the group scale folded at staging, one fp32 accumulator
+  an output over ascending k, so the same exact terms as the GEMV's sums in
+  another order (a measured envelope, not bit-identical; every tile of the
+  table bitwise the frozen one). Opt-in, the default `0` keeping a row's bits
+  dependent on its inputs only; `-1` follows the backend's fill rule for
+  prompt rows only, exactly `COLI_VK_CHAIN_GEMM_ROWS=-1`, so a verify's rows
+  and every decode step keep the GEMV's bits. The split cuts a starved
+  shape's reduction into k partial planes summed in ascending k
+  (deterministic, never bitwise). On an RX 6900 XT, S 128, the six real
+  projection shapes, best tile: the GEMV's 185–241 GMAC/s to 2,107–4,183,
+  the most starved (wkv) 574 → 2,107 with the split (experiment record in
+  `docs/experiments/mm8-2026-10-22/`).
 - `COLI_VK_CHAIN_GEMM_ROWS`: DeepSeek V4's chain prompt rows may take the
   backend's tiled GEMM instead of the per-row GEMV (`-1` follows the backend's
   rule, `N` from N rows; a verify's rows and decode keep the GEMV's bits). On
@@ -14,6 +453,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   152.1 s median (prefill 13.3 to 16.5 tok/s; experiment record in
   `docs/experiments/gemm-rows-2026-10-20/`); the default stays `0`, keeping a
   row's bits independent of the chunking.
+- The Vulkan tier's host pool can size itself from the engine's RAM plan:
+  `VktConfig` carries `ram_planned`/`ram_budget`/`ram_spare`, and the pool
+  takes at most what that plan leaves unclaimed. DeepSeek V4 passes its
+  resolved budget; without the bound the pool granted 25.75 GiB of system RAM
+  beside a 17.65 GiB plan and the kernel killed the process. Engines without a
+  plan keep the old rule, now also less their cache growth still to come, and
+  `COLI_VK_TIER_HOST_GB` still overrides the plan (with a line when it goes
+  over). `COLI_VK_TIER_HOST`/`_GB` also gain their missing
+  `docs/ENVIRONMENT.md` rows.
+
+- `COLI_VK_STRICT=1`: an opt-in mode that makes a silently lost Vulkan
+  capability fatal. One helper (`coli_vk_degrade`) now reports every point
+  that would quietly leave the GPU off — a shader absent from the deployment,
+  a fence wait that failed, the device lost mid-run, a staged upload's fence
+  — naming the operation; under strict it aborts with exit 70 so a broken
+  deployment cannot pass unnoticed. Legitimate refusals (a format or tile the
+  device never had) and budget fallbacks behave exactly as before, and unset
+  or `0` is byte-for-byte today's behaviour. `tests/test_vk_degrade.c` runs
+  the class table with no device; `make vk-strict-check` runs the fault knobs
+  against a real one.
 - SSSE3 integer-dot tier in `c/idot.h`: `maddubs`/`madd` kernels for
   `dense_act_i8`, `dot_i8i8`, `dot_i4i8`, `dot_i4p_u` and `i4p_gidot_rows`
   give pre-AVX2 x86-64 CPUs (SSSE3, no AVX2/FMA) an accelerated path where
@@ -24,6 +483,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   fetch, immediate admission into the per-layer LRU, 128-row prompt blocks in
   ascending expert id), so expert-placement policies can be compared on a model
   that runs on a CPU-only machine.
+- `tok_load` hardening: `tokenizer.json` is validated before it is indexed —
+  token ids must be finite integers in range (a negative id indexed below the
+  allocation, a fractional one aliased a different token), the containers
+  must have their shapes, and an `added_tokens` entry must carry `id` and
+  `content` — so a malformed file fails at load with a message instead of an
+  out-of-bounds write or a NULL deref
+  (`c/tests/test_tok_load_validation.py`). The commit rode in on `main`
+  (88c89479) before the port branches split, so no port slice carried it;
+  recorded here for the ledger.
 
 ## [2.0.0] - 2026-10-06
 
