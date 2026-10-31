@@ -205,3 +205,8 @@ c/shaders/*.spv
 .golden/
 # golden-parity run captures (keep .golden/upstream, the recorded fixtures)
 .golden/run-*/
+
+# raw bench campaign output (the up2276 logs, runners and scratch the
+# performance arms wrote): the curated records are docs/experiments/, the raw
+# campaign lives on the archive branches — never back in the PR tree
+bench/

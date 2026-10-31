@@ -1,7 +1,0 @@
-[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
-[VK] ready: AMD Radeon RX 6900 XT (RADV NAVI21), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096
-K1: fmt 7 gs 32, E 256 K 6 D 4096 I 2048, a layer's experts 3.75 GiB, 48 layers a frame
-K1 S   512: routed ok=1
-radv/amdgpu: The CS has been cancelled because the context is lost. This context is guilty of a hard recovery.
-[VK] chain: queue submit failed (-4): the device is lost
-K1 S 512: a frame failed (moe not reached, rows done)

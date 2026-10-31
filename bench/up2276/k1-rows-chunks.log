@@ -1,7 +1,0 @@
-[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
-[VK] ready: AMD Radeon RX 6900 XT (RADV NAVI21), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096
-K1: fmt 7 gs 32, E 256 K 6 D 4096 I 2048, a layer's experts 3.75 GiB, 8 layers a frame
-K1 S   512: routed ok=1
-K1 S   512: vkc_moe_rows phase done (47727.3 us/layer best)
-K1 S  2048: routed ok=1
-K1 S  2048: vkc_moe_rows phase done (99135.1 us/layer best)

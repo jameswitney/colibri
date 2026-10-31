@@ -5,6 +5,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+The campaign's working layer cited below — the dated `docs/research/` notes
+(except the four kept for their in-tree citations), `docs/campaign/`,
+`docs/PORT_STATUS.md`, the `docs/HANDOVER-*.md` files, the wave1/gap2/gap3
+syntheses and the raw `bench/up2276/` logs — is not part of this tree: it
+lives in the campaign record (branch `archive/performance-pr-178`). The
+curated records are `docs/experiments/` and the durable docs in
+`docs/performance-pr/` and `docs/pr/`.
+
 ### Added
 
 - `COLI_VK_TIER_STREAM_RING` (default off): the stream's prefills move off the engine
