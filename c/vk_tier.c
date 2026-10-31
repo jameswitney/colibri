@@ -2743,18 +2743,25 @@ static inline void host_rows(float *y, int ys, const gq_act *a, const HyAct *hp,
     }
 }
 /* host_rows for four consecutive rows (rb bytes apart, their scales nsc floats apart), row r
+ * of the four reading host_rs4's pointer (fmt 15's packed ue8m0 scales are a byte a group —
+ * the same advance host_scale_row makes one row at a time, so the fast path stays exact there)
  * at y + r * ystep: one check for the four. Four rows sharing one pass over the activation
  * (a sum in flight per row) was tried and lost to hy_dot4's four sums per row: 183 against
  * 129 us a pair on one core, 36 against 34 on twelve. */
+static inline const float *host_rs4(const float *rs, int t, size_t nsc, int r) {
+    if (!rs) return NULL;
+    if (t == -15) return (const float *)((const uint8_t *)rs + (size_t)r * nsc);   /* a byte a group */
+    return rs + (size_t)r * nsc;
+}
 static inline void host_rows4(float *y, int ys, int ystep, const gq_act *a, const HyAct *hp, const float *const *xf, const uint8_t *row,
                               size_t rb, int t, int I, float *tmp, const float *rs, size_t nsc, int gs) {
     if (t < 0 && (-t == 2 || -t == 4) && hp && hp->S == a->S && !gq_exact_mode()) {
         for (int s = 0; s < a->S; s++) {
-            for (int r = 0; r < 4; r++) y[(size_t)s * ys + (size_t)r * ystep] = hy_dot4(row + (size_t)r * rb, rs ? rs + (size_t)r * nsc : NULL, gs, hp, s);
+            for (int r = 0; r < 4; r++) y[(size_t)s * ys + (size_t)r * ystep] = hy_dot4(row + (size_t)r * rb, host_rs4(rs, t, nsc, r), gs, hp, s);
         }
         return;
     }
-    for (int r = 0; r < 4; r++) host_rows(y + (size_t)r * ystep, ys, a, hp, xf, row + (size_t)r * rb, t, I, tmp, rs ? rs + (size_t)r * nsc : NULL, gs);
+    for (int r = 0; r < 4; r++) host_rows(y + (size_t)r * ystep, ys, a, hp, xf, row + (size_t)r * rb, t, I, tmp, host_rs4(rs, t, nsc, r), gs);
 }
 typedef struct { const uint8_t *g; int p; } HyKey;
 static int hy_key_cmp(const void *a, const void *b) {
@@ -2890,12 +2897,12 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
                 continue;
             }
             const size_t nsc = h->gsgu ? (size_t)(D + h->gsgu - 1) / h->gsgu : 1;
-            if (whole && h->tg < 0 && h->tg != -15) {   /* two fours: one check for each (fmt 15's packed
-                                                 * scales take the per-row host_scale_row path below) */
+            if (whole && h->tg < 0) {   /* two fours: one check for each (fmt 15 included: host_rs4
+                                 * inside advances the packed byte scales, host_scale_row the base) */
                 for (int o = o0; o < o1; o += 4) {
                     const int oo = o < I ? o : o - I;
                     host_rows4(gu + (size_t)q0 * 2 * I + o, 2 * I, 1, &ag[g], &pg[g], xo + q0, (o < I ? h->g : h->u) + (size_t)oo * h->rgu, h->rgu,
-                               h->tg, D, tmp, (o < I ? h->sg : h->su) + (size_t)oo * nsc, nsc, h->gsgu);
+                               h->tg, D, tmp, host_scale_row(o < I ? h->sg : h->su, h->tg, h->gsgu, D, oo), nsc, h->gsgu);
                 }
                 continue;
             }
@@ -2934,10 +2941,10 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
                 continue;
             }
             const size_t nsc = h->gsd ? (size_t)(I + h->gsd - 1) / h->gsd : 1;
-            if (o1 - o0 == 8 && h->td < 0 && h->td != -15) {
+            if (o1 - o0 == 8 && h->td < 0) {
                 for (int o = o0; o < o1; o += 4)
                     host_rows4(dy + (size_t)q0 * D + o, D, 1, &ah[g], &ph[g], ho + q0, h->d + (size_t)o * h->rd, h->rd, h->td, I, tmp,
-                               h->sd + (size_t)o * nsc, nsc, h->gsd);
+                               host_scale_row(h->sd, h->td, h->gsd, I, o), nsc, h->gsd);
                 continue;
             }
             for (int o = o0; o < o1; o++) {
