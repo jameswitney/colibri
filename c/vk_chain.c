@@ -3968,12 +3968,12 @@ static int dsv4_rec(int kind, VkPipeline pipe, int mode, const void *b, size_t b
  * permanent. Numerics: thresholded against the scalar path, never bit-identical (the
  * fork held 2e-3): the dot is a subgroup tree, the softmax rescales in tile order and
  * the tile max carries llama's KQ_MAX_OFFSET, which also moves the bf16 probability
- * rounding's scale (flags 1). COLI_VK_CHAIN_ATTN_FA: unset/0 keeps mode 0 (today's
- * bits, read per call so a test can arm it case by case); 1 the fork's standing class
- * (the tile + the f16 mirror); 2 the tile over the fp32 rows (the fork's KV_F16=0
- * arm). A shape the tile cannot take (hd != 512, heads % 8, or a q/o/w/c offset or
- * stride not a multiple of 4 floats) or a pipeline that did not load falls back to
- * mode 0 -- never a misread. */
+ * rounding's scale (flags 1). COLI_VK_CHAIN_ATTN_FA: 1 the fork's standing class (the
+ * tile + the f16 mirror), the DEFAULT since gap-wave4; 2 the tile over the fp32 rows
+ * (the fork's KV_F16=0 arm); =0, and an unset env under COLI_VK_LEGACY=1, keep mode 0
+ * (read per call so a test can arm it case by case). A shape the tile cannot take
+ * (hd != 512, heads % 8, or a q/o/w/c offset or stride not a multiple of 4 floats)
+ * or a pipeline that did not load falls back to mode 0 -- never a misread. */
 enum { FA_BR8, FA_BR8_F16, FA_BR2, FA_BR2_F16, FA_GATHER, FA_N };
 static struct { VkShaderModule mod[FA_N]; VkPipeline pipe[FA_N]; int tried; } g_fa4[2];
 #define FA4 (g_fa4[g_kd])

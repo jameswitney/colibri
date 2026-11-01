@@ -9,9 +9,10 @@
  * the K1/P1 boundary), so the default keeps one frame under ~1 s): the best of 3
  * reps after a one-dispatch warm-up frame that also grows arm 1's f16 mirror
  * scratch, whose steady state re-gathers every dispatch.
- * The lever is set per arm around the recorded frame; VkcStats.attn_fa must move by the
- * dispatch count on the arms and not at all on mode 0 — a device without the tile says
- * so instead of reporting a 1x that is really mode 0.
+ * The lever is set per arm around the recorded frame (mode 0 pins =0 -- gap-wave4 made
+ * 1 the default, so an unset lever would time the tile); VkcStats.attn_fa must move by
+ * the dispatch count on the arms and not at all on mode 0 — a device without the tile
+ * says so instead of reporting a 1x that is really mode 0.
  *
  * NOT a unit test: test_vk_chain's test_ds_attn_fa gates the tile's bits. Build on
  * demand: make tests/bench_chain_attn_fa VK=1
@@ -90,7 +91,7 @@ int main(int argc, char **argv) {
     printf("bench fa S %d H %d hd %d window %d pool %d cnt %d, %d dispatches a frame, best of %d:\n",
            S, H, hd, nwin, ncmp, cnt, N, reps);
     unsigned long long fa0, fa1, fa2;
-    double m0 = arm(NULL, N, reps, &fa0);
+    double m0 = arm("0", N, reps, &fa0);   /* pinned off: the default is 1 since gap-wave4 */
     double m1 = arm("1", N, reps, &fa1);
     double m2 = arm("2", N, reps, &fa2);
     if (fa0) printf("  mode 0 moved attn_fa by %llu -- the lever is leaking\n", fa0);
