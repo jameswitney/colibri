@@ -1476,12 +1476,16 @@ static int matmul_bd(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcBuf *y
  * have no tiled path on a device without cooperative matrices: every prompt chunk's
  * rows fall to qmatmul.spv's GEMV, a workgroup a row. mm8 tiles them weight-stationary
  * (the fork's issue #46 kernel; the scale staging reads this tree's per-row per-group
- * layout, qmatmul_mm8.comp's note). Opt-in -- COLI_VK_MM8, default 0, keeps every
- * matmul's bits byte-for-byte. `1` takes it for every eligible matmul (fmt 12,
- * S >= 2, I a multiple of 64), a speculative verify's rows too, the documented
- * reassociation-class break of the rows policy; `-1` follows the backend's own fill
- * rule (gemm_min_s) as that policy gates it, exactly the tiled GEMM's `-1`: a
- * per-call vkc_gemm_rows pin (a verify's 0) keeps the rows on the GEMV.
+ * layout, qmatmul_mm8.comp's note). The default since the self-tuning defaults: an
+ * unset env is `-1`, the backend's own fill rule -- a prompt chunk's eligible rows
+ * tile, and a verify's rows and every decode step keep the GEMV's bits, so the
+ * pre-flip byte-for-byte standing survives everywhere but the prompt itself. `1` takes
+ * it for every eligible matmul (fmt 12, S >= 2, I a multiple of 64), a speculative
+ * verify's rows too, the documented reassociation-class break of the rows policy;
+ * `0` keeps every matmul on the GEMV byte-for-byte (the per-lever hatch), and
+ * COLI_VK_LEGACY=1 turns an unset env back to `0`. The fill rule is the tiled GEMM's
+ * own `-1` (gemm_min_s) as that policy gates it: a per-call vkc_gemm_rows pin (a
+ * verify's 0) keeps the rows on the GEMV.
  * A refusal anywhere (no pipeline, an unaligned I) leaves the matmul on the paths
  * below. */
 typedef struct { int blk, bm, bn, bk, wm, wn, wmiter, tm, tn, tk, warp; const char *name; } VkcMm8Tile;
@@ -1500,7 +1504,7 @@ static const VkcMm8Tile vkc_mm8_tile[VKC_MM8_VAR] = {
     /* MWM4 medium with WMITER=4           */ {128, 64, 64, 32, 64, 32, 4, 2, 2, 1, 64, "mwm4"},
     /* MBN128 medium with BN=128           */ {128, 64, 128, 32, 64, 64, 2, 2, 2, 1, 64, "mbn128"},
 };
-static int g_mm8_mode = -2;      /* -2 unread, 0 off (the default), 1 every eligible, -1 the fill rule */
+static int g_mm8_mode = -2;      /* -2 unread, 0 off, 1 every eligible, -1 the fill rule (the unset default) */
 static int g_mm8_tile_sel = -2;  /* -2 the frozen F tile, -1 the per-shape rule, >=0 forced (the bench) */
 static int g_mm8_ndbuf = -2;     /* id 11: -2 the measured default (single buffer; COLI_VK_CHAIN_MM8_NDBUF=2 arms the ping-pong), 0/2 forced (the tests) */
 static int g_mm8_ndbuf_baked = -1;   /* what the LAST pipeline build baked at id 11 (the env arm's observable, the tests assert it) */
@@ -1511,8 +1515,17 @@ int vkc_mm8_tile_count(void) { return VKC_MM8_VAR; }
 static int mm8_mode(void) {
     if (g_mm8_mode == -2) {
         const char *e = getenv("COLI_VK_MM8");
-        int v = e && *e ? atoi(e) : 0;
+        int v = coli_vk_env_def("COLI_VK_MM8", -1, 0);   /* unset: the fill rule; LEGACY: the GEMV */
         g_mm8_mode = v < 0 ? -1 : v > 0 ? 1 : 0;
+        /* the lever's ONE boot line, the tier's lever lines' pattern (first read wins,
+         * later dispatches quiet; a set env stays silent -- the tests' pin bypasses the
+         * env, so no strict byte-equality leg that pins it can see a line) */
+        if (!(e && *e)) {
+            if (g_mm8_mode < 0)
+                fprintf(stderr, "[VK] chain: mm8: follows the rows rule (unset) -- a prompt's fp8 rows the tiled weight-stationary GEMM, a verify's rows and decode the GEMV\n");
+            else
+                fprintf(stderr, "[VK] chain: mm8: legacy (COLI_VK_LEGACY=1) -- every fp8 matmul the per-row GEMV\n");
+        }
     }
     return g_mm8_mode;
 }

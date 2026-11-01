@@ -16,10 +16,12 @@
 #        op=expert batch fence;
 #   the default is untouched: unset and 0 give the same stderr (cmp), exit 0,
 #        and the old fault line — nothing about strict anywhere;
-#   the hatch is the base: all five gap-wave4 default levers at =0 vs
-#        COLI_VK_LEGACY=1 (levers unset) agree byte for byte (stdout exact,
-#        stderr past the hatch's own legacy lines) — per-lever =0 still wins,
-#        and the hatch reproduces exactly that base;
+#   the hatch is the base: all five gap-wave4 default levers at =0, and the
+#        self-tuning knobs at the base's own numbers (MM8=0 CHAIN_GEMM_ROWS=0
+#        TIER_GEMM_ROWS=16 STREAM_SLOTS=64 STREAM_BYPASS=0), vs COLI_VK_LEGACY=1
+#        (every knob unset) agree byte for byte (stdout exact, stderr past the
+#        hatch's own legacy lines) — per-lever =0 still wins, and the hatch
+#        reproduces exactly that base;
 #   the refusal is not fatal: a strict run of test_vk_tier serves the layers
 #        whose extra form has no device form ("[VK] refused:", the run continues)
 #        and aborts only at its deliberate final wait fault — exactly one
@@ -95,7 +97,10 @@ if grep -q "strict" "$TMP/a.out" "$TMP/a.err"; then fail "case: strict must not 
 # pre-flip standing, and COLI_VK_LEGACY=1 must reproduce exactly that — stdout
 # byte for byte, stderr past the hatch's own "legacy (COLI_VK_LEGACY=1)" lines
 # (an explicit env always wins over the hatch, so the =0 side prints nothing).
-OFF="COLI_VK_PROFILE=0 COLI_VK_CHAIN_ATTN_FA=0 COLI_VK_TIER_EXPERTS=0 COLI_VK_TIER_DECODE_GROW=0 COLI_VK_TIER_DECODE_GROW_HEADROOM=0 COLI_VK_V4_DECODE_PATH=0 COLI_VK_V4_S1GEMV=0"
+# The self-tuning defaults' five knobs join the leg the same way, each pinned to
+# the BASE's own value (not =0: the tier's GEMM rows were 16, the stream slots
+# 64), so the hatch case keeps covering the whole measured-shape flip.
+OFF="COLI_VK_PROFILE=0 COLI_VK_CHAIN_ATTN_FA=0 COLI_VK_TIER_EXPERTS=0 COLI_VK_TIER_DECODE_GROW=0 COLI_VK_TIER_DECODE_GROW_HEADROOM=0 COLI_VK_V4_DECODE_PATH=0 COLI_VK_V4_S1GEMV=0 COLI_VK_MM8=0 COLI_VK_CHAIN_GEMM_ROWS=0 COLI_VK_TIER_GEMM_ROWS=16 COLI_VK_TIER_STREAM_SLOTS=64 COLI_VK_TIER_STREAM_BYPASS=0"
 rc=$(rc_of env -u COLI_VK_STRICT $OFF "$TIER" "$SPV"); mv "$TMP/out" "$TMP/c.out"; mv "$TMP/err" "$TMP/c.err"
 [ "$rc" = 0 ] || fail "case: the =0 base must pass (rc $rc)"
 rc=$(rc_of env -u COLI_VK_STRICT COLI_VK_LEGACY=1 "$TIER" "$SPV"); mv "$TMP/out" "$TMP/d.out"; mv "$TMP/err" "$TMP/d.err"

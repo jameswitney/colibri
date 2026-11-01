@@ -15401,8 +15401,14 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
         fprintf(stderr, ")\n");
         if (!mixed) { free(lgu); free(ldn); lgu = ldn = NULL; }
     }
-    const char *bypass = getenv("COLI_VK_TIER_STREAM_BYPASS");   /* 1: the stream's fills read past the cache (v4_vkt_load_batch) */
-    v4_vkt_bypass = bypass && *bypass && atoi(bypass) != 0;
+    /* COLI_VK_TIER_STREAM_BYPASS: 1 reads the stream's fills past the cache
+     * (v4_vkt_load_batch). The default since the self-tuning defaults -- an unset env
+     * arms the bypass reader (numerics-neutral, only which cache sees the bytes
+     * differs); =0 the per-lever hatch, and COLI_VK_LEGACY=1 turns an unset env back
+     * to the base's off */
+    const char *bpe = getenv("COLI_VK_TIER_STREAM_BYPASS");
+    int bypass_set = bpe && *bpe;
+    v4_vkt_bypass = coli_vk_env_def("COLI_VK_TIER_STREAM_BYPASS", 1, 0) != 0;
     /* .stage stays unset on purpose (R-l1's OPEN-4): the staging carve it would enable is
      * doubly gated on block formats -- the tier's `blocks` scan and vkc_stage_sizes,
      * which returns 0 for fmt 7 -- and this model's experts are all MXFP4 (fmt 7), so it
@@ -15450,8 +15456,9 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
     if (v4_vkt_bypass) {   /* the effective depth at boot: the env's, both pools' */
         int depth = v4_vkt_depth();
         fprintf(stderr, "%s tier deepseek_v4: the stream's fills read past the expert cache "
-                "(%d stages of %d MiB, groups of %d in parallel; COLI_VK_TIER_STREAM_BYPASS)%s\n",
+                "(%d stages of %d MiB, groups of %d in parallel; COLI_VK_TIER_STREAM_BYPASS%s)%s\n",
                 XT_TAG, depth, V4_VKT_STAGE_CAP >> 20, depth,
+                bypass_set ? "" : " (unset -- the default reader)",
                 depth != V4_VKT_STAGE_N ?
                 " -- COLI_VK_TIER_STREAM_DEPTH: host read depth only, the device ring's width stays COLI_VK_TIER_STREAM_SLOTS'" : "");
     }

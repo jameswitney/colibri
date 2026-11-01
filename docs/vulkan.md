@@ -4087,6 +4087,13 @@ packing is lossless, so outputs are unaffected either way) and does not un-set a
 profile. `tests/vulkan_strict.sh`'s hatch case byte-compares `COLI_VK_LEGACY=1`
 against every lever at `=0`.
 
+Beside the probed levers, the **measured prefill shape is the default** (the
+self-tuning defaults): mm8 follows the rows rule, the chain's rows pin follows
+the backend's rule, the tier's grouped GEMM from 4 rows, stream slots derived
+from the fit (a quarter of the raw expert places, 64..4096), and the bypass
+reader on. `COLI_VK_PROFILE=` forces a stage set explicitly against those
+defaults; `LEGACY=1` restores the base (each knob at its own old number, not 0).
+
 Every knob, sub-knob, boot line and preset of the levers has its full row in
 [ENVIRONMENT.md](ENVIRONMENT.md).
 

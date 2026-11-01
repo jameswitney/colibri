@@ -4487,7 +4487,19 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         const char *se = getenv("COLI_VK_TIER_STREAM"), *sn = getenv("COLI_VK_TIER_STREAM_SLOTS");
         const char *sr = getenv("COLI_VK_TIER_STREAM_ROWS");
         int want_st = !(se && *se == '0') && T.c.load && T.c.release && T.gemm_rows > 0;
-        int slots = sn && *sn ? atoi(sn) : 64;
+        /* COLI_VK_TIER_STREAM_SLOTS, the self-tuning default: a set env wins outright;
+         * unset spends up to a QUARTER of the raw fit on streaming -- a slot is an
+         * expert's device bytes, and fit_raw already counts expert places, so the spend
+         * is fit_raw/4 of them -- clamped to the base's floor of 64 and a ceiling of
+         * 4096; COLI_VK_LEGACY=1 keeps the base's 64. The half-of-fit clamp below still
+         * applies to the derived count as it always did to a set one (the bench rig's
+         * 7.85 GiB fit at 12.76 MiB an expert lands at 157 slots, the measured prefill
+         * shape's 150-256 band) */
+        int slots_set = sn && *sn;
+        long long quarter = fit_raw / 4;
+        if (quarter < 64) quarter = 64;
+        if (quarter > 4096) quarter = 4096;
+        int slots = slots_set ? atoi(sn) : coli_vk_env_def("COLI_VK_TIER_STREAM_SLOTS", (int)quarter, 64);
         if (slots > fit_raw / 2) slots = (int)(fit_raw / 2);
         /* the hot set's pins come first: staging cannot shrink the residents below the
          * frozen section. Its count here is the device's share (the host pool is sized
@@ -4535,6 +4547,15 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
             fit = fit_raw - slots;   /* the carve's freed places join the residents even when streaming did not survive it (every slot became the bank) */
         if (T.st_ok) {
             T.st_slots = slots;
+            if (!slots_set) {   /* the derived count's ONE boot line: the arithmetic said */
+                if (!coli_vk_legacy()) {
+                    char hslot[32], hfit[32];
+                    fprintf(stderr, VKT_TAG " tier: %d stream slots (unset; %s of the %s fit)\n",
+                            T.st_slots, human((double)T.st_slots * T.exp_bytes, hslot, sizeof hslot),
+                            human((double)fit_raw * T.exp_bytes, hfit, sizeof hfit));
+                } else
+                    fprintf(stderr, VKT_TAG " tier: stream slots: legacy (COLI_VK_LEGACY=1) -- 64 slots\n");
+            }
             T.st_rows_env = sr && *sr ? atoi(sr) : 0;
             {   /* COLI_VK_TIER_STREAM_ROWS_ADAPTIVE: the rule's floor the measurement's */
                 const char *sa = getenv("COLI_VK_TIER_STREAM_ROWS_ADAPTIVE");

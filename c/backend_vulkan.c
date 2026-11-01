@@ -5985,9 +5985,25 @@ static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a,
             if (!xb_pipeline(X, X->sh_mm, X->pl4, &si, &X->p_mm[k])) X->p_mm[k] = VK_NULL_HANDLE;
         }
     }
+    /* COLI_VK_TIER_GEMM_ROWS: the unset default 4 is the measured crossover on this
+     * class of cards (RDNA2, no cooperative matrices; below it the grouped GEMV's rows
+     * win, above it the tiles' weight reuse does), gated on the GEMM route's pipelines
+     * exactly as before; `=N` pins N rows, 0 keeps the per-row GEMV, and COLI_VK_LEGACY=1
+     * turns an unset env back to the base's 16. The lever's ONE [VK] line (said once a
+     * run; a set env stays silent) */
     const char *e = getenv("COLI_VK_TIER_GEMM_ROWS");
-    X->gemm_rows = X->p_mm[0] && X->p_act ? (e && *e ? atoi(e) : 16) : 0;
+    X->gemm_rows = X->p_mm[0] && X->p_act ? coli_vk_env_def("COLI_VK_TIER_GEMM_ROWS", 4, 16) : 0;
     if (X->gemm_rows < 0) X->gemm_rows = 0;
+    if (X->p_mm[0] && X->p_act && !(e && *e)) {
+        static int said;
+        if (!said) {
+            said = 1;
+            if (coli_vk_legacy())
+                fprintf(stderr, "[VK] tier: grouped GEMM rows: legacy (COLI_VK_LEGACY=1) -- %d rows\n", X->gemm_rows);
+            else
+                fprintf(stderr, "[VK] tier: grouped GEMM from %d rows (unset; the measured crossover)\n", X->gemm_rows);
+        }
+    }
     xb_coop_init(X);
     xb_grp_init(X);
     xb_grp_bd_init(X);
